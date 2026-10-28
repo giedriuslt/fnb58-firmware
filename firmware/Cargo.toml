@@ -1,0 +1,21 @@
+[package]
+name = "fnb58-firmware"
+version = "0.1.0"
+edition = "2024"
+description = "Open firmware scaffold for the FNIRSI FNB58 USB tester (AT32F403A)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "fnb58-firmware"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+cortex-m = { workspace = true, features = ["critical-section-single-core"] }
+cortex-m-rt = { workspace = true, features = ["paint-stack"] }
+embassy-at32.workspace = true
+embassy-executor.workspace = true
+embassy-time.workspace = true
+panic-halt.workspace = true
