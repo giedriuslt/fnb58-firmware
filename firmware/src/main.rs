@@ -49,7 +49,6 @@ async fn main(_spawner: Spawner) {
 
     // Panel interrupt sources: the SPI flag waits and the DMA completion.
     unsafe {
-        cortex_m::peripheral::NVIC::unmask(interrupt::SPI1);
         cortex_m::peripheral::NVIC::unmask(match board::PANEL_DMA.0 {
             embassy_at32::dma::Unit::Dma1 => interrupt::DMA1_CHANNEL1,
             embassy_at32::dma::Unit::Dma2 => interrupt::DMA2_CHANNEL1,
@@ -99,11 +98,6 @@ async fn main(_spawner: Spawner) {
 #[cortex_m_rt::exception]
 fn SysTick() {
     embassy_at32::time_driver::systick_tick();
-}
-
-#[cortex_m_rt::interrupt]
-fn SPI1() {
-    embassy_at32::spi::on_interrupt();
 }
 
 #[cortex_m_rt::interrupt]
