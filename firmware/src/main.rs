@@ -28,15 +28,31 @@ use panic_halt as _;
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     // Crystal-first clocks: PLL from HEXT for a USB-accurate bit rate,
-    // HICK-48 fallback when no crystal oscillates. Everything else
-    // measures time against the resulting clocks.
-    let Ok((clocks, _crystal)) =
+    // HICK-48 fallback when no crystal oscillates.
+    //
+    // DIAGNOSTIC CONTRACT (round 8): the HICK fallback never attaches.
+    // The HICK's ±1% makes the USB transmitter out of spec, so a fallback
+    // build could only ever produce another Code 43 — indistinguishable
+    // from a protocol bug. Not attaching makes the clock path visible
+    // from outside:
+    //   - device appears (even as Code 43)  -> crystal path ran; the USB
+    //     bit rate is crystal-accurate and any remaining failure is
+    //     protocol-level;
+    //   - nothing appears at all            -> HEXT never stabilized on
+    //     the AT32 (the board's 8 MHz crystal is elsewhere, e.g. the BLE
+    //     module) -> the ACC HICK-trim path is the fix.
+    let Ok((clocks, crystal)) =
         (unsafe { embassy_at32::clocks::configure_usb(board::HEXT_HZ) })
     else {
         loop {
             cortex_m::asm::nop();
         }
     };
+    if !crystal {
+        loop {
+            cortex_m::asm::nop();
+        }
+    }
     unsafe { embassy_at32::init(clocks) };
     unsafe { cortex_m::interrupt::enable() };
 
