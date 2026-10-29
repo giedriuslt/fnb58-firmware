@@ -196,7 +196,7 @@ pub async fn run() {
         // Unknown 0x0C device from the round-18 scan: read candidate ID regs.
         if a == 0x0C {
             for reg in [0x0Fu8, 0x07u8, 0x0Du8] {
-                if unsafe { fnb58_i2c_read(x, reg, buf.as_mut_ptr(), 1) } == 0 && buf[0] != 0 {
+                if unsafe { fnb58_i2c_read(u16::from(x), reg, buf.as_mut_ptr(), 1) } == 0 && buf[0] != 0 {
                     let mut line = heapless_line::Line::new();
                     line.push(b"dev@0C reg ");
                     line.push_hex(reg);
