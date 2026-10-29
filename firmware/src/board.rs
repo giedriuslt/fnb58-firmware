@@ -78,6 +78,16 @@ pub const PIN_DRIVE: Drive = Drive::Moderate;
 /// DMA unit and channel (1-based) used for panel pixel bursts.
 pub const PANEL_DMA: (embassy_at32::dma::Unit, u8) = (embassy_at32::dma::Unit::Dma1, 1);
 
+/// Power-path hardware (user board trace, 2026-10-30): four ~20-ohm
+/// power resistors and one MOSFET sit directly behind the AT32. The
+/// working theory: a switchable current-pulse load bank for MediaTek
+/// Pump Express detection/triggering (PE works by the device drawing
+/// current pulses; 20 ohm across 5 V = 250 mA per leg, 1.25 W - hot!),
+/// with MOSFET gates driven by (unidentified) GPIOs. DANGER: enabling a
+/// pull-up on a gate pin turns a leg on continuously. The round-24/25
+/// button monitor did exactly that (chip heated, vbus drooped to 4.6 V).
+/// Rule: never pull or drive any untraced pin on this board.
+///
 /// The 192 MHz PLL profile (kept for later stages; the smoke test runs
 /// on `configure_hick48` instead).
 #[allow(dead_code)]
