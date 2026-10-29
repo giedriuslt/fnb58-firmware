@@ -40,7 +40,7 @@ async fn main(_spawner: Spawner) {
     //   - device vanishes                          -> firmware crashed;
     //   - nothing at all                           -> never reached the
     //     connect (pre-init fault).
-    let Ok((clocks, _crystal)) =
+    let Ok((clocks, crystal)) =
         (unsafe { embassy_at32::clocks::configure_usb(board::HEXT_HZ) })
     else {
         loop {
@@ -52,7 +52,14 @@ async fn main(_spawner: Spawner) {
 
     // SAFETY: exclusive startup owns the USBFS cell. No NVIC unmasking:
     // the cell is polled from the loop below.
-    unsafe { embassy_at32::usb::init() };
+    //
+    // The PID encodes the clock path on the wire (visible in a captured
+    // Get-Descriptor response even when enumeration fails):
+    // 0x5859 = PLL from the crystal (accurate USB clock), 0x5858 = HICK
+    // fallback (transmitter out of spec by construction).
+    unsafe {
+        embassy_at32::usb::init(if crystal { 0x5859 } else { 0x5858 });
+    }
 
     let mut rx = [0u8; 64];
     let mut last_heartbeat = Instant::now();
