@@ -104,7 +104,7 @@ async fn main(_spawner: Spawner) {
             last_heartbeat = Instant::now();
             static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             let tick = TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let mut banner = [0u8; 32];
+            let mut banner = [0u8; 40];
             let text = format_banner(tick, &mut banner);
             send_line(text);
         }
@@ -127,8 +127,8 @@ fn send_line(line: &[u8]) {
     }
 }
 
-fn format_banner(tick: u32, buf: &mut [u8; 32]) -> &[u8] {
-    const PREFIX: &[u8] = b"FNB58 alive ";
+fn format_banner(tick: u32, buf: &mut [u8; 40]) -> &[u8] {
+    const PREFIX: &[u8] = b"FNB58 r17 alive ";
     const CRLF: &[u8] = b"\r\n";
     let mut n = 0;
     for &b in PREFIX {
