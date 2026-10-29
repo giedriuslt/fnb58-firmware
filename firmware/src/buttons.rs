@@ -1,14 +1,21 @@
-//! Button discovery monitor: every probe-safe GPIO becomes an input with
-//! the internal pull-up enabled; transitions (a button shorting the pin
-//! to ground) are debounced and reported over the CDC.
+//! Button discovery monitor - PASSIVE mode (round 26).
+//!
+//! Every probe-safe GPIO is a floating input (the reset configuration);
+//! transitions are debounced and reported over the CDC. Buttons with
+//! external pull-ups on the board are detected directly. NO internal
+//! pull-ups are enabled anywhere: on an untraced board an internal pull
+//! can gate a power FET (round 24/25 heated something and dragged vbus
+//! from 5.04 V to 4.6 V — the user felt the chip hot). If the buttons
+//! turn out to need internal pulls, they get them ONE PIN AT A TIME
+//! (50 ms each) in a later round.
 //!
 //! Excluded pins: PA11/PA12 (USB data), PA13/PA14 (SWD), PB6/PB7 (the
 //! live I2C bus), PC14/PC15 (crystal territory). PD0/PD1 (crystal) are
 //! not in the enumerated set at all.
 //!
-//! Buttons are assumed active-low (pull-up + short to ground) — the same
-//! scheme the KWS-X1 firmware used. If nothing changes in this mode, a
-//! pull-down phase (press-to-VCC buttons) is the fallback.
+//! Buttons with external pull-ups toggle in this mode. Buttons relying
+//! on internal pulls will NOT — the per-pin 50 ms pull-up sweep is the
+//! follow-up if this pass is silent.
 
 
 const GPIOA_BASE: usize = 0x4001_0800;
@@ -60,12 +67,10 @@ pub fn init() {
             } else {
                 ((base + 4) as *mut u32, (num - 8) * 4)
             };
-            // SAFETY: valid GPIO register block under init's ownership.
+            // SAFETY: valid GPIO register block. Floating input — no pull.
             unsafe {
-                let value = (reg.read_volatile() & !(0xF << shift)) | (0b0010 << shift);
+                let value = (reg.read_volatile() & !(0xF << shift)) | (0b0001 << shift);
                 reg.write_volatile(value);
-                // Latch the pull direction high (pull-up) via SCR set bits.
-                scr.write_volatile(1 << num);
             };
         }
         // Baseline.
