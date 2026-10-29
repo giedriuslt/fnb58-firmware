@@ -117,8 +117,13 @@ async fn main(_spawner: Spawner) {
 /// Send one line through the vendor CDC (single packet; the vendor API
 /// rejects a second call while the first is in flight).
 fn send_line(line: &[u8]) {
+    // Trim at the first NUL: queue slots are fixed-size and zero-padded.
+    let len = line
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(line.len());
     unsafe {
-        fnb58_usb_send(line.as_ptr(), line.len() as u16);
+        fnb58_usb_send(line.as_ptr(), len as u16);
     }
 }
 
