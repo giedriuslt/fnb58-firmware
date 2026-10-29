@@ -92,8 +92,12 @@ mod heapless_line {
     }
 }
 
-/// Run one full scan cycle on the traced bus (I2C1, PB6/PB7): probe every
-/// address, identify the known devices, read the TPA626 bus voltage.
+/// Run one full scan cycle on the traced bus (I2C1, PB6/PB7).
+///
+/// Address convention (decoded from the round-18 scan): the vendor
+/// i2c_application library takes the 8-bit form — the byte on the wire is
+/// `X | rw` — so a device at 7-bit address `A` ACKs probe `X = A<<1` and
+/// `X+1`. The scan reports real 7-bit addresses (X/2).
 pub async fn run() {
     // One-time vendor I2C init (I2C1, PB6/PB7, 100 kHz).
     unsafe {
@@ -103,79 +107,103 @@ pub async fn run() {
     let mut line = heapless_line::Line::new();
     line.push(b"I2C1 PB6/PB7:");
     let mut found = 0usize;
-    for address in 0x08u8..=0x78 {
-        // 0 = ACK (device present); the vendor probe is a safe 1-byte read.
-        if unsafe { fnb58_i2c_probe(address as u16) } == 0 {
-            line.push(b" ");
-            line.push_hex(address);
-            found += 1;
+    let mut devices: [u8; 12] = [0; 12];
+    let mut previous_acked = false;
+    for x in 0x08u8..=0xF0 {
+        let acked = unsafe { fnb58_i2c_probe(x as u16) } == 0;
+        if acked {
+            if !previous_acked {
+                // Rising edge of a pair: the device's 7-bit address is x/2.
+                if found < devices.len() {
+                    devices[found] = x >> 1;
+                }
+                found += 1;
+                line.push(b" ");
+                line.push_hex(x >> 1);
+            }
         }
+        previous_acked = acked;
     }
     if found == 0 {
         line.push(b" none");
     }
     queue_line(line.bytes());
 
-    // Identify + measure whatever ACKed.
-    for address in 0x08u8..=0x78 {
-        if unsafe { fnb58_i2c_probe(address as u16) } != 0 {
-            continue;
-        }
+    // Identify + measure every discovered device.
+    for i in 0..found.min(devices.len()) {
+        let a = devices[i];
+        let x = a << 1; // vendor 8-bit form
         let mut buf = [0u8; 2];
 
-        if (0x40..=0x4F).contains(&address) {
+        if (0x40..=0x4F).contains(&a) {
             // TPA626: mfr 0xFE = 0x5449, die 0xFF = 0x2260; then bus volts.
-            if unsafe { fnb58_i2c_read(address as u16, 0xFE, buf.as_mut_ptr(), 2) } == 0
+            if unsafe { fnb58_i2c_read(u16::from(x), 0xFE, buf.as_mut_ptr(), 2) } == 0
                 && buf == [0x54, 0x49]
             {
                 let mut line = heapless_line::Line::new();
                 line.push(b"TPA626@");
-                line.push_hex(address);
+                line.push_hex(a);
                 line.push(b" mfr=TI");
-                if unsafe { fnb58_i2c_read(address as u16, 0xFF, buf.as_mut_ptr(), 2) } == 0 {
+                if unsafe { fnb58_i2c_read(u16::from(x), 0xFF, buf.as_mut_ptr(), 2) } == 0 {
                     line.push(b" die=");
                     line.push_hex(buf[0]);
                     line.push_hex(buf[1]);
                 }
-                // Bus voltage register 0x02, 1.25 mV/LSB.
-                if unsafe { fnb58_i2c_read(address as u16, 0x02, buf.as_mut_ptr(), 2) } == 0 {
-                    let mv = ((u16::from(buf[0]) << 8) | u16::from(buf[1])) as u32 * 125 / 100;
-                    line.push(b" vbus=");
-                    // Millivolts, decimal.
-                    let mv = mv as u16;
-                    if mv >= 10000 {
-                        line.push(&[b'0' + (mv / 10000) as u8]);
-                    }
-                    line.push(&[b'0' + (mv / 1000 % 10) as u8, b'.']);
-                    line.push(&[b'0' + (mv / 100 % 10) as u8, b'0' + (mv / 10 % 10) as u8]);
-                    line.push(b"V");
-                }
                 queue_line(line.bytes());
+
+                // Bus voltage register 0x02, 1.25 mV/LSB. Live measurement!
+                let mut vb = [0u8; 2];
+                if unsafe { fnb58_i2c_read(u16::from(x), 0x02, vb.as_mut_ptr(), 2) } == 0 {
+                    let raw = (u16::from(vb[0]) << 8) | u16::from(vb[1]);
+                    let mv = (raw as u32 * 125 / 100) as u16; // 1.25 mV/LSB
+                    let mut line = heapless_line::Line::new();
+                    line.push(b"TPA626 vbus=");
+                    let v = mv; // millivolts
+                    if v >= 10000 {
+                        line.push(&[b'0' + (v / 10000) as u8]);
+                    }
+                    line.push(&[b'0' + (v / 1000 % 10) as u8, b'.']);
+                    line.push(&[b'0' + (v / 100 % 10) as u8, b'0' + (v / 10 % 10) as u8]);
+                    line.push(b"V");
+                    queue_line(line.bytes());
+                }
             }
         }
 
-        if matches!(address, 0x22 | 0x23) {
-            if unsafe { fnb58_i2c_read(address as u16, 0x01, buf.as_mut_ptr(), 1) } == 0
+        if matches!(a, 0x22 | 0x23) {
+            if unsafe { fnb58_i2c_read(u16::from(x), 0x01, buf.as_mut_ptr(), 1) } == 0
                 && (0x80..=0x9F).contains(&buf[0])
             {
                 let mut line = heapless_line::Line::new();
                 line.push(b"FUSB302@");
-                line.push_hex(address);
+                line.push_hex(a);
                 line.push(b" id=");
                 line.push_hex(buf[0]);
                 queue_line(line.bytes());
             }
         }
 
-        if matches!(address, 0x0E | 0x0F) {
-            if unsafe { fnb58_i2c_read(address as u16, 0x0F, buf.as_mut_ptr(), 1) } == 0
-                && buf[0] == 0x35
-            {
+        if matches!(a, 0x0E | 0x0F) {
+            if unsafe { fnb58_i2c_read(u16::from(x), 0x0F, buf.as_mut_ptr(), 1) } == 0 && buf[0] == 0x35 {
                 let mut line = heapless_line::Line::new();
                 line.push(b"KXTJ3@");
-                line.push_hex(address);
+                line.push_hex(a);
                 line.push(b" whoami=35");
                 queue_line(line.bytes());
+            }
+        }
+
+        // Unknown 0x0C device from the round-18 scan: read candidate ID regs.
+        if a == 0x0C {
+            for reg in [0x0Fu8, 0x07u8, 0x0Du8] {
+                if unsafe { fnb58_i2c_read(x, reg, buf.as_mut_ptr(), 1) } == 0 && buf[0] != 0 {
+                    let mut line = heapless_line::Line::new();
+                    line.push(b"dev@0C reg ");
+                    line.push_hex(reg);
+                    line.push(b"=");
+                    line.push_hex(buf[0]);
+                    queue_line(line.bytes());
+                }
             }
         }
     }
