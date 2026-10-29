@@ -29,6 +29,7 @@ use embassy_at32::gpio::{Drive, Port};
 /// PLL math produces a wrong system clock and USB fails again. If
 /// enumeration still fails, verify this value against the board (the
 /// crystal sits near the AT32, usually marked e.g. "8.000").
+#[allow(dead_code)]
 pub const HEXT_HZ: u32 = 8_000_000;
 
 /// Panel geometry: the ST7789's native 240x320 memory, rotated to
