@@ -132,79 +132,81 @@ pub async fn run() {
     // Identify + measure every discovered device.
     for i in 0..found.min(devices.len()) {
         let a = devices[i];
-        let x = a << 1; // vendor 8-bit form
+        let x = u16::from(a) << 1; // vendor 8-bit form
+        let mut line2 = heapless_line::Line::new();
+        line2.push(b"dev ");
+        line2.push_hex(a);
+        line2.push(b":");
         let mut buf = [0u8; 2];
 
+        // Raw register dump for every discovered device - the identification
+        // gate is gone: print what's actually there.
         if (0x40..=0x4F).contains(&a) {
-            // TPA626: mfr 0xFE = 0x5449, die 0xFF = 0x2260; then bus volts.
-            if unsafe { fnb58_i2c_read(u16::from(x), 0xFE, buf.as_mut_ptr(), 2) } == 0
-                && buf == [0x54, 0x49]
-            {
-                let mut line = heapless_line::Line::new();
-                line.push(b"TPA626@");
-                line.push_hex(a);
-                line.push(b" mfr=TI");
-                if unsafe { fnb58_i2c_read(u16::from(x), 0xFF, buf.as_mut_ptr(), 2) } == 0 {
-                    line.push(b" die=");
-                    line.push_hex(buf[0]);
-                    line.push_hex(buf[1]);
-                }
-                queue_line(line.bytes());
-
-                // Bus voltage register 0x02, 1.25 mV/LSB. Live measurement!
-                let mut vb = [0u8; 2];
-                if unsafe { fnb58_i2c_read(u16::from(x), 0x02, vb.as_mut_ptr(), 2) } == 0 {
-                    let raw = (u16::from(vb[0]) << 8) | u16::from(vb[1]);
-                    let mv = (raw as u32 * 125 / 100) as u16; // 1.25 mV/LSB
-                    let mut line = heapless_line::Line::new();
-                    line.push(b"TPA626 vbus=");
-                    let v = mv; // millivolts
-                    if v >= 10000 {
-                        line.push(&[b'0' + (v / 10000) as u8]);
-                    }
-                    line.push(&[b'0' + (v / 1000 % 10) as u8, b'.']);
-                    line.push(&[b'0' + (v / 100 % 10) as u8, b'0' + (v / 10 % 10) as u8]);
-                    line.push(b"V");
-                    queue_line(line.bytes());
+            // TPA626/INA226-class: mfr 0xFE, die 0xFF, config 0x00, vbus 0x02.
+            for (reg, name) in [(0xFEu8, b" mfr="), (0xFFu8, b" die="), (0x00u8, b" cfg=")] {
+                let mut b2 = [0u8; 2];
+                let st = unsafe { fnb58_i2c_read(u16::from(x), reg, b2.as_mut_ptr(), 2) };
+                if st == 0 {
+                    line2.push(name);
+                    line2.push_hex(b2[0]);
+                    line2.push_hex(b2[1]);
                 }
             }
+            let mut vb = [0u8; 2];
+            let st = unsafe { fnb58_i2c_read(u16::from(x), 0x02, vb.as_mut_ptr(), 2) };
+            if st == 0 {
+                let raw = (u16::from(vb[0]) << 8) | u16::from(vb[1]);
+                let mv = (raw as u32 * 125 / 100) as u16; // 1.25 mV/LSB
+                line2.push(b" vbus=");
+                if mv >= 10000 {
+                    line2.push(&[b'0' + (mv / 10000) as u8]);
+                }
+                line2.push(&[b'0' + (mv / 1000 % 10) as u8, b'.']);
+                line2.push(&[b'0' + (mv / 100 % 10) as u8, b'0' + (mv / 10 % 10) as u8]);
+                line2.push(b"V");
+            }
+            queue_line(line2.bytes());
         }
 
         if matches!(a, 0x22 | 0x23) {
-            if unsafe { fnb58_i2c_read(u16::from(x), 0x01, buf.as_mut_ptr(), 1) } == 0
-                && (0x80..=0x9F).contains(&buf[0])
-            {
-                let mut line = heapless_line::Line::new();
-                line.push(b"FUSB302@");
-                line.push_hex(a);
-                line.push(b" id=");
-                line.push_hex(buf[0]);
-                queue_line(line.bytes());
+            // FUSB302: DeviceID 0x01.
+            let mut b1 = [0u8; 1];
+            let st = unsafe { fnb58_i2c_read(u16::from(x), 0x01, b1.as_mut_ptr(), 1) };
+            if st == 0 {
+                line2.push(b" FUSB302 id=");
+                line2.push_hex(b1[0]);
+            } else {
+                line2.push(b" FUSB302 rd-err");
             }
+            queue_line(line2.bytes());
         }
 
         if matches!(a, 0x0E | 0x0F) {
-            if unsafe { fnb58_i2c_read(u16::from(x), 0x0F, buf.as_mut_ptr(), 1) } == 0 && buf[0] == 0x35 {
-                let mut line = heapless_line::Line::new();
-                line.push(b"KXTJ3@");
-                line.push_hex(a);
-                line.push(b" whoami=35");
-                queue_line(line.bytes());
+            // KXTJ3: WHO_AM_I 0x0F.
+            let mut b1 = [0u8; 1];
+            let st = unsafe { fnb58_i2c_read(u16::from(x), 0x0F, b1.as_mut_ptr(), 1) };
+            if st == 0 {
+                line2.push(b" KXTJ3 whoami=");
+                line2.push_hex(b1[0]);
+            } else {
+                line2.push(b" KXTJ3 rd-err");
             }
+            queue_line(line2.bytes());
         }
 
-        // Unknown 0x0C device from the round-18 scan: read candidate ID regs.
         if a == 0x0C {
-            for reg in [0x0Fu8, 0x07u8, 0x0Du8] {
-                if unsafe { fnb58_i2c_read(u16::from(x), reg, buf.as_mut_ptr(), 1) } == 0 && buf[0] != 0 {
-                    let mut line = heapless_line::Line::new();
-                    line.push(b"dev@0C reg ");
-                    line.push_hex(reg);
-                    line.push(b"=");
-                    line.push_hex(buf[0]);
-                    queue_line(line.bytes());
+            // Mystery device: dump candidate ID registers raw.
+            for reg in [0x00u8, 0x07u8, 0x0Du8, 0x0Fu8, 0x32u8] {
+                let mut b1 = [0u8; 1];
+                let st = unsafe { fnb58_i2c_read(u16::from(x), reg, b1.as_mut_ptr(), 1) };
+                if st == 0 && b1[0] != 0 {
+                    line2.push(b" r");
+                    line2.push_hex(reg);
+                    line2.push(b"=");
+                    line2.push_hex(b1[0]);
                 }
             }
+            queue_line(line2.bytes());
         }
     }
 }
