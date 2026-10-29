@@ -17,6 +17,7 @@
 #![no_main]
 
 mod board;
+mod buttons;
 #[allow(dead_code)]
 mod panel;
 mod scanner;
@@ -70,6 +71,9 @@ async fn main(_spawner: Spawner) {
     unsafe {
         fnb58_usb_init();
     }
+
+    // Button discovery monitor (round 24).
+    buttons::init();
 
     let mut rx = [0u8; 64];
     let mut last_heartbeat = Instant::now();
@@ -133,7 +137,7 @@ pub fn send_line(line: &[u8]) {
 }
 
 fn format_banner(tick: u32, buf: &mut [u8; 40]) -> &[u8] {
-    const PREFIX: &[u8] = b"FNB58 r21 alive ";
+    const PREFIX: &[u8] = b"FNB58 r24 alive ";
     const CRLF: &[u8] = b"\r\n";
     let mut n = 0;
     for &b in PREFIX {
