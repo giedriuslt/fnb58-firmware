@@ -70,11 +70,14 @@ async fn main(_spawner: Spawner) {
     let mut last_heartbeat = Instant::now();
     loop {
         // Echo anything received (the vendor class buffers OUT data).
+        // Newline travels in the SAME packet: the vendor send API rejects
+        // a second call while the first is still in flight.
         let n = unsafe { fnb58_usb_recv(rx.as_mut_ptr()) } as usize;
-        if n > 0 {
+        if n > 0 && n <= rx.len() - 2 {
+            rx[n] = b'\r';
+            rx[n + 1] = b'\n';
             unsafe {
-                fnb58_usb_send(rx.as_ptr(), n as u16);
-                fnb58_usb_send(b"\r\n".as_ptr(), 2);
+                fnb58_usb_send(rx.as_ptr(), (n + 2) as u16);
             }
         }
 
