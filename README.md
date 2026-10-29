@@ -4,18 +4,20 @@ Open firmware scaffold for the **FNIRSI FNB58** USB tester (Artery
 AT32F403A), built on [`embassy-at32`](../at32f403a-embassy-rs) and ported
 from [kws-x1-standalone-rs](https://github.com/kralonur/kws-x1-standalone-rs).
 
-## Current state: display smoke test
+## Current state: USB CDC smoke test
 
-The scaffold brings up clocks and drives the **320x240 ST7789-class panel**
-over SPI1 with DMA row bursts: hard reset, the KWS-X1's proven generic
-ST7789 init sequence (16-bit pixels, inversion on, MADCTL `0x60`
-landscape), full-window CASET/RASET/RAMWR, then continuous color bars with
-a moving marker stripe and a blinking backlight line.
+The firmware enumerates as a **CDC serial port** (VID 0x2e3c, PID 0x5859)
+and echoes received bytes plus a one-per-second `FNB58 alive <n>`
+heartbeat. If the port appears and echoes, the MCU, flash execution, the
+240 MHz clock tree, the 48 MHz USB clock, the USBFS cell and its
+interrupt all work — the bring-up baseline, independent of the unverified
+display pins. The ST7789 panel transport (`panel.rs`) is kept for the
+next stage but not started.
 
-Build:
+Build a flashable binary (vector table at 0x08000000):
 
 ```sh
-cargo build --release --target thumbv7em-none-eabihf
+./make-bin.sh    # cargo build + rust-objcopy -O binary
 ```
 
 ## ⚠️ The pin map is UNVERIFIED

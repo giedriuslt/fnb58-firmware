@@ -1,39 +1,27 @@
-//! FNB58 open-firmware scaffold: clock bring-up and an ST7789 320x240
-//! panel smoke test over SPI1.
+//! FNB58 open-firmware smoke test: USB CDC virtual COM port.
 //!
-//! Draw stages: a full-screen fill, then colored bars with a moving white
-//! stripe, blinking the backlight at the end of each pass. Everything
-//! hardware-specific is in [`board`]; the pin map is UNVERIFIED until the
-//! FNB58's display connector is traced.
+//! The device enumerates as a serial port (VID 0x2e3c PID 0x5859) and
+//! echoes everything it receives, appending a one-per-second heartbeat
+//! line with a tick counter. If the port appears and echoes, the MCU,
+//! flash execution, the 240 MHz clock tree, the 48 MHz USB clock, the USB
+//! cell and its interrupt all work — the complete bring-up baseline,
+//! independent of the (still unverified) display pins.
+//!
+//! The display transport (`panel`) is kept for the next stage but not
+//! started: its pin map is unverified and its failure must not block the
+//! USB proof.
 
 #![no_std]
 #![no_main]
 
 mod board;
+#[allow(dead_code)]
 mod panel;
 
 use embassy_at32::pac::at32f403a::interrupt;
 use embassy_executor::Spawner;
 use embassy_time::Timer;
 use panic_halt as _;
-
-use crate::board::{HEIGHT, WIDTH};
-
-/// One RGB565 row, built in place and streamed through DMA.
-const BARS: [u16; 8] = [
-    rgb565(255, 0, 0),
-    rgb565(255, 85, 0),
-    rgb565(255, 255, 0),
-    rgb565(0, 255, 0),
-    rgb565(0, 255, 255),
-    rgb565(0, 85, 255),
-    rgb565(128, 0, 255),
-    rgb565(255, 255, 255),
-];
-
-const fn rgb565(r: u8, g: u8, b: u8) -> u16 {
-    ((r >> 3) as u16) << 11 | ((g >> 2) as u16) << 5 | (b >> 3) as u16
-}
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -45,54 +33,78 @@ async fn main(_spawner: Spawner) {
         },
     };
     unsafe { embassy_at32::init(clocks) };
-    unsafe { cortex_m::interrupt::enable() };
 
-    // Panel interrupt sources: the SPI flag waits and the DMA completion.
-    unsafe {
-        cortex_m::peripheral::NVIC::unmask(match board::PANEL_DMA.0 {
-            embassy_at32::dma::Unit::Dma1 => interrupt::DMA1_CHANNEL1,
-            embassy_at32::dma::Unit::Dma2 => interrupt::DMA2_CHANNEL1,
-        });
-    }
-
-    let Some(mut panel) = unsafe { panel::init() }.await else {
-        // Transport dead: blink nothing, but stay alive for a debugger.
+    // 48 MHz for the USB cell from the 240 MHz PLL (240 / 5).
+    if unsafe { embassy_at32::usb::enable_usb_clock(clocks.sclk_hz) }.is_err() {
         loop {
             cortex_m::asm::nop();
         }
-    };
-
-    let mut row = [0u16; WIDTH as usize];
-    let mut stripe = 0usize;
-    loop {
-        if !panel.full_window().await {
-            continue;
-        }
-        for y in 0..HEIGHT as usize {
-            let bar_width = WIDTH as usize / BARS.len();
-            for (i, pixel) in row.iter_mut().enumerate() {
-                *pixel = if i == stripe && y % 8 < 4 {
-                    // A moving white marker stripe, four pixels tall.
-                    BARS[7]
-                } else {
-                    BARS[i / bar_width % BARS.len()]
-                };
-            }
-            if !panel
-                .write_row(unsafe {
-                    core::slice::from_raw_parts(row.as_ptr().cast(), panel::ROW_BYTES)
-                })
-                .await
-            {
-                break;
-            }
-        }
-        stripe = (stripe + 1) % WIDTH as usize;
-        panel.set_backlight(true);
-        Timer::after_millis(500).await;
-        panel.set_backlight(false);
-        Timer::after_millis(500).await;
     }
+
+    // The USBFS shares NVIC lines with CAN1; the H line is our interrupt.
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_H_CAN1_TX);
+        cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_L_CAN1_RX0);
+    }
+    unsafe { cortex_m::interrupt::enable() };
+
+    // SAFETY: exclusive startup owns the USBFS cell.
+    unsafe { embassy_at32::usb::init() };
+
+    let mut tick: u32 = 0;
+    let mut rx = [0u8; 64];
+    loop {
+        match embassy_at32::usb::read(&mut rx).await {
+            Ok(0) => {}
+            Ok(n) => {
+                let _ = embassy_at32::usb::write(&rx[..n]).await;
+                let _ = embassy_at32::usb::write(b"\r\n").await;
+            }
+            // Not configured or timed out: keep the loop alive either way.
+            Err(_) => {}
+        }
+        // Heartbeat: one line per second, whatever the host does.
+        let mut banner = [0u8; 32];
+        let text = format_banner(tick, &mut banner);
+        let _ = embassy_at32::usb::write(text).await;
+        tick = tick.wrapping_add(1);
+        Timer::after_millis(1000).await;
+    }
+}
+
+/// `FNB58 alive <tick>\r\n` into a fixed buffer.
+fn format_banner(tick: u32, buf: &mut [u8; 32]) -> &[u8] {
+    const PREFIX: &[u8] = b"FNB58 alive ";
+    const CRLF: &[u8] = b"\r\n";
+    let mut n = 0;
+    for &b in PREFIX {
+        buf[n] = b;
+        n += 1;
+    }
+    // Decimal tick, no alloc, no formatting machinery.
+    if tick == 0 {
+        buf[n] = b'0';
+        n += 1;
+    } else {
+        let mut digits = [0u8; 10];
+        let mut count = 0;
+        let mut value = tick;
+        while value > 0 {
+            digits[count] = b'0' + (value % 10) as u8;
+            value /= 10;
+            count += 1;
+        }
+        while count > 0 {
+            count -= 1;
+            buf[n] = digits[count];
+            n += 1;
+        }
+    }
+    for &b in CRLF {
+        buf[n] = b;
+        n += 1;
+    }
+    &buf[..n]
 }
 
 #[cortex_m_rt::exception]
@@ -101,11 +113,11 @@ fn SysTick() {
 }
 
 #[cortex_m_rt::interrupt]
-fn DMA1_CHANNEL1() {
-    embassy_at32::dma::on_interrupt(embassy_at32::dma::Unit::Dma1, 1);
+fn USBFS_H_CAN1_TX() {
+    embassy_at32::usb::on_interrupt();
 }
 
 #[cortex_m_rt::interrupt]
-fn DMA2_CHANNEL1() {
-    embassy_at32::dma::on_interrupt(embassy_at32::dma::Unit::Dma2, 1);
+fn USBFS_L_CAN1_RX0() {
+    embassy_at32::usb::on_interrupt();
 }

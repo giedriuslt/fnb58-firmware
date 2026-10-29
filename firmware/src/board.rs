@@ -43,7 +43,7 @@ pub const PIN_RST: (Port, u8) = (Port::B, 1);
 pub const PIN_CS: (Port, u8) = (Port::A, 4);
 /// Backlight enable (simple digital on; move to a timer channel when the
 /// real pin is known).
-pub const PIN_BACKLIGHT: (Port, u8) = (Port::A, 8);
+pub const PIN_BACKLIGHT: (Port, u8) = (Port::B, 3);
 
 /// SPI mode for the ST7789 (CPOL 0, CPHA 0; the KWS-X1 also used the
 /// sampled-on-first-edge family).
