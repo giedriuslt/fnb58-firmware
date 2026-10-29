@@ -65,7 +65,7 @@ static mut MEASURE_STORE: [u8; 64] = [0; 64];
 /// Read the TPA626 (7-bit 0x40) and format one measurement line:
 /// `V=5.04V I=+123uA(raw)` — current is shunt-voltage raw until the board
 /// shunt resistance is confirmed for the CAL register.
-pub fn measure(out: &mut [u8]) {
+pub fn measure(out: &mut [u8], tick: u32) {
     // SAFETY: main-task only.
     let store = unsafe { &mut *core::ptr::addr_of_mut!(MEASURE_STORE) };
     let mut line = heapless_line::Line::new();
@@ -111,6 +111,23 @@ pub fn measure(out: &mut [u8]) {
         line.push(b"uV");
     } else {
         line.push(b" I=--");
+    }
+    line.push(b" #");
+    if tick == 0 {
+        line.push(b"0");
+    } else {
+        let mut digits = [0u8; 10];
+        let mut n = 0;
+        let mut v = tick;
+        while v > 0 {
+            digits[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+        while n > 0 {
+            n -= 1;
+            line.push(&[digits[n]]);
+        }
     }
     let n = line.peak().len();
     out[..n].copy_from_slice(&line.peak()[..n]);

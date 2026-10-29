@@ -18,6 +18,8 @@
 
 mod board;
 mod buttons;
+
+static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 #[allow(dead_code)]
 mod panel;
 mod scanner;
@@ -76,7 +78,6 @@ async fn main(_spawner: Spawner) {
     buttons::init();
 
     let mut rx = [0u8; 64];
-    let mut last_heartbeat = Instant::now();
     let mut last_scan = Instant::now();
     let mut last_measure = Instant::now();
     let mut measure_buf = [0u8; 64];
@@ -101,20 +102,14 @@ async fn main(_spawner: Spawner) {
         }
 
         // Live TPA626 measurements every second (the tester's actual job).
+        // The tick rides along (#N): the heartbeat line loses the vendor
+        // send race against the measurement line every time, so the tick
+        // in the V= line is the liveness signal instead.
         if last_measure.elapsed() >= Duration::from_secs(1) {
             last_measure = Instant::now();
-            scanner::measure(&mut measure_buf);
-            send_line(&measure_buf[..scanner::last_measure_len()]);
-        }
-
-        // Heartbeat: one line per second, whatever the host does.
-        if last_heartbeat.elapsed() >= Duration::from_secs(1) {
-            last_heartbeat = Instant::now();
-            static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             let tick = TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let mut banner = [0u8; 40];
-            let text = format_banner(tick, &mut banner);
-            send_line(text);
+            scanner::measure(&mut measure_buf, tick);
+            send_line(&measure_buf[..scanner::last_measure_len()]);
         }
 
         Timer::after_millis(2).await;
