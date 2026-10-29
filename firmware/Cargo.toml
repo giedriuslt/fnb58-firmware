@@ -18,3 +18,5 @@ cortex-m-rt = { workspace = true, features = ["paint-stack"] }
 embassy-at32.workspace = true
 embassy-executor.workspace = true
 embassy-time.workspace = true
+embassy-sync.workspace = true
+embedded-hal-async.workspace = true

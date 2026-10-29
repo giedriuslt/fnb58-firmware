@@ -19,6 +19,9 @@
 mod board;
 #[allow(dead_code)]
 mod panel;
+mod scanner;
+
+use embassy_at32::pac::at32f403a::interrupt;
 
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
@@ -54,10 +57,16 @@ async fn main(_spawner: Spawner) {
     // The vendor stack is interrupt-driven: unmask both USBFS lines (the
     // vendor example uses the L line; H is wired identically) and the ACC
     // calibration line. The C handlers override the PAC's weak vectors.
+    // The I2C lines drive the bus scanner's waits.
     use embassy_at32::pac::at32f403a::interrupt;
+
     unsafe {
         cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_L_CAN1_RX0);
         cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_H_CAN1_TX);
+        cortex_m::peripheral::NVIC::unmask(interrupt::I2C1_EVT);
+        cortex_m::peripheral::NVIC::unmask(interrupt::I2C1_ERR);
+        cortex_m::peripheral::NVIC::unmask(interrupt::I2C2_EVT);
+        cortex_m::peripheral::NVIC::unmask(interrupt::I2C2_ERR);
     }
 
     // Vendor init: CRM USB clock enable, cell reset, usbd_core_init with
@@ -68,6 +77,7 @@ async fn main(_spawner: Spawner) {
 
     let mut rx = [0u8; 64];
     let mut last_heartbeat = Instant::now();
+    let mut last_scan = Instant::now();
     loop {
         // Echo anything received (the vendor class buffers OUT data).
         // Newline travels in the SAME packet: the vendor send API rejects
@@ -81,6 +91,13 @@ async fn main(_spawner: Spawner) {
             }
         }
 
+        // I2C discovery scan every 15 s (results repeat so a late-connecting
+        // host still catches them).
+        if last_scan.elapsed() >= Duration::from_secs(15) {
+            last_scan = Instant::now();
+            scanner::run().await;
+        }
+
         // Heartbeat: one line per second, whatever the host does.
         if last_heartbeat.elapsed() >= Duration::from_secs(1) {
             last_heartbeat = Instant::now();
@@ -88,9 +105,7 @@ async fn main(_spawner: Spawner) {
             let tick = TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let mut banner = [0u8; 32];
             let text = format_banner(tick, &mut banner);
-            unsafe {
-                fnb58_usb_send(text.as_ptr(), text.len() as u16);
-            }
+            send_line(text);
         }
 
         Timer::after_millis(2).await;
@@ -98,6 +113,14 @@ async fn main(_spawner: Spawner) {
 }
 
 /// `FNB58 alive <tick>\r\n` into a fixed buffer.
+/// Send one line through the vendor CDC (single packet; the vendor API
+/// rejects a second call while the first is in flight).
+fn send_line(line: &[u8]) {
+    unsafe {
+        fnb58_usb_send(line.as_ptr(), line.len() as u16);
+    }
+}
+
 fn format_banner(tick: u32, buf: &mut [u8; 32]) -> &[u8] {
     const PREFIX: &[u8] = b"FNB58 alive ";
     const CRLF: &[u8] = b"\r\n";
@@ -162,4 +185,24 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[cortex_m_rt::exception]
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
     fault_halt()
+}
+
+#[cortex_m_rt::interrupt]
+fn I2C1_EVT() {
+    embassy_at32::i2c::on_interrupt();
+}
+
+#[cortex_m_rt::interrupt]
+fn I2C1_ERR() {
+    embassy_at32::i2c::on_interrupt();
+}
+
+#[cortex_m_rt::interrupt]
+fn I2C2_EVT() {
+    embassy_at32::i2c::on_interrupt();
+}
+
+#[cortex_m_rt::interrupt]
+fn I2C2_ERR() {
+    embassy_at32::i2c::on_interrupt();
 }

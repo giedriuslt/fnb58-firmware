@@ -8,6 +8,8 @@ cortex-m-rt = "0.7.7"
 embassy-at32 = { path = "../at32f403a-embassy-rs/embassy", features = ["rt", "critical-section-single-core"] }
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
 embassy-time = { version = "0.5.1", features = ["tick-hz-1_000"] }
+embassy-sync = "0.8.0"
+embedded-hal-async = "1.0.0"
 
 [profile.release]
 opt-level = "z"
