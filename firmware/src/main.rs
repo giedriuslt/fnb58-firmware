@@ -23,7 +23,6 @@ mod panel;
 
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
-use panic_halt as _;
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -126,4 +125,31 @@ fn format_banner(tick: u32, buf: &mut [u8; 32]) -> &[u8] {
 #[cortex_m_rt::exception]
 fn SysTick() {
     embassy_at32::time_driver::systick_tick();
+}
+
+/// Drop the D+ pull-up and spin. A panicking or faulting firmware used to
+/// leave the pull-up asserted with the cell NAKing forever — visibly
+/// identical to any protocol failure (Code 43). Dropping the pull-up on
+/// the way down makes a crash observable: the attached device VANISHES.
+fn fault_halt() -> ! {
+    unsafe {
+        // CTRL.DISUSB (bit 1) + CFG.PUO (bit 1): disconnect + pull-up off.
+        let ctrl = (0x4000_5c00 + 0x40) as *mut u32;
+        core::ptr::write_volatile(ctrl, core::ptr::read_volatile(ctrl) | 0b10);
+        let cfg = (0x4000_5c00 + 0x60) as *mut u32;
+        core::ptr::write_volatile(cfg, core::ptr::read_volatile(cfg) | 0b10);
+    }
+    loop {
+        cortex_m::asm::nop();
+    }
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    fault_halt()
+}
+
+#[cortex_m_rt::exception]
+unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
+    fault_halt()
 }

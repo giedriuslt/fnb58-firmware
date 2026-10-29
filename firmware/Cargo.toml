@@ -18,4 +18,3 @@ cortex-m-rt = { workspace = true, features = ["paint-stack"] }
 embassy-at32.workspace = true
 embassy-executor.workspace = true
 embassy-time.workspace = true
-panic-halt.workspace = true
