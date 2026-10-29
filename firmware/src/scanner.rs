@@ -161,18 +161,27 @@ pub async fn run() {
         }
 
         if a == 0x0C {
-            // Mystery device: dump candidate ID registers raw.
-            for reg in [0x00u8, 0x07u8, 0x0Du8, 0x0Fu8, 0x32u8] {
-                let mut b1 = [0u8; 1];
-                let st = unsafe { fnb58_i2c_read(u16::from(x), reg, b1.as_mut_ptr(), 1) };
-                if st == 0 && b1[0] != 0 {
-                    line2.push(b" r");
-                    line2.push_hex(reg);
-                    line2.push(b"=");
-                    line2.push_hex(b1[0]);
+            // Mystery device: wide register dump, values AND read status,
+            // so a NACK (device ignores reads) is distinguishable from
+            // zero returns. 16 registers per line, two lines.
+            for half in 0..2u8 {
+                let mut line3 = heapless_line::Line::new();
+                line3.push(b"0C ");
+                line3.push_hex(half * 16);
+                line3.push(b"-:");
+                for r in 0..16u8 {
+                    let reg = half * 16 + r;
+                    let mut b1 = [0u8; 1];
+                    let st = unsafe { fnb58_i2c_read(u16::from(x), reg, b1.as_mut_ptr(), 1) };
+                    line3.push(b" ");
+                    if st != 0 {
+                        line3.push(b"--"); // NACK/timeout: no response
+                    } else {
+                        line3.push_hex(b1[0]);
+                    }
                 }
+                queue_line(line3.bytes());
             }
-            queue_line(line2.bytes());
         }
     }
 }
