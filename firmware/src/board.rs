@@ -9,13 +9,13 @@
 //! are plain push-pull outputs, and the backlight starts as a digital line
 //! (a PWM timer can replace it once the real pin is known).
 //!
-//! The clock profile uses the internal 8 MHz HICK (PLL input fixed at
-//! HICK/2 = 4 MHz, times 48) so the firmware does not depend on the
-//! board's crystal: SCLK/AHB 192 MHz, APB1/APB2 96 MHz (timers 192 MHz).
-//! 192 MHz is deliberate: the AT32F403A USB divider offers no /5, so a
-//! 240 MHz PLL cannot produce the required 48 MHz USB clock — 192 MHz
-//! with USB /4 is the vendor USB example's own profile (48 = 192/4).
-//! With a crystal, switch `PLL_SOURCE` to `Hext` and set `HEXT_HZ`.
+//! The clock profile is the AT32 system boot ROM's crystalless recipe:
+//! the whole system runs from the internal HICK at 48 MHz
+//! (`clocks::configure_hick48`), and the USB cell is fed from the same
+//! HICK via MISC3.HICK_TO_USB. No PLL and no USB divider are involved:
+//! the AT32F403A USB divider has no /5, so PLL-based 48 MHz USB requires
+//! one of the 72/96/144/168/192 MHz PLL profiles (`CLOCK` below records
+//! the 192 MHz variant for later; the smoke test stays on HICK-48).
 
 use embassy_at32::clocks::{AhbDiv, ApbDiv, Config, PllSource};
 use embassy_at32::gpio::{Drive, Port};
@@ -66,7 +66,9 @@ pub const PIN_DRIVE: Drive = Drive::Moderate;
 /// DMA unit and channel (1-based) used for panel pixel bursts.
 pub const PANEL_DMA: (embassy_at32::dma::Unit, u8) = (embassy_at32::dma::Unit::Dma1, 1);
 
-/// The clock profile described above.
+/// The 192 MHz PLL profile (kept for later stages; the smoke test runs
+/// on `configure_hick48` instead).
+#[allow(dead_code)]
 pub const CLOCK: Config = Config {
     hext_hz: 8_000_000,
     pll_source: PllSource::Hick,

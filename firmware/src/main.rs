@@ -1,15 +1,18 @@
-//! FNB58 open-firmware smoke test: USB CDC virtual COM port.
+//! FNB58 open-firmware smoke test: USB CDC virtual COM port, purely
+//! polled.
+//!
+//! The clock profile is the AT32 system boot ROM's own crystalless
+//! recipe: the whole system (and the USB cell, via MISC3.HICK_TO_USB)
+//! runs from the internal 48 MHz HICK. No PLL, no USB divider, no NVIC
+//! interrupt configuration — the USB cell is serviced by `usb::poll()`
+//! from the main loop, so no interrupt routing can silently break
+//! enumeration.
 //!
 //! The device enumerates as a serial port (VID 0x2e3c PID 0x5859) and
-//! echoes everything it receives, appending a one-per-second heartbeat
-//! line with a tick counter. If the port appears and echoes, the MCU,
-//! flash execution, the 240 MHz clock tree, the 48 MHz USB clock, the USB
-//! cell and its interrupt all work — the complete bring-up baseline,
-//! independent of the (still unverified) display pins.
-//!
-//! The display transport (`panel`) is kept for the next stage but not
-//! started: its pin map is unverified and its failure must not block the
-//! USB proof.
+//! echoes received bytes plus a one-per-second `FNB58 alive <n>`
+//! heartbeat. If the port appears and echoes, the MCU, flash execution,
+//! the 48 MHz HICK clock tree, the USBFS cell and the polling stack all
+//! work.
 
 #![no_std]
 #![no_main]
@@ -18,57 +21,52 @@ mod board;
 #[allow(dead_code)]
 mod panel;
 
-use embassy_at32::pac::at32f403a::interrupt;
 use embassy_executor::Spawner;
-use embassy_time::Timer;
+use embassy_time::{Duration, Instant, Timer};
 use panic_halt as _;
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    // Clocks first: everything else measures time against HCLK.
-    let clocks = match unsafe { embassy_at32::clocks::configure(board::CLOCK) } {
+    // Boot-ROM-style crystalless clocks: 48 MHz HICK everywhere, USB fed
+    // from the same HICK. Everything else measures time against this.
+    let clocks = match unsafe { embassy_at32::clocks::configure_hick48() } {
         Ok(clocks) => clocks,
         Err(_) => loop {
             cortex_m::asm::nop();
         },
     };
     unsafe { embassy_at32::init(clocks) };
-
-    // 48 MHz for the USB cell from the 240 MHz PLL (240 / 5).
-    if unsafe { embassy_at32::usb::enable_usb_clock(clocks.sclk_hz) }.is_err() {
-        loop {
-            cortex_m::asm::nop();
-        }
-    }
-
-    // The USBFS shares NVIC lines with CAN1; the H line is our interrupt.
-    unsafe {
-        cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_H_CAN1_TX);
-        cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_L_CAN1_RX0);
-    }
     unsafe { cortex_m::interrupt::enable() };
 
-    // SAFETY: exclusive startup owns the USBFS cell.
+    // SAFETY: exclusive startup owns the USBFS cell. No NVIC unmasking:
+    // the cell is polled from the loop below.
     unsafe { embassy_at32::usb::init() };
 
-    let mut tick: u32 = 0;
     let mut rx = [0u8; 64];
+    let mut last_heartbeat = Instant::now();
     loop {
-        match embassy_at32::usb::read(&mut rx).await {
-            Ok(0) => {}
-            Ok(n) => {
+        // Service the USB cell (SETUP, completions, reset).
+        embassy_at32::usb::poll();
+
+        // Echo anything received.
+        if let Ok(n) = embassy_at32::usb::try_read(&mut rx) {
+            if n > 0 {
                 let _ = embassy_at32::usb::write(&rx[..n]).await;
                 let _ = embassy_at32::usb::write(b"\r\n").await;
             }
-            // Not configured or timed out: keep the loop alive either way.
-            Err(_) => {}
         }
+
         // Heartbeat: one line per second, whatever the host does.
-        let mut banner = [0u8; 32];
-        let text = format_banner(tick, &mut banner);
-        let _ = embassy_at32::usb::write(text).await;
-        tick = tick.wrapping_add(1);
-        Timer::after_millis(1000).await;
+        if last_heartbeat.elapsed() >= Duration::from_secs(1) {
+            last_heartbeat = Instant::now();
+            static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let tick = TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let mut banner = [0u8; 32];
+            let text = format_banner(tick, &mut banner);
+            let _ = embassy_at32::usb::write(text).await;
+        }
+
+        Timer::after_millis(2).await;
     }
 }
 
@@ -110,14 +108,4 @@ fn format_banner(tick: u32, buf: &mut [u8; 32]) -> &[u8] {
 #[cortex_m_rt::exception]
 fn SysTick() {
     embassy_at32::time_driver::systick_tick();
-}
-
-#[cortex_m_rt::interrupt]
-fn USBFS_H_CAN1_TX() {
-    embassy_at32::usb::on_interrupt();
-}
-
-#[cortex_m_rt::interrupt]
-fn USBFS_L_CAN1_RX0() {
-    embassy_at32::usb::on_interrupt();
 }
