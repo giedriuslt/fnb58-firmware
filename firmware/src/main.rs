@@ -94,11 +94,6 @@ async fn main(_spawner: Spawner) {
             scanner::run().await;
         }
 
-        // Drain the scanner's queued report lines.
-        while let Some(line) = scanner::take_line() {
-            send_line(line);
-        }
-
         // Heartbeat: one line per second, whatever the host does.
         if last_heartbeat.elapsed() >= Duration::from_secs(1) {
             last_heartbeat = Instant::now();
@@ -115,8 +110,9 @@ async fn main(_spawner: Spawner) {
 
 /// `FNB58 alive <tick>\r\n` into a fixed buffer.
 /// Send one line through the vendor CDC (single packet; the vendor API
-/// rejects a second call while the first is in flight).
-fn send_line(line: &[u8]) {
+/// rejects a second call while the first is in flight). Public: the
+/// scanner module sends its report lines through this too.
+pub fn send_line(line: &[u8]) {
     // Trim at the first NUL: queue slots are fixed-size and zero-padded.
     let len = line
         .iter()
@@ -128,7 +124,7 @@ fn send_line(line: &[u8]) {
 }
 
 fn format_banner(tick: u32, buf: &mut [u8; 40]) -> &[u8] {
-    const PREFIX: &[u8] = b"FNB58 r17 alive ";
+    const PREFIX: &[u8] = b"FNB58 r21 alive ";
     const CRLF: &[u8] = b"\r\n";
     let mut n = 0;
     for &b in PREFIX {

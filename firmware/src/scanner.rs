@@ -12,43 +12,9 @@ unsafe extern "C" {
     fn fnb58_i2c_read(address: u16, reg: u8, out: *mut u8, len: u16) -> u32;
 }
 
-/// Ring of queued report lines (the scanner queues up to ~5 lines per
-/// cycle while the main loop can't drain; a single slot lost them).
-const RING_SLOTS: usize = 8;
-static mut RING_STORE: [[u8; 64]; RING_SLOTS] = [[0; 64]; RING_SLOTS];
-static RING_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static RING_HEAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
 fn queue_line(text: &[u8]) {
-    // SAFETY: single-threaded scanner and drain (main task only).
-    let ring = &raw mut RING_STORE;
-    let len = RING_LEN.load(Ordering::Acquire);
-    if len >= RING_SLOTS {
-        return; // full: drop (bring-up semantics)
-    }
-    let head = RING_HEAD.load(Ordering::Acquire);
-    let slot = unsafe { &mut (*ring)[head] };
-    let n = text.len().min(63);
-    *slot = [0; 64];
-    slot[..n].copy_from_slice(&text[..n]);
-    RING_HEAD.store((head + 1) % RING_SLOTS, Ordering::Release);
-    RING_LEN.store(len + 1, Ordering::Release);
-}
-
-/// Take the queued report line, if any.
-pub fn take_line() -> Option<&'static [u8]> {
-    let len = RING_LEN.load(Ordering::Acquire);
-    if len == 0 {
-        return None;
-    }
-    // SAFETY: single-threaded scanner and drain (main task only).
-    let ring = &raw mut RING_STORE;
-    let tail = (RING_HEAD.load(Ordering::Acquire) + RING_SLOTS - len) % RING_SLOTS;
-    let line = unsafe { &(*ring)[tail] };
-    let end = line.iter().position(|&b| b == 0).unwrap_or(64);
-    let out: &'static [u8] = unsafe { core::mem::transmute(&line[..end]) };
-    RING_LEN.store(len - 1, Ordering::Release);
-    Some(out)
+    // Direct send: the CDC path is proven; no queue in between.
+    crate::send_line(text);
 }
 
 /// Fixed-capacity scratch line buffer.
