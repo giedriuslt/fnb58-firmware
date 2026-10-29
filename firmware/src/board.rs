@@ -10,9 +10,12 @@
 //! (a PWM timer can replace it once the real pin is known).
 //!
 //! The clock profile uses the internal 8 MHz HICK (PLL input fixed at
-//! HICK/2 = 4 MHz, times 60) so the scaffold does not depend on the board's
-//! crystal: SCLK/AHB 240 MHz, APB1/APB2 120 MHz (timers 240 MHz). If the
-//! board has a crystal, switch `PLL_SOURCE` to `Hext` and set `HEXT_HZ`.
+//! HICK/2 = 4 MHz, times 48) so the firmware does not depend on the
+//! board's crystal: SCLK/AHB 192 MHz, APB1/APB2 96 MHz (timers 192 MHz).
+//! 192 MHz is deliberate: the AT32F403A USB divider offers no /5, so a
+//! 240 MHz PLL cannot produce the required 48 MHz USB clock — 192 MHz
+//! with USB /4 is the vendor USB example's own profile (48 = 192/4).
+//! With a crystal, switch `PLL_SOURCE` to `Hext` and set `HEXT_HZ`.
 
 use embassy_at32::clocks::{AhbDiv, ApbDiv, Config, PllSource};
 use embassy_at32::gpio::{Drive, Port};
@@ -48,8 +51,8 @@ pub const PIN_BACKLIGHT: (Port, u8) = (Port::B, 3);
 /// SPI mode for the ST7789 (CPOL 0, CPHA 0; the KWS-X1 also used the
 /// sampled-on-first-edge family).
 pub const SPI_MODE: embassy_at32::spi::Mode = embassy_at32::spi::Mode::Mode0;
-/// 120 MHz APB2 / 4 = 30 MHz SCK: a conservative first-light rate; /2
-/// (60 MHz) is near the ST7789's write limit and can be tried next.
+/// 96 MHz APB2 / 4 = 24 MHz SCK: a conservative first-light rate; /2
+/// (48 MHz) is near the ST7789's write limit and can be tried next.
 pub const SPI_DIVIDER: embassy_at32::spi::Divider = embassy_at32::spi::Divider::Div4;
 
 /// Initial output levels: CS active low, DC idle low, reset released high,
@@ -67,13 +70,13 @@ pub const PANEL_DMA: (embassy_at32::dma::Unit, u8) = (embassy_at32::dma::Unit::D
 pub const CLOCK: Config = Config {
     hext_hz: 8_000_000,
     pll_source: PllSource::Hick,
-    pll_multiplier: 60,
+    pll_multiplier: 48,
     ahb: AhbDiv::Div1,
     apb1: ApbDiv::Div2,
     apb2: ApbDiv::Div2,
 };
 
 /// Timer-clock input for APB1 timers (PWM candidates) under [`CLOCK`]:
-/// divided buses double, so 120 MHz x 2.
+/// divided buses double, so 96 MHz x 2.
 #[allow(dead_code)]
-pub const TIMER1_HZ: u32 = 240_000_000;
+pub const TIMER1_HZ: u32 = 192_000_000;
