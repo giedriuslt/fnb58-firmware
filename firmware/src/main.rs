@@ -26,32 +26,27 @@ use embassy_time::{Duration, Instant, Timer};
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    // Crystal-first clocks: PLL from HEXT for a USB-accurate bit rate,
-    // HICK-48 fallback when no crystal oscillates.
-    //
-    // DIAGNOSTIC CONTRACT (round 8): the HICK fallback never attaches.
-    // The HICK's ±1% makes the USB transmitter out of spec, so a fallback
-    // build could only ever produce another Code 43 — indistinguishable
-    // from a protocol bug. Not attaching makes the clock path visible
-    // from outside:
-    //   - device appears (even as Code 43)  -> crystal path ran; the USB
-    //     bit rate is crystal-accurate and any remaining failure is
-    //     protocol-level;
-    //   - nothing appears at all            -> HEXT never stabilized on
-    //     the AT32 (the board's 8 MHz crystal is elsewhere, e.g. the BLE
-    //     module) -> the ACC HICK-trim path is the fix.
-    let Ok((clocks, crystal)) =
+    // Crystal-first clocks; the round-10 capture proved the HICK-fallback
+    // halt left the device invisible (no host event at all), which made
+    // every later "Code 43" sighting untrustworthy as a clock-path signal:
+    // Device Manager keeps failed entries listed, so a stale one reads as
+    // a fresh attach. Round 11 attaches UNCONDITIONALLY — whatever the
+    // clock path, the host must see a connect event (USBPcap URBs on the
+    // hub), separating fresh attach from stale entries. A crash after
+    // this point drops the pull-up (fault handler below), so the visible
+    // outcomes are:
+    //   - host URBs in the capture, device stays  -> attach + live
+    //     protocol exchange on the wire: direct evidence;
+    //   - device vanishes                          -> firmware crashed;
+    //   - nothing at all                           -> never reached the
+    //     connect (pre-init fault).
+    let Ok((clocks, _crystal)) =
         (unsafe { embassy_at32::clocks::configure_usb(board::HEXT_HZ) })
     else {
         loop {
             cortex_m::asm::nop();
         }
     };
-    if !crystal {
-        loop {
-            cortex_m::asm::nop();
-        }
-    }
     unsafe { embassy_at32::init(clocks) };
     unsafe { cortex_m::interrupt::enable() };
 
