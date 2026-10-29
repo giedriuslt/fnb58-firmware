@@ -90,6 +90,7 @@ const CANDIDATES: [Candidate; 3] = [
 /// Run one full scan cycle: every candidate bus, every address 0x08..=0x78,
 /// then identify the ACKed devices. One report line per candidate.
 pub async fn run() {
+    scan_pullups();
     let pclk1 = 96_000_000; // APB1 under the 192 MHz crystal clock profile.
     for candidate in CANDIDATES {
         let mut report = heapless_line::Line::new();
@@ -231,6 +232,107 @@ async fn read_kxtj3(bus: &mut I2c, address: u8) -> Option<u8> {
     (buf[0] == 0x35).then_some(buf[0])
 }
 
+// --- Raw GPIO access (register-level, no HAL pin-claim contract: the
+// probe re-runs every cycle on the same pins). ---
+
+const GPIOA_BASE: usize = 0x4001_0800;
+const GPIOB_BASE: usize = 0x4001_0C00;
+const GPIOC_BASE: usize = 0x4001_1000;
+
+fn gpio_base(port: Port) -> usize {
+    match port {
+        Port::A => GPIOA_BASE,
+        Port::B => GPIOB_BASE,
+        Port::C => GPIOC_BASE,
+        _ => GPIOC_BASE,
+    }
+}
+
+/// Configure one pin as input with the pull latch at `low` (pulldown),
+/// read it, and restore its previous configuration. Returns the level
+/// read while pulled down: 1 means an external pull-up is present.
+unsafe fn probe_pullup(port: Port, num: u8) -> Option<bool> {
+    if num > 15 {
+        return None;
+    }
+    let base = gpio_base(port);
+    let cfglr = (base) as *mut u32;
+    let cfghr = (base + 4) as *mut u32;
+    let idt = (base + 8) as *mut u32;
+    let clr = (base + 0x14) as *mut u32;
+    let scr = (base + 0x10) as *mut u32;
+
+    let (reg, shift) = if num < 8 {
+        (cfglr, num * 4)
+    } else {
+        (cfghr, (num - 8) * 4)
+    };
+    // Save the previous nibble.
+    let saved = (reg.read_volatile() >> shift) & 0xF;
+    // Input + pull (mode 00, cfg 10).
+    let value = (reg.read_volatile() & !(0xF << shift)) | (0b10 << shift);
+    reg.write_volatile(value);
+    // Latch the pull direction low (pulldown) via CLR (write-1-to-clear
+    // the ODT latch) and give the line a moment to settle.
+    clr.write_volatile(1 << num);
+    let _ = scr.read_volatile();
+    for _ in 0..200 {
+        core::hint::spin_loop();
+    }
+    let level = (idt.read_volatile() >> num) & 1 == 1;
+    // Restore the previous configuration.
+    let value = (reg.read_volatile() & !(0xF << shift)) | (saved << shift);
+    reg.write_volatile(value);
+    Some(level)
+}
+
+/// Pins skipped in the pull-up probe: USB data (PA11/PA12), SWD
+/// (PA13/PA14), crystal pins (PD0/PD1, PC14/PC15 - PC14/15 could be
+/// OSC32 or GPIO; leaving them out is the safe choice).
+const PROBE_SKIP: [(&Port, u8); 5] = [
+    (&Port::A, 11),
+    (&Port::A, 12),
+    (&Port::A, 13),
+    (&Port::A, 14),
+    (&Port::C, 14),
+];
+
+/// Scan every probe-safe pin: report those reading HIGH with the
+/// internal pull-down enabled (= external pull-up present). Lines are
+/// emitted per port.
+fn scan_pullups() {
+    let ports = [(Port::A, "PA", 16u8), (Port::B, "PB", 16), (Port::C, "PC", 13)];
+    for (port, name, count) in ports {
+        let mut line = heapless_line::Line::new();
+        line.push(b"[pu] ");
+        line.push(name.as_bytes());
+        line.push(b":");
+        let mut found = 0;
+        for num in 0..count {
+            if PROBE_SKIP.iter().any(|(p, n)| **p == port && *n == num) {
+                continue;
+            }
+            // SAFETY: forwarded from the scanner's bring-up contract.
+            if let Some(true) = (unsafe { probe_pullup(port, num) }) {
+                line.push(b" ");
+                line.push_num(num);
+                found += 1;
+            }
+        }
+        if found == 0 {
+            line.push(b" none");
+        }
+        queue_line(line.bytes());
+    }
+}
+
+/// Read one pin's current input level as input-floating.
+unsafe fn read_pin(port: Port, num: u8) -> Option<bool> {
+    let base = gpio_base(port);
+    let idt = (base + 8) as *mut u32;
+    Some(((idt.read_volatile() >> num) & 1) == 1)
+}
+
 fn set_i2c1_mux(remapped: bool) {
     // IOMUX needs the APB2 clock (enabled here unconditionally; cheap).
     // SAFETY: bring-up scanner, exclusive CRM/IOMUX ownership.
@@ -261,6 +363,26 @@ mod heapless_line {
                     self.buf[self.len] = b;
                     self.len += 1;
                 }
+            }
+        }
+
+        pub fn push_num(&mut self, value: u8) {
+            // Decimal.
+            if value == 0 {
+                self.push(b"0");
+                return;
+            }
+            let mut digits = [0u8; 3];
+            let mut n = 0;
+            let mut v = value;
+            while v > 0 {
+                digits[n] = b'0' + v % 10;
+                v /= 10;
+                n += 1;
+            }
+            while n > 0 {
+                n -= 1;
+                self.push(&[digits[n]]);
             }
         }
 
