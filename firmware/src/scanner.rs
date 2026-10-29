@@ -58,6 +58,71 @@ mod heapless_line {
     }
 }
 
+/// The last measurement's length (set by `measure`).
+static MEASURE_LEN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static mut MEASURE_STORE: [u8; 64] = [0; 64];
+
+/// Read the TPA626 (7-bit 0x40) and format one measurement line:
+/// `V=5.04V I=+123uA(raw)` — current is shunt-voltage raw until the board
+/// shunt resistance is confirmed for the CAL register.
+pub fn measure(out: &mut [u8]) {
+    // SAFETY: main-task only.
+    let store = unsafe { &mut *core::ptr::addr_of_mut!(MEASURE_STORE) };
+    let mut line = heapless_line::Line::new();
+    const TPA_X: u16 = 0x80; // 7-bit 0x40 in the vendor 8-bit form
+
+    let mut vb = [0u8; 2];
+    if unsafe { fnb58_i2c_read(TPA_X, 0x02, vb.as_mut_ptr(), 2) } == 0 {
+        let raw = (u16::from(vb[0]) << 8) | u16::from(vb[1]);
+        let mv = (raw as u32 * 125 / 100) as u16;
+        line.push(b"V=");
+        if mv >= 10000 {
+            line.push(&[b'0' + (mv / 10000) as u8]);
+        }
+        line.push(&[b'0' + (mv / 1000 % 10) as u8, b'.']);
+        line.push(&[b'0' + (mv / 100 % 10) as u8, b'0' + (mv / 10 % 10) as u8]);
+        line.push(b"V");
+    } else {
+        line.push(b"V=--");
+    }
+
+    // Shunt voltage, 2.5 uV/LSB, signed 16-bit. Calibration pending:
+    // the board's shunt resistance is unconfirmed (~20 mOhm class).
+    let mut sh = [0u8; 2];
+    if unsafe { fnb58_i2c_read(TPA_X, 0x04, sh.as_mut_ptr(), 2) } == 0 {
+        let raw = (u16::from(sh[0]) << 8) | u16::from(sh[1]);
+        let signed = raw as i16;
+        line.push(b" I=");
+        if signed < 0 {
+            line.push(b"-");
+        }
+        let uv = signed.unsigned_abs() as u32;
+        // 6 fixed digits of microvolts.
+        for digit in [
+            (uv / 100_000 % 10) as u8,
+            (uv / 10_000 % 10) as u8,
+            (uv / 1_000 % 10) as u8,
+            (uv / 100 % 10) as u8,
+            (uv / 10 % 10) as u8,
+            (uv % 10) as u8,
+        ] {
+            line.push(&[b'0' + digit]);
+        }
+        line.push(b"uV");
+    } else {
+        line.push(b" I=--");
+    }
+    let n = line.peak().len();
+    out[..n].copy_from_slice(&line.peak()[..n]);
+    MEASURE_LEN.store(n, Ordering::Release);
+}
+
+/// Length of the last formatted measurement.
+pub fn last_measure_len() -> usize {
+    MEASURE_LEN.load(Ordering::Acquire)
+}
+
 /// Run one full scan cycle on the traced bus (I2C1, PB6/PB7).
 ///
 /// Address convention (decoded from the round-18 scan): the vendor

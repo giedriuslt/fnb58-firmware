@@ -74,6 +74,8 @@ async fn main(_spawner: Spawner) {
     let mut rx = [0u8; 64];
     let mut last_heartbeat = Instant::now();
     let mut last_scan = Instant::now();
+    let mut last_measure = Instant::now();
+    let mut measure_buf = [0u8; 64];
     loop {
         // Echo anything received (the vendor class buffers OUT data).
         // Newline travels in the SAME packet: the vendor send API rejects
@@ -92,6 +94,13 @@ async fn main(_spawner: Spawner) {
         if last_scan.elapsed() >= Duration::from_secs(15) {
             last_scan = Instant::now();
             scanner::run().await;
+        }
+
+        // Live TPA626 measurements every second (the tester's actual job).
+        if last_measure.elapsed() >= Duration::from_secs(1) {
+            last_measure = Instant::now();
+            scanner::measure(&mut measure_buf);
+            send_line(&measure_buf[..scanner::last_measure_len()]);
         }
 
         // Heartbeat: one line per second, whatever the host does.
