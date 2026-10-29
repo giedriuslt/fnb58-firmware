@@ -133,15 +133,40 @@ fn SysTick() {
 /// leave the pull-up asserted with the cell NAKing forever — visibly
 /// identical to any protocol failure (Code 43). Dropping the pull-up on
 /// the way down makes a crash observable: the attached device VANISHES.
+///
+/// Round 13: the fault handler first BLINKS the crash code through the
+/// pull-up itself — the device visibly flickers back N times (250 ms on,
+/// 250 ms off) and then disappears for good. Codes: 1 = crashed after
+/// connect, 2 = crashed servicing a bus reset, 3 = crashed dispatching a
+/// SETUP, 4 = crashed queuing a descriptor response. No blink = crashed
+/// before the connect. The blink runs on busy-wait delays (no timers in
+/// a fault context); at 48-192 MHz a 250 ms tick is a few million nops.
 fn fault_halt() -> ! {
+    let code = embassy_at32::usb::CRASH_CODE.load(core::sync::atomic::Ordering::Acquire);
     unsafe {
-        // CTRL.DISUSB (bit 1) + CFG.PUO (bit 1): disconnect + pull-up off.
         let ctrl = (0x4000_5c00 + 0x40) as *mut u32;
-        core::ptr::write_volatile(ctrl, core::ptr::read_volatile(ctrl) | 0b10);
         let cfg = (0x4000_5c00 + 0x60) as *mut u32;
+        // Disconnect first, then blink only CFG.PUO (the pull-up).
+        core::ptr::write_volatile(ctrl, core::ptr::read_volatile(ctrl) | 0b10);
+        for _ in 0..code {
+            // OFF (pull-up disabled): PUO = 1.
+            core::ptr::write_volatile(cfg, core::ptr::read_volatile(cfg) | 0b10);
+            delay_ms(300);
+            // ON (pull-up enabled): PUO = 0.
+            core::ptr::write_volatile(cfg, core::ptr::read_volatile(cfg) & !0b10);
+            delay_ms(300);
+        }
+        // OFF forever.
         core::ptr::write_volatile(cfg, core::ptr::read_volatile(cfg) | 0b10);
     }
     loop {
+        cortex_m::asm::nop();
+    }
+}
+
+/// ~300 ms busy wait. 192 MHz, ~5 cycles per loop iteration: 30M loops.
+fn delay_ms(_ms: u32) {
+    for _ in 0..30_000_000 {
         cortex_m::asm::nop();
     }
 }
