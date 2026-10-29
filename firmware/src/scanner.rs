@@ -2,9 +2,8 @@
 //! SCL pin 42, user-traced). Probes addresses, identifies known devices
 //! by ID registers, and queues report lines for the CDC.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::Ordering;
 
-use embassy_at32::pac::at32f403a::interrupt;
 
 unsafe extern "C" {
     fn fnb58_i2c_init();

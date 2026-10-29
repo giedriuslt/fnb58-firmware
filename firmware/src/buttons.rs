@@ -10,7 +10,6 @@
 //! scheme the KWS-X1 firmware used. If nothing changes in this mode, a
 //! pull-down phase (press-to-VCC buttons) is the fallback.
 
-use embassy_at32::pac::at32f403a::interrupt;
 
 const GPIOA_BASE: usize = 0x4001_0800;
 const GPIOB_BASE: usize = 0x4001_0C00;
