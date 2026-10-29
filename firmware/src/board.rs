@@ -9,16 +9,27 @@
 //! are plain push-pull outputs, and the backlight starts as a digital line
 //! (a PWM timer can replace it once the real pin is known).
 //!
-//! The clock profile is the AT32 system boot ROM's crystalless recipe:
-//! the whole system runs from the internal HICK at 48 MHz
-//! (`clocks::configure_hick48`), and the USB cell is fed from the same
-//! HICK via MISC3.HICK_TO_USB. No PLL and no USB divider are involved:
-//! the AT32F403A USB divider has no /5, so PLL-based 48 MHz USB requires
-//! one of the 72/96/144/168/192 MHz PLL profiles (`CLOCK` below records
-//! the 192 MHz variant for later; the smoke test stays on HICK-48).
+//! Clock strategy for USB: `clocks::configure_usb(HEXT_HZ)` runs the PLL
+//! from the board's crystal so the USB bit rate is crystal-accurate (USB
+//! full-speed needs about ±0.25%; the ±1% HICK drifts several bit times
+//! per packet, which the host reads as corruption — a device that
+//! attaches but fails every descriptor request). When no crystal
+//! oscillates, it falls back to the 48 MHz HICK profile, whose USB
+//! timing stays out of spec until ACC calibration lands. `CLOCK` below
+//! records the pure-HICK PLL variant for logic-only work.
 
 use embassy_at32::clocks::{AhbDiv, ApbDiv, Config, PllSource};
 use embassy_at32::gpio::{Drive, Port};
+
+/// The board crystal frequency. **UNVERIFIED**: 8 MHz is the standard
+/// AT32 board value, but the FNB58's crystal (if present) has not been
+/// identified. `configure_usb` waits a bounded time for HEXT to
+/// stabilize — if no crystal exists, it falls back to HICK — but if a
+/// crystal oscillates at a *different* frequency than this constant, the
+/// PLL math produces a wrong system clock and USB fails again. If
+/// enumeration still fails, verify this value against the board (the
+/// crystal sits near the AT32, usually marked e.g. "8.000").
+pub const HEXT_HZ: u32 = 8_000_000;
 
 /// Panel geometry: the ST7789's native 240x320 memory, rotated to
 /// landscape. `0x60` is MX | MV (as the KWS-X1 panel used); a full-size
