@@ -7,12 +7,11 @@
 //! retired: this firmware runs the vendor middleware verbatim, the same
 //! code that drives Artery's own examples on this exact silicon.
 //!
-//! Clock: HICK 48 MHz everywhere (`configure_hick48`), USB fed from the
-//! same HICK, plus the vendor's **ACC auto-calibration** (HICK trim via
-//! USB SOF, c1/c2/c3 = 7980/8000/8020) — the crystalless recipe the
-//! vendor's virtual_comport example uses when no crystal is present. The
-//! device enumerates as a CDC serial port and echoes received bytes plus
-//! a one-per-second heartbeat.
+//! Clock: 192 MHz PLL from the board's 8 MHz crystal with USB /4 — the
+//! exact configuration of the vendor `virtual_comport` example, which was
+//! confirmed enumerating on this board (round 15 control experiment). The
+//! vendor C stack handles the cell; this main only configures clocks,
+//! unmasks the IRQs and echoes via the vendor `usb_vcp` API.
 
 #![no_std]
 #![no_main]
