@@ -98,6 +98,11 @@ async fn main(_spawner: Spawner) {
             scanner::run().await;
         }
 
+        // Drain the scanner's queued report lines.
+        while let Some(line) = scanner::take_line() {
+            send_line(line);
+        }
+
         // Heartbeat: one line per second, whatever the host does.
         if last_heartbeat.elapsed() >= Duration::from_secs(1) {
             last_heartbeat = Instant::now();

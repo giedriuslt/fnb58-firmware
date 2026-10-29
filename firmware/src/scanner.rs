@@ -28,7 +28,7 @@ static mut LINE_STORE: [u8; 64] = [0; 64];
 
 fn queue_line(text: &[u8]) {
     // SAFETY: single-threaded scanner and drain (main task only).
-    let store = unsafe { &raw mut LINE_STORE };
+    let store = &raw mut LINE_STORE;
     let line = unsafe { &mut *store };
     let n = text.len().min(63);
     *line = [0; 64];
@@ -112,7 +112,7 @@ pub async fn run() {
         }
         set_i2c1_mux(candidate.remap_i2c1);
 
-        let mut bus = match candidate.instance {
+        let bus = match candidate.instance {
             Instance::I2c1 => unsafe { I2c::new_i2c1(pclk1, Speed::Standard) },
             Instance::I2c2 => unsafe { I2c::new_i2c2(pclk1, Speed::Standard) },
         };
