@@ -188,7 +188,3 @@ unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
     fault_halt()
 }
 
-#[cortex_m_rt::interrupt]
-fn I2C2_ERR() {
-    embassy_at32::i2c::on_interrupt();
-}
