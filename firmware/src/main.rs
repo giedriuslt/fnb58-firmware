@@ -63,10 +63,6 @@ async fn main(_spawner: Spawner) {
     unsafe {
         cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_L_CAN1_RX0);
         cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_H_CAN1_TX);
-        cortex_m::peripheral::NVIC::unmask(interrupt::I2C1_EVT);
-        cortex_m::peripheral::NVIC::unmask(interrupt::I2C1_ERR);
-        cortex_m::peripheral::NVIC::unmask(interrupt::I2C2_EVT);
-        cortex_m::peripheral::NVIC::unmask(interrupt::I2C2_ERR);
     }
 
     // Vendor init: CRM USB clock enable, cell reset, usbd_core_init with
@@ -190,21 +186,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[cortex_m_rt::exception]
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
     fault_halt()
-}
-
-#[cortex_m_rt::interrupt]
-fn I2C1_EVT() {
-    embassy_at32::i2c::on_interrupt();
-}
-
-#[cortex_m_rt::interrupt]
-fn I2C1_ERR() {
-    embassy_at32::i2c::on_interrupt();
-}
-
-#[cortex_m_rt::interrupt]
-fn I2C2_EVT() {
-    embassy_at32::i2c::on_interrupt();
 }
 
 #[cortex_m_rt::interrupt]
