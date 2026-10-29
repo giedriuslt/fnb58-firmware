@@ -38,13 +38,16 @@ extern "C" fn fnb58_usbd_event_hook() {}
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    // HICK-48 clocks for the whole system, USB clocked from the same HICK
-    // (MISC3.HICK_TO_USB) — the vendor ACC example's crystalless recipe.
-    let clocks = match unsafe { embassy_at32::clocks::configure_hick48() } {
-        Ok(clocks) => clocks,
-        Err(_) => loop {
+    // Clock: 192 MHz PLL from the 8 MHz crystal with USB /4 — the exact
+    // configuration of the vendor virtual_comport example, which was
+    // confirmed working on this board (COM6). Round 14's HICK+ACC path is
+    // retired; the crystal is proven present.
+    let Ok((clocks, _crystal)) =
+        (unsafe { embassy_at32::clocks::configure_usb(board::HEXT_HZ) })
+    else {
+        loop {
             cortex_m::asm::nop();
-        },
+        }
     };
     unsafe { embassy_at32::init(clocks) };
     unsafe { cortex_m::interrupt::enable() };

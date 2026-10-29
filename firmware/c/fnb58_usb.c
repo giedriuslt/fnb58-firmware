@@ -18,33 +18,14 @@ usbd_core_type usb_core_dev;
 
 extern void fnb58_usbd_event_hook(void);
 
-static void usb_clock48m_hick_acc(void)
-{
-  /* vendor crm_usb_clock_source_select(HICK) equivalent, done by the Rust
-     clock setup (HICKDIV=NODIV + HICK_TO_SCLK + HICK_TO_USB). Here: only
-     the ACC trim, exactly as the vendor virtual_comport example does. */
-  crm_periph_clock_enable(CRM_ACC_PERIPH_CLOCK, TRUE);
-
-  /* update the c1\c2\c3 value (vendor constants for 48 MHz HICK) */
-  acc_write_c1(7980);
-  acc_write_c2(8000);
-  acc_write_c3(8020);
-
-  /* open acc calibration */
-  acc_calibration_mode_enable(ACC_CAL_HICKTRIM, TRUE);
-}
-
 void fnb58_usb_init(void)
 {
-  usb_clock48m_hick_acc();
-
-  /* enable usb clock */
+  /* The 48 MHz USB clock is already programmed by the Rust clock setup:
+     192 MHz PLL from the 8 MHz crystal (vendor-proven on this board) with
+     CRM_USB_DIV_4. The example does not reset the cell here - neither do
+     we. Init order matches the vendor virtual_comport example exactly:
+     clock enable, usbd_core_init, connect (NVIC is unmasked by main). */
   crm_periph_clock_enable(CRM_USB_PERIPH_CLOCK, TRUE);
-
-  /* reset the usb cell (the vendor BSP does this between clock setup and
-     usbd_core_init when switching clock sources) */
-  crm_periph_reset(CRM_USB_PERIPH_CLOCK, TRUE);
-  crm_periph_reset(CRM_USB_PERIPH_CLOCK, FALSE);
 
   usbd_core_init(&usb_core_dev, USB, &cdc_class_handler, &cdc_desc_handler, 0);
 
