@@ -36,6 +36,7 @@ fn main() {
         vendor.join("libraries/drivers/inc"),
         vendor.join("middlewares/usbd_drivers/inc"),
         vendor.join("middlewares/usbd_class/cdc"),
+        vendor.join("middlewares/i2c_application_library"),
         c_dir.clone(),
     ];
 
@@ -44,6 +45,10 @@ fn main() {
         vendor.join("libraries/drivers/src/at32f403a_407_usb.c"),
         vendor.join("libraries/drivers/src/at32f403a_407_crm.c"),
         vendor.join("libraries/drivers/src/at32f403a_407_acc.c"),
+        vendor.join("libraries/drivers/src/at32f403a_407_i2c.c"),
+        vendor.join("libraries/drivers/src/at32f403a_407_gpio.c"),
+        c_dir.join("fnb58_i2c.c"),
+        vendor.join("middlewares/i2c_application_library/i2c_application.c"),
         vendor.join("middlewares/usbd_drivers/src/usbd_core.c"),
         vendor.join("middlewares/usbd_drivers/src/usbd_int.c"),
         vendor.join("middlewares/usbd_drivers/src/usbd_sdr.c"),
@@ -73,6 +78,7 @@ fn main() {
             "-fdata-sections",
             "-ffreestanding", "-include", "stddef.h",
             "-DAT32F403ACGT7", "-DUSB_MODULE_ENABLED", "-DCRM_MODULE_ENABLED", "-DACC_MODULE_ENABLED",
+            "-DI2C_MODULE_ENABLED", "-DGPIO_MODULE_ENABLED", "-DDMA_MODULE_ENABLED",
             "-std=gnu99",
             "-Wall",
         ]);

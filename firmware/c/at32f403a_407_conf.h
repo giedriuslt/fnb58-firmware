@@ -20,6 +20,10 @@ extern "C" {
 #include "at32f403a_407_crm.h"
 #include "at32f403a_407_acc.h"
 #include "at32f403a_407_usb.h"
+#include "at32f403a_407_i2c.h"
+#include "at32f403a_407_dma.h"
+#include "at32f403a_407_i2c.h"
+#include "at32f403a_407_dma.h"
 #include "at32f403a_407_gpio.h"
 #include "at32f403a_407_misc.h"
 
