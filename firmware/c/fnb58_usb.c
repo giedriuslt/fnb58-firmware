@@ -79,6 +79,12 @@ void usb_usart_config(linecoding_type linecoding)
   (void)linecoding;
 }
 
+/* Returns 1 when the USB host has configured the device (CDC ready). */
+uint32_t fnb58_usb_configured(void)
+{
+  return (usb_core_dev.conn_state == USB_CONN_STATE_CONFIGURED) ? 1 : 0;
+}
+
 /* Vendor usbd_core.c calls usb_delay_ms between init steps. */
 volatile uint32_t fnb58_delay_ticks = 0;
 

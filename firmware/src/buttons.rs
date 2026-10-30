@@ -35,6 +35,10 @@ static mut DEB_DOWN: [u8; 47] = [0; 47];
 static mut DEB_UP: [u8; 47] = [0; 47];
 static mut INITED: bool = false;
 
+unsafe extern "C" {
+    fn fnb58_usb_send(data: *const u8, len: u16) -> i32;
+}
+
 fn is_skipped(port: u8, num: u8) -> bool {
     SKIP.iter().any(|(p, n)| *p == port && *n == num)
 }
@@ -137,7 +141,7 @@ pub fn poll() {
                 let suffix: &[u8] = if now_down { b" down" } else { b" up" };
                 line[n..n + suffix.len()].copy_from_slice(suffix);
                 n += suffix.len();
-                crate::send_line(&line[..n]);
+                unsafe { fnb58_usb_send(line[..n].as_ptr(), n as u16); }
                 // SAFETY: single-threaded.
                 unsafe {
                     let l = &mut LAST[last_idx];

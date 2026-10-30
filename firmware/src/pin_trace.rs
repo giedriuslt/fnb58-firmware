@@ -33,6 +33,11 @@ const GPIOA_BASE: usize = 0x4001_0800;
 const GPIOB_BASE: usize = 0x4001_0C00;
 const GPIOC_BASE: usize = 0x4001_1000;
 
+unsafe extern "C" {
+    fn fnb58_usb_send(data: *const u8, len: u16) -> i32;
+    fn fnb58_usb_configured() -> u32;
+}
+
 /// A traceable GPIO pin: (physical pin, name, base, num, note).
 struct TracePin {
     phys: u8,
@@ -105,75 +110,174 @@ fn delay_10s() {
 }
 
 /// Send a line via CDC.
-fn send(text: &[u8]) {
-    crate::send_line(text);
-}
 
-/// Run the full pin trace sweep for physical pins 1-24.
-/// Uses hardcoded byte literals (same pattern as "done" which works).
+
+/// Run the full pin trace sweep.
+/// Every message is a DIRECT fnb58_usb_send call with a hardcoded byte
+/// literal - no wrapper functions, no formatting, no indirection.
 pub fn sweep() {
-    // Enable GPIOA/B/C clocks.
-    // SAFETY: exclusive CRM ownership.
-    let crm = unsafe { embassy_at32::pac::at32f403a::CRM::steal() };
-    crm.apb2en().modify(|_, w| {
-        w.gpioa().bit(true);
-        w.gpiob().bit(true);
-        w.gpioc().bit(true);
-        w
-    });
-
-    send(b"[trace] === pins 1-24 sweep, 10s each ===");
-    send(b"[trace] probe display wires w/ multimeter");
-
-    // (physical pin, GPIO name, base, num, label)
-    const PINS: [(&[u8], usize, u8); 14] = [
-        (b"pin2 PC13", GPIOC_BASE, 13),
-        (b"pin12 PA0", GPIOA_BASE, 0),
-        (b"pin13 PA1", GPIOA_BASE, 1),
-        (b"pin14 PA2", GPIOA_BASE, 2),
-        (b"pin15 PA3", GPIOA_BASE, 3),
-        (b"pin16 PA4", GPIOA_BASE, 4),
-        (b"pin17 PA5 SCK", GPIOA_BASE, 5),
-        (b"pin18 PA6 MISO", GPIOA_BASE, 6),
-        (b"pin19 PA7 MOSI", GPIOA_BASE, 7),
-        (b"pin20 PB0", GPIOB_BASE, 0),
-        (b"pin21 PB1", GPIOB_BASE, 1),
-        (b"pin22 PB2", GPIOB_BASE, 2),
-        (b"pin23 PB10", GPIOB_BASE, 10),
-        (b"pin24 PB11", GPIOB_BASE, 11),
-    ];
-
-    for (label, base, num) in PINS {
-        // Build: "[trace] <label> HIGH"
-        let mut buf = [0u8; 48];
-        let prefix: &[u8] = b"[trace] ";
-        buf[..prefix.len()].copy_from_slice(prefix);
-        let label_len = label.len();
-        buf[prefix.len()..prefix.len() + label_len].copy_from_slice(label);
-        let mut n = prefix.len() + label_len;
-        let suffix: &[u8] = b" HIGH";
-        buf[n..n + suffix.len()].copy_from_slice(suffix);
-        n += suffix.len();
-        send(&buf[..n]);
-
-        // SAFETY: exclusive GPIO ownership during the trace.
+    // Wait for USB CDC to be configured (max 15 seconds).
+    for _ in 0..1500 {
         unsafe {
-            pin_output(base, num);
-            pin_high(base, num);
+            if fnb58_usb_configured() == 1 {
+                break;
+            }
         }
-
-        delay_10s();
-
-        // SAFETY: exclusive GPIO ownership during the trace.
-        unsafe {
-            pin_low(base, num);
-            pin_input(base, num);
+        // 10ms delay
+        for _ in 0..100_000 {
+            core::hint::black_box(());
         }
-
-        send(b"[trace] done");
     }
 
-    send(b"[trace] === sweep complete ===");
+    // Signal that we're alive.
+    unsafe {
+        unsafe { fnb58_usb_send(b"[trace] === pins 1-24 sweep, 10s each ===\r\n".as_ptr(), 43); }
+        unsafe { fnb58_usb_send(b"[trace] probe display wires w/ multimeter\r\n".as_ptr(), 44); }
+    }
+
+    // --- Pin 2: PC13 ---
+    unsafe {
+        pin_output(GPIOC_BASE, 13);
+        pin_high(GPIOC_BASE, 13);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin2 PC13 HIGH\r\n".as_ptr(), 24); }
+    delay_10s();
+    unsafe { pin_low(GPIOC_BASE, 13); pin_input(GPIOC_BASE, 13); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 12: PA0 ---
+    unsafe {
+        pin_output(GPIOA_BASE, 0);
+        pin_high(GPIOA_BASE, 0);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin12 PA0 HIGH\r\n".as_ptr(), 24); }
+    delay_10s();
+    unsafe { pin_low(GPIOA_BASE, 0); pin_input(GPIOA_BASE, 0); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 13: PA1 ---
+    unsafe {
+        pin_output(GPIOA_BASE, 1);
+        pin_high(GPIOA_BASE, 1);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin13 PA1 HIGH\r\n".as_ptr(), 24); }
+    delay_10s();
+    unsafe { pin_low(GPIOA_BASE, 1); pin_input(GPIOA_BASE, 1); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 14: PA2 ---
+    unsafe {
+        pin_output(GPIOA_BASE, 2);
+        pin_high(GPIOA_BASE, 2);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin14 PA2 HIGH\r\n".as_ptr(), 24); }
+    delay_10s();
+    unsafe { pin_low(GPIOA_BASE, 2); pin_input(GPIOA_BASE, 2); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 15: PA3 ---
+    unsafe {
+        pin_output(GPIOA_BASE, 3);
+        pin_high(GPIOA_BASE, 3);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin15 PA3 HIGH\r\n".as_ptr(), 24); }
+    delay_10s();
+    unsafe { pin_low(GPIOA_BASE, 3); pin_input(GPIOA_BASE, 3); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 16: PA4 ---
+    unsafe {
+        pin_output(GPIOA_BASE, 4);
+        pin_high(GPIOA_BASE, 4);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin16 PA4 HIGH\r\n".as_ptr(), 24); }
+    delay_10s();
+    unsafe { pin_low(GPIOA_BASE, 4); pin_input(GPIOA_BASE, 4); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 17: PA5 (SPI1_SCK) ---
+    unsafe {
+        pin_output(GPIOA_BASE, 5);
+        pin_high(GPIOA_BASE, 5);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin17 PA5 SPI1_SCK HIGH\r\n".as_ptr(), 33); }
+    delay_10s();
+    unsafe { pin_low(GPIOA_BASE, 5); pin_input(GPIOA_BASE, 5); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 18: PA6 (SPI1_MISO) ---
+    unsafe {
+        pin_output(GPIOA_BASE, 6);
+        pin_high(GPIOA_BASE, 6);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin18 PA6 SPI1_MISO HIGH\r\n".as_ptr(), 34); }
+    delay_10s();
+    unsafe { pin_low(GPIOA_BASE, 6); pin_input(GPIOA_BASE, 6); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 19: PA7 (SPI1_MOSI) ---
+    unsafe {
+        pin_output(GPIOA_BASE, 7);
+        pin_high(GPIOA_BASE, 7);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin19 PA7 SPI1_MOSI HIGH\r\n".as_ptr(), 33); }
+    delay_10s();
+    unsafe { pin_low(GPIOA_BASE, 7); pin_input(GPIOA_BASE, 7); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 20: PB0 ---
+    unsafe {
+        pin_output(GPIOB_BASE, 0);
+        pin_high(GPIOB_BASE, 0);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin20 PB0 HIGH\r\n".as_ptr(), 24); }
+    delay_10s();
+    unsafe { pin_low(GPIOB_BASE, 0); pin_input(GPIOB_BASE, 0); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 21: PB1 ---
+    unsafe {
+        pin_output(GPIOB_BASE, 1);
+        pin_high(GPIOB_BASE, 1);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin21 PB1 HIGH\r\n".as_ptr(), 24); }
+    delay_10s();
+    unsafe { pin_low(GPIOB_BASE, 1); pin_input(GPIOB_BASE, 1); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 22: PB2 ---
+    unsafe {
+        pin_output(GPIOB_BASE, 2);
+        pin_high(GPIOB_BASE, 2);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin22 PB2 HIGH\r\n".as_ptr(), 24); }
+    delay_10s();
+    unsafe { pin_low(GPIOB_BASE, 2); pin_input(GPIOB_BASE, 2); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 23: PB10 ---
+    unsafe {
+        pin_output(GPIOB_BASE, 10);
+        pin_high(GPIOB_BASE, 10);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin23 PB10 HIGH\r\n".as_ptr(), 25); }
+    delay_10s();
+    unsafe { pin_low(GPIOB_BASE, 10); pin_input(GPIOB_BASE, 10); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    // --- Pin 24: PB11 ---
+    unsafe {
+        pin_output(GPIOB_BASE, 11);
+        pin_high(GPIOB_BASE, 11);
+    }
+    unsafe { fnb58_usb_send(b"[trace] pin24 PB11 HIGH\r\n".as_ptr(), 25); }
+    delay_10s();
+    unsafe { pin_low(GPIOB_BASE, 11); pin_input(GPIOB_BASE, 11); }
+    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+
+    unsafe {
+        unsafe { fnb58_usb_send(b"[trace] === sweep complete ===\r\n".as_ptr(), 31); }
+    }
 }
 
 /// Fixed-capacity scratch line buffer.
