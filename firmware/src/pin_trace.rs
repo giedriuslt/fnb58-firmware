@@ -1,5 +1,5 @@
 //! Pin tracer: walks through the GPIO pins on physical LQFP48 pins 1-24
-//! of the AT32F403ACGT7, sets each HIGH for 10 seconds, and prints the
+//! of the AT32F403ACGT7, sets each HIGH for 60 seconds, and prints the
 //! physical pin number + GPIO name to serial. The user probes display
 //! connector wires with a multimeter.
 //!
@@ -112,7 +112,7 @@ unsafe fn pin_input(base: usize, num: u8) {
 }
 
 
-/// Busy-wait ~10 seconds. Uses a volatile write that the compiler cannot
+/// Busy-wait ~60 seconds. Uses a volatile write that the compiler cannot
 /// optimize away (opt-level=z + LTO eliminates bare nop loops entirely).
 /// At ~192 MHz HCLK: 384 outer x 1M inner = 384M iterations,
 /// ~5 cycles each (volatile store + loop overhead) = 1.92G cycles = 10s.
@@ -149,7 +149,7 @@ pub fn sweep() {
 
     // Signal that we're alive.
     unsafe {
-        send_trace(b"[trace] === pins 1-24 sweep, 10s each ===\r\n");
+        send_trace(b"[trace] === pins 1-24 sweep, 60s each ===\r\n");
         send_trace(b"[trace] probe display wires w/ multimeter\r\n");
     }
 
@@ -159,7 +159,7 @@ pub fn sweep() {
         pin_high(GPIOC_BASE, 13);
     }
     send_trace(b"[trace] pin2 PC13 HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOC_BASE, 13); pin_input(GPIOC_BASE, 13); }
     send_trace(b"[trace] done\r\n");
 
@@ -169,7 +169,7 @@ pub fn sweep() {
         pin_high(GPIOA_BASE, 0);
     }
     send_trace(b"[trace] pin12 PA0 HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOA_BASE, 0); pin_input(GPIOA_BASE, 0); }
     send_trace(b"[trace] done\r\n");
 
@@ -179,7 +179,7 @@ pub fn sweep() {
         pin_high(GPIOA_BASE, 1);
     }
     send_trace(b"[trace] pin13 PA1 HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOA_BASE, 1); pin_input(GPIOA_BASE, 1); }
     send_trace(b"[trace] done\r\n");
 
@@ -189,7 +189,7 @@ pub fn sweep() {
         pin_high(GPIOA_BASE, 2);
     }
     send_trace(b"[trace] pin14 PA2 HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOA_BASE, 2); pin_input(GPIOA_BASE, 2); }
     send_trace(b"[trace] done\r\n");
 
@@ -199,7 +199,7 @@ pub fn sweep() {
         pin_high(GPIOA_BASE, 3);
     }
     send_trace(b"[trace] pin15 PA3 HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOA_BASE, 3); pin_input(GPIOA_BASE, 3); }
     send_trace(b"[trace] done\r\n");
 
@@ -209,7 +209,7 @@ pub fn sweep() {
         pin_high(GPIOA_BASE, 4);
     }
     send_trace(b"[trace] pin16 PA4 HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOA_BASE, 4); pin_input(GPIOA_BASE, 4); }
     send_trace(b"[trace] done\r\n");
 
@@ -219,7 +219,7 @@ pub fn sweep() {
         pin_high(GPIOA_BASE, 5);
     }
     send_trace(b"[trace] pin17 PA5 SPI1_SCK HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOA_BASE, 5); pin_input(GPIOA_BASE, 5); }
     send_trace(b"[trace] done\r\n");
 
@@ -229,7 +229,7 @@ pub fn sweep() {
         pin_high(GPIOA_BASE, 6);
     }
     send_trace(b"[trace] pin18 PA6 SPI1_MISO HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOA_BASE, 6); pin_input(GPIOA_BASE, 6); }
     send_trace(b"[trace] done\r\n");
 
@@ -239,7 +239,7 @@ pub fn sweep() {
         pin_high(GPIOA_BASE, 7);
     }
     send_trace(b"[trace] pin19 PA7 SPI1_MOSI HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOA_BASE, 7); pin_input(GPIOA_BASE, 7); }
     send_trace(b"[trace] done\r\n");
 
@@ -249,7 +249,7 @@ pub fn sweep() {
         pin_high(GPIOB_BASE, 0);
     }
     send_trace(b"[trace] pin20 PB0 HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOB_BASE, 0); pin_input(GPIOB_BASE, 0); }
     send_trace(b"[trace] done\r\n");
 
@@ -259,7 +259,7 @@ pub fn sweep() {
         pin_high(GPIOB_BASE, 1);
     }
     send_trace(b"[trace] pin21 PB1 HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOB_BASE, 1); pin_input(GPIOB_BASE, 1); }
     send_trace(b"[trace] done\r\n");
 
@@ -269,7 +269,7 @@ pub fn sweep() {
         pin_high(GPIOB_BASE, 2);
     }
     send_trace(b"[trace] pin22 PB2 HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOB_BASE, 2); pin_input(GPIOB_BASE, 2); }
     send_trace(b"[trace] done\r\n");
 
@@ -279,7 +279,7 @@ pub fn sweep() {
         pin_high(GPIOB_BASE, 10);
     }
     send_trace(b"[trace] pin23 PB10 HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOB_BASE, 10); pin_input(GPIOB_BASE, 10); }
     send_trace(b"[trace] done\r\n");
 
@@ -289,7 +289,7 @@ pub fn sweep() {
         pin_high(GPIOB_BASE, 11);
     }
     send_trace(b"[trace] pin24 PB11 HIGH\r\n");
-    delay_10s();
+    delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s(); delay_10s();
     unsafe { pin_low(GPIOB_BASE, 11); pin_input(GPIOB_BASE, 11); }
     send_trace(b"[trace] done\r\n");
 
