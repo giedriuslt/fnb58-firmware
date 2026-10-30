@@ -24,7 +24,6 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 mod panel;
 mod scanner;
 
-use embassy_at32::pac::at32f403a::interrupt;
 
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
@@ -61,8 +60,7 @@ async fn main(_spawner: Spawner) {
     // vendor example uses the L line; H is wired identically) and the ACC
     // calibration line. The C handlers override the PAC's weak vectors.
     // The I2C lines drive the bus scanner's waits.
-    use embassy_at32::pac::at32f403a::interrupt;
-
+    
     unsafe {
         cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_L_CAN1_RX0);
         cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_H_CAN1_TX);
@@ -79,8 +77,6 @@ async fn main(_spawner: Spawner) {
 
     let mut rx = [0u8; 64];
     let mut last_scan = Instant::now();
-    let mut last_measure = Instant::now();
-    let mut measure_buf = [0u8; 64];
     loop {
         // Echo anything received (the vendor class buffers OUT data).
         // Newline travels in the SAME packet: the vendor send API rejects
@@ -99,17 +95,6 @@ async fn main(_spawner: Spawner) {
         if last_scan.elapsed() >= Duration::from_secs(15) {
             last_scan = Instant::now();
             scanner::run().await;
-        }
-
-        // Live TPA626 measurements every second (the tester's actual job).
-        // The tick rides along (#N): the heartbeat line loses the vendor
-        // send race against the measurement line every time, so the tick
-        // in the V= line is the liveness signal instead.
-        if last_measure.elapsed() >= Duration::from_secs(1) {
-            last_measure = Instant::now();
-            let tick = TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            scanner::measure(&mut measure_buf, tick);
-            send_line(&measure_buf[..scanner::last_measure_len()]);
         }
 
         Timer::after_millis(2).await;
