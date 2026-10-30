@@ -26,6 +26,7 @@ extern "C" {
 #include "at32f403a_407_dma.h"
 #include "at32f403a_407_gpio.h"
 #include "at32f403a_407_misc.h"
+#include "at32f403a_407_spi.h"
 
 #ifdef __cplusplus
 }

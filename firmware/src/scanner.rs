@@ -9,6 +9,9 @@ unsafe extern "C" {
     fn fnb58_i2c_init();
     fn fnb58_i2c_probe(address: u16) -> u32;
     fn fnb58_i2c_read(address: u16, reg: u8, out: *mut u8, len: u16) -> u32;
+    fn fnb58_display_probe_bus(bus_idx: i32, results: *mut u8);
+    fn fnb58_display_bus_name(bus_idx: i32) -> *const u8;
+    fn fnb58_display_num_buses() -> i32;
 }
 
 fn queue_line(text: &[u8]) {
