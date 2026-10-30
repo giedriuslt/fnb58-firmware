@@ -6,6 +6,7 @@
 
 mod board;
 mod buttons;
+mod pd;
 mod pin_trace;
 
 static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -27,6 +28,19 @@ unsafe extern "C" {
 /// Called from the vendor IRQ handlers.
 #[unsafe(no_mangle)]
 extern "C" fn fnb58_usbd_event_hook() {}
+
+unsafe extern "C" {
+    fn fnb58_lcd_fill(color: u16);
+    fn fnb58_lcd_fill_window(x0: u16, y0: u16, x1: u16, y1: u16, color: u16);
+    fn fnb58_lcd_draw_text(
+        x: u16,
+        y: u16,
+        s: *const u8,
+        scale: u8,
+        fg: u16,
+        bg: u16,
+    ) -> u16;
+}
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -73,19 +87,7 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(500).await;
     }
-    unsafe extern "C" {
-        fn fnb58_lcd_fill(color: u16);
-        fn fnb58_lcd_draw_text(
-            x: u16,
-            y: u16,
-            s: *const u8,
-            scale: u8,
-            fg: u16,
-            bg: u16,
-        ) -> u16;
-    }
-
-    say(b"[lcd] FNB58 r55: rust i2c meter\r\n").await;
+    say(b"[lcd] FNB58 r56: pd profile reading\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
@@ -193,6 +195,25 @@ async fn main(_spawner: Spawner) {
     let _ = tpa_write(&mut tpa, 0x05, cal).await;
     say(b"[meter] rust tpa configured\r\n").await;
 
+    // --- FUSB302 passive PD listener ---
+    let mut caps = pd::SourceCaps::default();
+    match pd::init(&mut tpa).await {
+        Ok(id) => {
+            let mut d = [0u8; 96];
+            let mut n = 0;
+            for &b in b"[pd] fusb302 id=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_hex8(&mut d, n, id as u32);
+            d[n] = 13;
+            d[n + 1] = 10;
+            unsafe { fnb58_usb_send(d.as_ptr(), (n + 2) as u16) };
+            Timer::after_millis(500).await;
+        }
+        Err(_) => say(b"[pd] fusb302 init FAIL\r\n").await,
+    }
+
     // Meter loop (same as r46).
     unsafe { fnb58_lcd_fill(0x0000) };
 
@@ -291,8 +312,167 @@ async fn main(_spawner: Spawner) {
             say(b"[meter] tpa626 read FAIL\r\n").await;
         }
 
+        // PD poll: parse Source_Capabilities as they appear on the CC
+        // lines (the source re-sends them whenever the DUT hard-resets).
+        if matches!(pd::poll(&mut tpa, &mut caps).await, Ok(true)) {
+            report_caps(&caps).await;
+        }
+
         tick = tick.wrapping_add(1);
         Timer::after_millis(250).await;
+    }
+}
+
+/// Append `v` with `dec` digits after the decimal point, into `buf` at
+/// `pos` (generic-buffer version of Line12::num_u32).
+fn push_num_dec(buf: &mut [u8], pos: usize, v: u32, dec: usize) -> usize {
+    let mut tmp = [0u8; 10];
+    let mut n = 0;
+    let mut x = v;
+    if x == 0 {
+        tmp[0] = b'0';
+        n = 1;
+    } else {
+        while x > 0 && n < 10 {
+            tmp[n] = b'0' + (x % 10) as u8;
+            x /= 10;
+            n += 1;
+        }
+    }
+    let mut p = pos;
+    if n <= dec {
+        buf[p] = b'0';
+        p += 1;
+        if dec > 0 {
+            buf[p] = b'.';
+            p += 1;
+            for _ in 0..(dec - n) {
+                buf[p] = b'0';
+                p += 1;
+            }
+        }
+    } else {
+        let mut k = n;
+        while k > dec {
+            k -= 1;
+            buf[p] = tmp[k];
+            p += 1;
+        }
+        if dec > 0 {
+            buf[p] = b'.';
+            p += 1;
+        }
+    }
+    if dec > 0 {
+        let mut k = dec.min(n);
+        while k > 0 {
+            k -= 1;
+            buf[p] = tmp[k];
+            p += 1;
+        }
+    }
+    p
+}
+
+/// Format one PDO as "x.xV y.yA" / "PPS a.a-b.bV y.yA" into `buf` at
+/// `pos`; returns the new position.
+fn push_pdo(buf: &mut [u8], pos: usize, pdo: &pd::Pdo) -> usize {
+    let mut p = pos;
+    if pdo.is_pps {
+        for &b in b"PPS " {
+            buf[p] = b;
+            p += 1;
+        }
+        p = push_num_dec(buf, p, pdo.min_mv / 100, 1);
+        buf[p] = b'-';
+        p += 1;
+    }
+    p = push_num_dec(buf, p, pdo.mv / 100, 1);
+    buf[p] = b'V';
+    p += 1;
+    buf[p] = b' ';
+    p += 1;
+    if pdo.ma >= 1000 {
+        p = push_num_dec(buf, p, pdo.ma / 1000, 1);
+        buf[p] = b'A';
+    } else {
+        p = push_num_dec(buf, p, pdo.ma, 0);
+        buf[p] = b'm';
+        buf[p + 1] = b'A';
+        p += 1;
+    }
+    p + 1
+}
+
+/// Report new source capabilities: full list to the console, summary
+/// lines to the LCD's bottom strip.
+async fn report_caps(caps: &pd::SourceCaps) {
+    // Console header.
+    let mut d = [0u8; 96];
+    let mut n = 0;
+    for &b in b"[pd] src caps " {
+        d[n] = b;
+        n += 1;
+    }
+    n = push_dec(&mut d, n, caps.n as u32);
+    for &b in b" PDOs" {
+        d[n] = b;
+        n += 1;
+    }
+    d[n] = 13;
+    d[n + 1] = 10;
+    n += 2;
+    unsafe { fnb58_usb_send(d.as_ptr(), n as u16) };
+    Timer::after_millis(500).await;
+
+    for i in 0..caps.n {
+        let mut d = [0u8; 96];
+        let mut n = 0;
+        for &b in b"[pd]  " {
+            d[n] = b;
+            n += 1;
+        }
+        n = push_pdo(&mut d, n, &caps.pdos[i]);
+        d[n] = 13;
+        d[n + 1] = 10;
+        n += 2;
+        unsafe { fnb58_usb_send(d.as_ptr(), n as u16) };
+        Timer::after_millis(500).await;
+    }
+
+    // LCD summary: highest fixed profile + first PPS, bottom strip.
+    unsafe { fnb58_lcd_fill_window(0, 196, 319, 239, 0x0000) };
+    let mut best: Option<&pd::Pdo> = None;
+    let mut pps: Option<&pd::Pdo> = None;
+    for i in 0..caps.n {
+        let pdo = &caps.pdos[i];
+        if pdo.is_pps {
+            if pps.is_none() {
+                pps = Some(pdo);
+            }
+        } else if best.map(|b| pdo.mv > b.mv).unwrap_or(true) {
+            best = Some(pdo);
+        }
+    }
+    if let Some(fixed) = best {
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        for &b in b"PD " {
+            line[n] = b;
+            n += 1;
+        }
+        n = push_pdo(&mut line, n, fixed);
+        unsafe {
+            fnb58_lcd_draw_text(8, 200, line.as_ptr(), 2, 0xFFFF, 0x0000);
+        }
+    }
+    if let Some(pps) = pps {
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        n = push_pdo(&mut line, n, pps);
+        unsafe {
+            fnb58_lcd_draw_text(8, 220, line.as_ptr(), 2, 0xF81F, 0x0000);
+        }
     }
 }
 

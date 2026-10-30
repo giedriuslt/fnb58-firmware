@@ -253,8 +253,8 @@ void fnb58_lcd_test_pattern(void)
 /* --- 5x7 font --------------------------------------------------------- */
 
 /* Glyphs are 5 columns x 7 rows; each byte is one column, bit r = row r
- * (bit 0 = top). Characters: 0-9 . space V A W m u - */
-static const char FONT_CHARS[] = "0123456789. VAWmu-";
+ * (bit 0 = top). Characters: 0-9 . space V A W m u - P S C D */
+static const char FONT_CHARS[] = "0123456789. VAWmu-PSCD";
 static const uint8_t FONT_5X7[][5] = {
     /* 0 */ {0x3E, 0x51, 0x49, 0x45, 0x3E},
     /* 1 */ {0x00, 0x42, 0x7F, 0x40, 0x00},
@@ -274,6 +274,10 @@ static const uint8_t FONT_5X7[][5] = {
     /* m */ {0x7C, 0x04, 0x04, 0x04, 0x78},
     /* u */ {0x3C, 0x40, 0x40, 0x20, 0x7C},
     /* - */ {0x08, 0x08, 0x08, 0x08, 0x08},
+    /* P */ {0x7F, 0x09, 0x09, 0x09, 0x06},
+    /* S */ {0x46, 0x49, 0x49, 0x49, 0x31},
+    /* C */ {0x3E, 0x41, 0x41, 0x41, 0x22},
+    /* D */ {0x7F, 0x41, 0x41, 0x41, 0x3E},
 };
 
 /* Draw one character at (x, y), `scale` pixels per font pixel, fg on bg.
