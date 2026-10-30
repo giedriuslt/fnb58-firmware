@@ -249,3 +249,72 @@ void fnb58_lcd_test_pattern(void)
         fnb58_lcd_fill_window(x0, 0, x0 + 39, LCD_H - 1, bars[i]);
     }
 }
+
+/* --- 5x7 font --------------------------------------------------------- */
+
+/* Glyphs are 5 columns x 7 rows; each byte is one column, bit r = row r
+ * (bit 0 = top). Characters: 0-9 . space V A W m u - */
+static const char FONT_CHARS[] = "0123456789. VAWmu-";
+static const uint8_t FONT_5X7[][5] = {
+    /* 0 */ {0x3E, 0x51, 0x49, 0x45, 0x3E},
+    /* 1 */ {0x00, 0x42, 0x7F, 0x40, 0x00},
+    /* 2 */ {0x62, 0x51, 0x49, 0x49, 0x46},
+    /* 3 */ {0x41, 0x49, 0x49, 0x49, 0x36},
+    /* 4 */ {0x18, 0x14, 0x12, 0x7F, 0x10},
+    /* 5 */ {0x27, 0x45, 0x45, 0x45, 0x39},
+    /* 6 */ {0x3C, 0x4A, 0x49, 0x49, 0x30},
+    /* 7 */ {0x01, 0x71, 0x09, 0x05, 0x03},
+    /* 8 */ {0x36, 0x49, 0x49, 0x49, 0x36},
+    /* 9 */ {0x06, 0x49, 0x49, 0x29, 0x1E},
+    /* . */ {0x00, 0x60, 0x60, 0x00, 0x00},
+    /* ' '*/ {0x00, 0x00, 0x00, 0x00, 0x00},
+    /* V */ {0x1F, 0x20, 0x40, 0x20, 0x1F},
+    /* A */ {0x7E, 0x09, 0x09, 0x09, 0x7E},
+    /* W */ {0x3F, 0x40, 0x38, 0x40, 0x3F},
+    /* m */ {0x7C, 0x04, 0x04, 0x04, 0x78},
+    /* u */ {0x3C, 0x40, 0x40, 0x20, 0x7C},
+    /* - */ {0x08, 0x08, 0x08, 0x08, 0x08},
+};
+
+/* Draw one character at (x, y), `scale` pixels per font pixel, fg on bg.
+ * Returns the character width (5*scale). */
+uint16_t fnb58_lcd_draw_char(uint16_t x, uint16_t y, char ch, uint8_t scale,
+                             uint16_t fg, uint16_t bg)
+{
+    /* Map char -> glyph index (no libc on target). */
+    int idx = 11; /* default: blank */
+    for (int i = 0; FONT_CHARS[i]; i++) {
+        if (FONT_CHARS[i] == ch) {
+            idx = i;
+            break;
+        }
+    }
+    const uint8_t *glyph = FONT_5X7[idx];
+
+    fnb58_lcd_set_window(x, y, x + 5u * scale - 1u, y + 7u * scale - 1u);
+    lcd_wait_idle();
+    gpio_bits_set(GPIOB, LCD_DC);
+    gpio_bits_reset(GPIOB, LCD_CS);
+    for (uint8_t r = 0; r < 7u * scale; r++) {
+        for (uint8_t c = 0; c < 5u * scale; c++) {
+            uint8_t col = glyph[c / scale];
+            uint16_t color = (col & (1u << (r / scale))) ? fg : bg;
+            lcd_byte((uint8_t)(color >> 8));
+            lcd_byte((uint8_t)color);
+        }
+    }
+    lcd_wait_idle();
+    gpio_bits_set(GPIOB, LCD_CS);
+    return 5u * scale;
+}
+
+/* Draw a NUL-terminated string; 1px letter spacing. Unsupported
+ * characters render as blanks. Returns final x. */
+uint16_t fnb58_lcd_draw_text(uint16_t x, uint16_t y, const char *s,
+                             uint8_t scale, uint16_t fg, uint16_t bg)
+{
+    while (*s) {
+        x += fnb58_lcd_draw_char(x, y, *s++, scale, fg, bg) + scale;
+    }
+    return x;
+}

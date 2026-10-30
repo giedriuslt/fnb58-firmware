@@ -51,6 +51,7 @@ fn main() {
         vendor.join("middlewares/usbd_class/cdc/cdc_desc.c"),
         c_dir.join("fnb58_i2c.c"),
         c_dir.join("fnb58_lcd.c"),
+        c_dir.join("fnb58_measure.c"),
         c_dir.join("fnb58_pin.c"),
         vendor.join("libraries/drivers/src/at32f403a_407_spi.c"),
         vendor.join("middlewares/i2c_application_library/i2c_application.c"),

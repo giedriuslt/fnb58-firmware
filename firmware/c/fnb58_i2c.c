@@ -55,3 +55,10 @@ uint32_t fnb58_i2c_read(uint16_t address, uint8_t reg, uint8_t *out, uint16_t le
 {
   return i2c_memory_read(&fnb_hi2c, I2C_MEM_ADDR_WIDIH_8, address, reg, out, len, FNB_I2C_TIMEOUT);
 }
+
+/* Write `len` bytes to 8-bit register `reg`. 0 = OK. */
+uint32_t fnb58_i2c_write(uint16_t address, uint8_t reg, const uint8_t *data, uint16_t len)
+{
+  return i2c_memory_write(&fnb_hi2c, I2C_MEM_ADDR_WIDIH_8, address, reg,
+                          (uint8_t *)data, len, FNB_I2C_TIMEOUT);
+}
