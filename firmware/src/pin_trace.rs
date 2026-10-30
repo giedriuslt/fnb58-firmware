@@ -114,22 +114,53 @@ pub fn sweep() {
     });
 
     send(b"[trace] === LQFP48 pins 1-24 sweep, 10s each ===");
-    send(b"[trace] probe display wires with multimeter (DCV)");
+    send(b"[trace] probe display wires with multimeter");
 
     for pin in &TRACE_PINS {
-        // Build the announcement line.
-        let mut line = heapless_line::Line::new();
-        line.push(b"[trace] pin ");
-        line.push_num(pin.phys as u32);
-        line.push(b" = ");
-        line.push(pin.name.as_bytes());
-        if !pin.note.is_empty() {
-            line.push(b" (");
-            line.push(pin.note.as_bytes());
-            line.push(b")");
+        // Format the announcement directly into a byte array.
+        let mut buf = [0u8; 80];
+        let mut n = 0;
+        // "[trace] pin "
+        for &b in b"[trace] pin " {
+            buf[n] = b;
+            n += 1;
         }
-        line.push(b" HIGH now");
-        send(line.bytes());
+        // Physical pin number (decimal).
+        let phys = pin.phys;
+        if phys >= 10 {
+            buf[n] = b'0' + (phys / 10);
+            n += 1;
+        }
+        buf[n] = b'0' + (phys % 10);
+        n += 1;
+        // " = "
+        buf[n] = b' ';
+        buf[n + 1] = b'=';
+        buf[n + 2] = b' ';
+        n += 3;
+        // GPIO name.
+        for &b in pin.name.as_bytes() {
+            buf[n] = b;
+            n += 1;
+        }
+        // Note if any.
+        if !pin.note.is_empty() {
+            buf[n] = b' ';
+            buf[n + 1] = b'(';
+            n += 2;
+            for &b in pin.note.as_bytes() {
+                buf[n] = b;
+                n += 1;
+            }
+            buf[n] = b')';
+            n += 1;
+        }
+        // " HIGH"
+        for &b in b" HIGH" {
+            buf[n] = b;
+            n += 1;
+        }
+        send(&buf[..n]);
 
         // Set HIGH.
         // SAFETY: exclusive GPIO ownership during the trace.
