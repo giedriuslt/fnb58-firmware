@@ -318,3 +318,58 @@ uint16_t fnb58_lcd_draw_text(uint16_t x, uint16_t y, const char *s,
     }
     return x;
 }
+
+/* --- bisect helpers (r52): add LCD ingredients one at a time ---------- */
+
+/* Ingredient 1: IOMUX clock + SWJTAG remap only. */
+void fnb58_bisect_iomux(void)
+{
+    crm_periph_clock_enable(CRM_IOMUX_PERIPH_CLOCK, TRUE);
+    gpio_pin_remap_config(SWJTAG_GMUX_010, TRUE);
+}
+
+/* Ingredient 2: PB3 backlight high (requires remap first). */
+void fnb58_bisect_blk(void)
+{
+    gpio_init_type g;
+    crm_periph_clock_enable(CRM_GPIOB_PERIPH_CLOCK, TRUE);
+    gpio_default_para_init(&g);
+    g.gpio_pins = GPIO_PINS_3;
+    g.gpio_mode = GPIO_MODE_OUTPUT;
+    g.gpio_out_type = GPIO_OUTPUT_PUSH_PULL;
+    g.gpio_drive_strength = GPIO_DRIVE_STRENGTH_MODERATE;
+    g.gpio_pull = GPIO_PULL_NONE;
+    gpio_init(GPIOB, &g);
+    gpio_bits_set(GPIOB, GPIO_PINS_3);
+}
+
+/* Ingredient 3: SPI2 clock + PB13/PB15 mux + spi init/enable,
+ * no control pins, no traffic. */
+void fnb58_bisect_spi2(void)
+{
+    gpio_init_type g;
+    spi_init_type s;
+
+    crm_periph_clock_enable(CRM_SPI2_PERIPH_CLOCK, TRUE);
+    crm_periph_clock_enable(CRM_GPIOB_PERIPH_CLOCK, TRUE);
+
+    gpio_default_para_init(&g);
+    g.gpio_pins = GPIO_PINS_13 | GPIO_PINS_15;
+    g.gpio_mode = GPIO_MODE_MUX;
+    g.gpio_out_type = GPIO_OUTPUT_PUSH_PULL;
+    g.gpio_drive_strength = GPIO_DRIVE_STRENGTH_MODERATE;
+    g.gpio_pull = GPIO_PULL_NONE;
+    gpio_init(GPIOB, &g);
+
+    spi_default_para_init(&s);
+    s.master_slave_mode = SPI_MODE_MASTER;
+    s.transmission_mode = SPI_TRANSMIT_FULL_DUPLEX;
+    s.mclk_freq_division = SPI_MCLK_DIV_4;
+    s.clock_polarity = SPI_CLOCK_POLARITY_LOW;
+    s.clock_phase = SPI_CLOCK_PHASE_1EDGE;
+    s.first_bit_transmission = SPI_FIRST_BIT_MSB;
+    s.frame_bit_num = SPI_FRAME_8BIT;
+    s.cs_mode_selection = SPI_CS_SOFTWARE_MODE;
+    spi_init(SPI2, &s);
+    spi_enable(SPI2, TRUE);
+}
