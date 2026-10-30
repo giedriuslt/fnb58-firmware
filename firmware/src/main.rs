@@ -54,7 +54,8 @@ async fn main(_spawner: Spawner) {
     }
 
     // Button monitor init.
-    // buttons::init(); // r52 bisect: excluded (skips PB6/PB7 anyway)
+    // Button monitor init.
+    buttons::init();
 
     // Wait for USB CDC to be configured (max 15 seconds).
     // The host needs time to enumerate and open the COM port.
@@ -90,41 +91,27 @@ async fn main(_spawner: Spawner) {
         ) -> u16;
     }
 
-    say(b"[lcd] FNB58 r52: lcd-ingredient bisect
-").await;
+    say(b"[lcd] FNB58 r53: true 192MHz + meter\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
         fn fnb58_i2c_probe(addr: u16) -> u32;
         fn fnb58_i2c_bitbang_read16(addr: u16, reg: u8, val: *mut u16) -> u32;
-        fn fnb58_bisect_iomux();
-        fn fnb58_bisect_blk();
-        fn fnb58_bisect_spi2();
     }
 
-    // Plain hw probe (fresh init, no reset tricks) + bit-bang reference.
-    // Two probes back to back (st/st2) to catch first-transaction quirks.
-    async fn ph(tag: &'static [u8]) {
+    // One hw-I2C health check at the new true 192 MHz clock.
+    {
         unsafe { fnb58_i2c_init() };
-        let st1 = unsafe { fnb58_i2c_probe(0x40) };
-        let st2 = unsafe { fnb58_i2c_probe(0x40) };
+        let st = unsafe { fnb58_i2c_probe(0x40) };
         let mut mfr: u16 = 0;
         let e = unsafe { fnb58_i2c_bitbang_read16(0x40, 0xFE, &mut mfr) };
-
         let mut d = [0u8; 96];
         let mut n = 0;
-        for &b in tag {
+        for &b in b"[clk] 192M fix, hw i2c st=" {
             d[n] = b;
             n += 1;
         }
-        for &b in b" st=" {
-            d[n] = b;
-            n += 1;
-        }
-        n = push_dec(&mut d, n, st1);
-        d[n] = b'/';
-        n += 1;
-        n = push_dec(&mut d, n, st2);
+        n = push_dec(&mut d, n, st);
         for &b in b" bbE=" {
             d[n] = b;
             n += 1;
@@ -143,24 +130,15 @@ async fn main(_spawner: Spawner) {
         Timer::after_millis(500).await;
     }
 
-    ph(b"[A fresh     ]").await;
-    unsafe { fnb58_bisect_iomux() };
-    ph(b"[B +remap    ]").await;
-    unsafe { fnb58_bisect_blk() };
-    ph(b"[C +blk PB3  ]").await;
-    unsafe { fnb58_bisect_spi2() };
-    ph(b"[D +spi2     ]").await;
     unsafe { fnb58_lcd_init() };
-    ph(b"[E +lcd full ]").await;
+    say(b"[lcd] init done, drawing bars\r\n").await;
     unsafe { fnb58_lcd_test_pattern() };
-    ph(b"[F +traffic  ]").await;
-    say(b"[bisect] complete
-").await;
+    say(b"[lcd] pattern drawn\r\n").await;
+    Timer::after_millis(1500).await;
 
     unsafe { fnb58_lcd_fill(0x0000) };
     unsafe { fnb58_measure_init() };
-    say(b"[meter] bitbang tpa init
-").await;
+    say(b"[meter] bitbang tpa init\r\n").await;
 
     // Meter loop (same as r46).
     unsafe { fnb58_lcd_fill(0x0000) };
