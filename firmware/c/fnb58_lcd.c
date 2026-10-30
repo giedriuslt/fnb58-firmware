@@ -23,6 +23,11 @@
 #define LCD_RST  GPIO_PINS_10
 #define LCD_CTRL (LCD_CS | LCD_DC | LCD_RST)
 
+/* Backlight enable: PB3, drives a MOSFET gate (user-identified).
+ * HIGH did not light the panel -> gate polarity may be inverted
+ * (P-FET high-side): try LOW = backlight on. */
+#define LCD_BLK  GPIO_PINS_3
+
 /* Screen geometry: landscape 320x240. */
 #define LCD_W 320
 #define LCD_H 240
@@ -125,9 +130,14 @@ void fnb58_lcd_init(void)
     gpio_init_type g;
     spi_init_type s;
 
-    /* Clocks: SPI2 + GPIOB. */
+    /* Clocks: SPI2 + GPIOB + IOMUX (remap register needs it). */
     crm_periph_clock_enable(CRM_SPI2_PERIPH_CLOCK, TRUE);
     crm_periph_clock_enable(CRM_GPIOB_PERIPH_CLOCK, TRUE);
+    crm_periph_clock_enable(CRM_IOMUX_PERIPH_CLOCK, TRUE);
+
+    /* Release PB3/PB4/PA15 from JTAG: SWJTAG remap to SWD-only.
+     * Without this, PB3 stays JTDO and gpio_init on it is a no-op. */
+    gpio_pin_remap_config(SWJTAG_GMUX_010, TRUE);
 
     /* Control pins: CS/DC/RST push-pull outputs, idle high. */
     gpio_default_para_init(&g);
@@ -138,6 +148,11 @@ void fnb58_lcd_init(void)
     g.gpio_pull = GPIO_PULL_NONE;
     gpio_init(GPIOB, &g);
     gpio_bits_set(GPIOB, LCD_CTRL);
+
+    /* Backlight MOSFET gate on PB3: output, HIGH = on (r45, remap kept). */
+    g.gpio_pins = LCD_BLK;
+    gpio_init(GPIOB, &g);
+    gpio_bits_set(GPIOB, LCD_BLK);
 
     /* Bus pins: PB13 = SPI2_SCK, PB15 = SPI2_MOSI (mux). */
     g.gpio_pins = GPIO_PINS_13 | GPIO_PINS_15;

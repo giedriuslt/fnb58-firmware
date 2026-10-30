@@ -72,7 +72,7 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(500).await;
     }
-    say(b"[lcd] FNB58 r41: init ST7789V\r\n").await;
+    say(b"[lcd] FNB58 r45: BLK PB3 high + swjtag remap\r\n").await;
     unsafe { fnb58_lcd_init() };
     say(b"[lcd] init done, drawing bars\r\n").await;
     unsafe { fnb58_lcd_test_pattern() };
