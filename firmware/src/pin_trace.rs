@@ -33,6 +33,25 @@ const GPIOA_BASE: usize = 0x4001_0800;
 const GPIOB_BASE: usize = 0x4001_0C00;
 const GPIOC_BASE: usize = 0x4001_1000;
 
+static mut DELAY_DUMMY: u32 = 0;
+
+/// Busy-wait ~1ms per unit (volatile write, optimization-proof at 192 MHz).
+fn delay_ms(ms: u32) {
+    for _ in 0..ms {
+        for _ in 0..38_000 {
+            // SAFETY: static mut, single-threaded.
+            unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(DELAY_DUMMY), 0); }
+        }
+    }
+}
+
+/// Send via vendor CDC + 500ms gap for the host to collect the packet.
+/// Without this gap, the next send is REJECTED (endpoint buffer busy).
+fn send_trace(msg: &[u8]) {
+    send_trace(msg);
+    delay_ms(500);
+}
+
 unsafe extern "C" {
     fn fnb58_usb_send(data: *const u8, len: u16) -> i32;
     fn fnb58_usb_configured() -> u32;
@@ -92,7 +111,6 @@ unsafe fn pin_input(base: usize, num: u8) {
     (reg as *mut u32).write_volatile(val);
 }
 
-static mut DELAY_DUMMY: u32 = 0;
 
 /// Busy-wait ~10 seconds. Uses a volatile write that the compiler cannot
 /// optimize away (opt-level=z + LTO eliminates bare nop loops entirely).
@@ -131,8 +149,8 @@ pub fn sweep() {
 
     // Signal that we're alive.
     unsafe {
-        unsafe { fnb58_usb_send(b"[trace] === pins 1-24 sweep, 10s each ===\r\n".as_ptr(), 43); }
-        unsafe { fnb58_usb_send(b"[trace] probe display wires w/ multimeter\r\n".as_ptr(), 44); }
+        send_trace(b"[trace] === pins 1-24 sweep, 10s each ===\r\n");
+        send_trace(b"[trace] probe display wires w/ multimeter\r\n");
     }
 
     // --- Pin 2: PC13 ---
@@ -140,143 +158,143 @@ pub fn sweep() {
         pin_output(GPIOC_BASE, 13);
         pin_high(GPIOC_BASE, 13);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin2 PC13 HIGH\r\n".as_ptr(), 24); }
+    send_trace(b"[trace] pin2 PC13 HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOC_BASE, 13); pin_input(GPIOC_BASE, 13); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 12: PA0 ---
     unsafe {
         pin_output(GPIOA_BASE, 0);
         pin_high(GPIOA_BASE, 0);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin12 PA0 HIGH\r\n".as_ptr(), 24); }
+    send_trace(b"[trace] pin12 PA0 HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOA_BASE, 0); pin_input(GPIOA_BASE, 0); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 13: PA1 ---
     unsafe {
         pin_output(GPIOA_BASE, 1);
         pin_high(GPIOA_BASE, 1);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin13 PA1 HIGH\r\n".as_ptr(), 24); }
+    send_trace(b"[trace] pin13 PA1 HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOA_BASE, 1); pin_input(GPIOA_BASE, 1); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 14: PA2 ---
     unsafe {
         pin_output(GPIOA_BASE, 2);
         pin_high(GPIOA_BASE, 2);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin14 PA2 HIGH\r\n".as_ptr(), 24); }
+    send_trace(b"[trace] pin14 PA2 HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOA_BASE, 2); pin_input(GPIOA_BASE, 2); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 15: PA3 ---
     unsafe {
         pin_output(GPIOA_BASE, 3);
         pin_high(GPIOA_BASE, 3);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin15 PA3 HIGH\r\n".as_ptr(), 24); }
+    send_trace(b"[trace] pin15 PA3 HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOA_BASE, 3); pin_input(GPIOA_BASE, 3); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 16: PA4 ---
     unsafe {
         pin_output(GPIOA_BASE, 4);
         pin_high(GPIOA_BASE, 4);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin16 PA4 HIGH\r\n".as_ptr(), 24); }
+    send_trace(b"[trace] pin16 PA4 HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOA_BASE, 4); pin_input(GPIOA_BASE, 4); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 17: PA5 (SPI1_SCK) ---
     unsafe {
         pin_output(GPIOA_BASE, 5);
         pin_high(GPIOA_BASE, 5);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin17 PA5 SPI1_SCK HIGH\r\n".as_ptr(), 33); }
+    send_trace(b"[trace] pin17 PA5 SPI1_SCK HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOA_BASE, 5); pin_input(GPIOA_BASE, 5); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 18: PA6 (SPI1_MISO) ---
     unsafe {
         pin_output(GPIOA_BASE, 6);
         pin_high(GPIOA_BASE, 6);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin18 PA6 SPI1_MISO HIGH\r\n".as_ptr(), 34); }
+    send_trace(b"[trace] pin18 PA6 SPI1_MISO HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOA_BASE, 6); pin_input(GPIOA_BASE, 6); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 19: PA7 (SPI1_MOSI) ---
     unsafe {
         pin_output(GPIOA_BASE, 7);
         pin_high(GPIOA_BASE, 7);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin19 PA7 SPI1_MOSI HIGH\r\n".as_ptr(), 33); }
+    send_trace(b"[trace] pin19 PA7 SPI1_MOSI HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOA_BASE, 7); pin_input(GPIOA_BASE, 7); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 20: PB0 ---
     unsafe {
         pin_output(GPIOB_BASE, 0);
         pin_high(GPIOB_BASE, 0);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin20 PB0 HIGH\r\n".as_ptr(), 24); }
+    send_trace(b"[trace] pin20 PB0 HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOB_BASE, 0); pin_input(GPIOB_BASE, 0); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 21: PB1 ---
     unsafe {
         pin_output(GPIOB_BASE, 1);
         pin_high(GPIOB_BASE, 1);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin21 PB1 HIGH\r\n".as_ptr(), 24); }
+    send_trace(b"[trace] pin21 PB1 HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOB_BASE, 1); pin_input(GPIOB_BASE, 1); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 22: PB2 ---
     unsafe {
         pin_output(GPIOB_BASE, 2);
         pin_high(GPIOB_BASE, 2);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin22 PB2 HIGH\r\n".as_ptr(), 24); }
+    send_trace(b"[trace] pin22 PB2 HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOB_BASE, 2); pin_input(GPIOB_BASE, 2); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 23: PB10 ---
     unsafe {
         pin_output(GPIOB_BASE, 10);
         pin_high(GPIOB_BASE, 10);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin23 PB10 HIGH\r\n".as_ptr(), 25); }
+    send_trace(b"[trace] pin23 PB10 HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOB_BASE, 10); pin_input(GPIOB_BASE, 10); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     // --- Pin 24: PB11 ---
     unsafe {
         pin_output(GPIOB_BASE, 11);
         pin_high(GPIOB_BASE, 11);
     }
-    unsafe { fnb58_usb_send(b"[trace] pin24 PB11 HIGH\r\n".as_ptr(), 25); }
+    send_trace(b"[trace] pin24 PB11 HIGH\r\n");
     delay_10s();
     unsafe { pin_low(GPIOB_BASE, 11); pin_input(GPIOB_BASE, 11); }
-    unsafe { fnb58_usb_send(b"[trace] done\r\n".as_ptr(), 14); }
+    send_trace(b"[trace] done\r\n");
 
     unsafe {
-        unsafe { fnb58_usb_send(b"[trace] === sweep complete ===\r\n".as_ptr(), 31); }
+        send_trace(b"[trace] === sweep complete ===\r\n");
     }
 }
 
