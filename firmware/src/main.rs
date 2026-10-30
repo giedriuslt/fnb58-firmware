@@ -91,28 +91,29 @@ async fn main(_spawner: Spawner) {
         ) -> u16;
     }
 
-    say(b"[lcd] FNB58 r53: true 192MHz + meter\r\n").await;
+    say(b"[lcd] FNB58 r54: hw i2c fixed (addr shift)\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
         fn fnb58_i2c_probe(addr: u16) -> u32;
-        fn fnb58_i2c_bitbang_read16(addr: u16, reg: u8, val: *mut u16) -> u32;
+        fn fnb58_i2c_read(addr: u16, reg: u8, out: *mut u8, len: u16) -> u32;
     }
 
-    // One hw-I2C health check at the new true 192 MHz clock.
+    // Hardware I2C health check: probe + a REAL hw register read of the
+    // TPA626 manufacturer id (expect 55 49).
     {
         unsafe { fnb58_i2c_init() };
         let st = unsafe { fnb58_i2c_probe(0x40) };
-        let mut mfr: u16 = 0;
-        let e = unsafe { fnb58_i2c_bitbang_read16(0x40, 0xFE, &mut mfr) };
+        let mut mfr = [0u8; 2];
+        let e = unsafe { fnb58_i2c_read(0x40, 0xFE, mfr.as_mut_ptr(), 2) };
         let mut d = [0u8; 96];
         let mut n = 0;
-        for &b in b"[clk] 192M fix, hw i2c st=" {
+        for &b in b"[i2c] hw FIXED st=" {
             d[n] = b;
             n += 1;
         }
         n = push_dec(&mut d, n, st);
-        for &b in b" bbE=" {
+        for &b in b" rdE=" {
             d[n] = b;
             n += 1;
         }
@@ -121,8 +122,8 @@ async fn main(_spawner: Spawner) {
             d[n] = b;
             n += 1;
         }
-        n = push_hex8(&mut d, n, (mfr >> 8) as u32);
-        n = push_hex8(&mut d, n, (mfr & 0xFF) as u32);
+        n = push_hex8(&mut d, n, mfr[0] as u32);
+        n = push_hex8(&mut d, n, mfr[1] as u32);
         d[n] = 13;
         d[n + 1] = 10;
         n += 2;
@@ -138,7 +139,7 @@ async fn main(_spawner: Spawner) {
 
     unsafe { fnb58_lcd_fill(0x0000) };
     unsafe { fnb58_measure_init() };
-    say(b"[meter] bitbang tpa init\r\n").await;
+    say(b"[meter] hw tpa init\r\n").await;
 
     // Meter loop (same as r46).
     unsafe { fnb58_lcd_fill(0x0000) };

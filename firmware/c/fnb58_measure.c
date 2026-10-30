@@ -21,27 +21,39 @@
 /* CURRENT_LSB chosen for ~0-6 A range headroom: 50 uA. */
 #define CURRENT_LSB_UA 50
 
-extern uint32_t fnb58_i2c_bitbang_read16(uint16_t addr, uint8_t reg, uint16_t *val);
-extern uint32_t fnb58_i2c_bitbang_write16(uint16_t addr, uint8_t reg, uint16_t val);
+extern void fnb58_i2c_init(void);
+extern uint32_t fnb58_i2c_read(uint16_t address, uint8_t reg, uint8_t *out,
+                               uint16_t len);
+extern uint32_t fnb58_i2c_write(uint16_t address, uint8_t reg,
+                                const uint8_t *data, uint16_t len);
 
 static uint8_t tpa_ok;
 
-/* Write one 16-bit BE register (bit-bang). 0 = OK. */
+/* Write one 16-bit BE register (hardware I2C1, shifted-address glue).
+ * 0 = OK. */
 static uint32_t tpa_write16(uint8_t reg, uint16_t val)
 {
-    return fnb58_i2c_bitbang_write16(TPA_ADDR, reg, val);
+    uint8_t b[2] = {(uint8_t)(val >> 8), (uint8_t)val};
+    return fnb58_i2c_write(TPA_ADDR, reg, b, 2);
 }
 
-/* Read one 16-bit BE register (bit-bang). 0 = OK. */
+/* Read one 16-bit BE register. 0 = OK. */
 static uint32_t tpa_read16(uint8_t reg, uint16_t *val)
 {
-    return fnb58_i2c_bitbang_read16(TPA_ADDR, reg, val);
+    uint8_t b[2];
+    uint32_t e = fnb58_i2c_read(TPA_ADDR, reg, b, 2);
+    if (e == 0) {
+        *val = ((uint16_t)b[0] << 8) | b[1];
+    }
+    return e;
 }
 
 void fnb58_measure_init(void)
 {
-    /* Hardware I2C1 stays unused: its peripheral wedges (BUSY stuck,
-     * r49/r50 findings). All TPA626 traffic is bit-banged on PB6/PB7. */
+    /* Hardware I2C1 revived (r54): the vendor middleware expects shifted
+     * addresses; the glue now shifts. Bit-bang helpers remain in
+     * fnb58_i2c.c as a proven fallback. */
+    fnb58_i2c_init();
 
     /* Manufacturer/die id check (informational only). */
     uint16_t mfr = 0, die = 0;

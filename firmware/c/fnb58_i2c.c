@@ -43,23 +43,26 @@ void fnb58_i2c_init(void)
   i2c_config(&fnb_hi2c);
 }
 
-/* 0 = ACK (device present), nonzero = vendor error status. */
+/* 0 = ACK (device present), nonzero = vendor error status.
+ * Artery's i2c_application expects SHIFTED (8-bit) addresses - their
+ * examples pass 0xA0 for a 0x50 EEPROM (i2c_7bit_address_send writes
+ * the value raw into DT). Shift our 7-bit input. */
 uint32_t fnb58_i2c_probe(uint16_t address)
 {
   uint8_t b;
-  return i2c_master_receive(&fnb_hi2c, address, &b, 1, FNB_I2C_TIMEOUT);
+  return i2c_master_receive(&fnb_hi2c, address << 1, &b, 1, FNB_I2C_TIMEOUT);
 }
 
 /* Read `len` bytes starting at 8-bit register `reg`. 0 = OK. */
 uint32_t fnb58_i2c_read(uint16_t address, uint8_t reg, uint8_t *out, uint16_t len)
 {
-  return i2c_memory_read(&fnb_hi2c, I2C_MEM_ADDR_WIDIH_8, address, reg, out, len, FNB_I2C_TIMEOUT);
+  return i2c_memory_read(&fnb_hi2c, I2C_MEM_ADDR_WIDIH_8, address << 1, reg, out, len, FNB_I2C_TIMEOUT);
 }
 
 /* Write `len` bytes to 8-bit register `reg`. 0 = OK. */
 uint32_t fnb58_i2c_write(uint16_t address, uint8_t reg, const uint8_t *data, uint16_t len)
 {
-  return i2c_memory_write(&fnb_hi2c, I2C_MEM_ADDR_WIDIH_8, address, reg,
+  return i2c_memory_write(&fnb_hi2c, I2C_MEM_ADDR_WIDIH_8, address << 1, reg,
                           (uint8_t *)data, len, FNB_I2C_TIMEOUT);
 }
 
