@@ -110,6 +110,7 @@ fn send(text: &[u8]) {
 }
 
 /// Run the full pin trace sweep for physical pins 1-24.
+/// Uses hardcoded byte literals (same pattern as "done" which works).
 pub fn sweep() {
     // Enable GPIOA/B/C clocks.
     // SAFETY: exclusive CRM ownership.
@@ -121,70 +122,52 @@ pub fn sweep() {
         w
     });
 
-    send(b"[trace] === LQFP48 pins 1-24 sweep, 10s each ===");
-    send(b"[trace] probe display wires with multimeter");
+    send(b"[trace] === pins 1-24 sweep, 10s each ===");
+    send(b"[trace] probe display wires w/ multimeter");
 
-    for pin in &TRACE_PINS {
-        // Format the announcement directly into a byte array.
-        let mut buf = [0u8; 80];
-        let mut n = 0;
-        // "[trace] pin "
-        for &b in b"[trace] pin " {
-            buf[n] = b;
-            n += 1;
-        }
-        // Physical pin number (decimal).
-        let phys = pin.phys;
-        if phys >= 10 {
-            buf[n] = b'0' + (phys / 10);
-            n += 1;
-        }
-        buf[n] = b'0' + (phys % 10);
-        n += 1;
-        // " = "
-        buf[n] = b' ';
-        buf[n + 1] = b'=';
-        buf[n + 2] = b' ';
-        n += 3;
-        // GPIO name.
-        for &b in pin.name.as_bytes() {
-            buf[n] = b;
-            n += 1;
-        }
-        // Note if any.
-        if !pin.note.is_empty() {
-            buf[n] = b' ';
-            buf[n + 1] = b'(';
-            n += 2;
-            for &b in pin.note.as_bytes() {
-                buf[n] = b;
-                n += 1;
-            }
-            buf[n] = b')';
-            n += 1;
-        }
-        // " HIGH"
-        for &b in b" HIGH" {
-            buf[n] = b;
-            n += 1;
-        }
+    // (physical pin, GPIO name, base, num, label)
+    const PINS: [(&[u8], usize, u8); 14] = [
+        (b"pin2 PC13", GPIOC_BASE, 13),
+        (b"pin12 PA0", GPIOA_BASE, 0),
+        (b"pin13 PA1", GPIOA_BASE, 1),
+        (b"pin14 PA2", GPIOA_BASE, 2),
+        (b"pin15 PA3", GPIOA_BASE, 3),
+        (b"pin16 PA4", GPIOA_BASE, 4),
+        (b"pin17 PA5 SCK", GPIOA_BASE, 5),
+        (b"pin18 PA6 MISO", GPIOA_BASE, 6),
+        (b"pin19 PA7 MOSI", GPIOA_BASE, 7),
+        (b"pin20 PB0", GPIOB_BASE, 0),
+        (b"pin21 PB1", GPIOB_BASE, 1),
+        (b"pin22 PB2", GPIOB_BASE, 2),
+        (b"pin23 PB10", GPIOB_BASE, 10),
+        (b"pin24 PB11", GPIOB_BASE, 11),
+    ];
+
+    for (label, base, num) in PINS {
+        // Build: "[trace] <label> HIGH"
+        let mut buf = [0u8; 48];
+        let prefix: &[u8] = b"[trace] ";
+        buf[..prefix.len()].copy_from_slice(prefix);
+        let label_len = label.len();
+        buf[prefix.len()..prefix.len() + label_len].copy_from_slice(label);
+        let mut n = prefix.len() + label_len;
+        let suffix: &[u8] = b" HIGH";
+        buf[n..n + suffix.len()].copy_from_slice(suffix);
+        n += suffix.len();
         send(&buf[..n]);
 
-        // Set HIGH.
         // SAFETY: exclusive GPIO ownership during the trace.
         unsafe {
-            pin_output(pin.base, pin.num);
-            pin_high(pin.base, pin.num);
+            pin_output(base, num);
+            pin_high(base, num);
         }
 
-        // Wait 10 seconds.
         delay_10s();
 
-        // Set LOW and restore to floating input.
         // SAFETY: exclusive GPIO ownership during the trace.
         unsafe {
-            pin_low(pin.base, pin.num);
-            pin_input(pin.base, pin.num);
+            pin_low(base, num);
+            pin_input(base, num);
         }
 
         send(b"[trace] done");
