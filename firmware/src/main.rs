@@ -1,7 +1,5 @@
-//! FNB58 pin tracer: walks LQFP48 physical pins 1-24, sets each HIGH for
-//! 10 seconds, prints to COM6. User probes display wires with multimeter.
-//!
-//! After the sweep, the firmware continues to normal CDC echo operation.
+//! FNB58 LCD bring-up: ST7789V 320x240 on SPI2 (verified pin map in
+//! c/fnb58_lcd.c), color-bar test pattern drawn at boot. CDC echo after.
 
 #![no_std]
 #![no_main]
@@ -13,7 +11,7 @@ mod pin_trace;
 static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::Timer;
 
 // --- Vendor C stack glue (compiled by build.rs into libvendorusb.a) ---
 
@@ -22,6 +20,8 @@ unsafe extern "C" {
     fn fnb58_usb_recv(buffer: *mut u8) -> u16;
     fn fnb58_usb_send(data: *const u8, len: u16) -> i32;
     fn fnb58_usb_configured() -> u32;
+    fn fnb58_lcd_init();
+    fn fnb58_lcd_test_pattern();
 }
 
 /// Called from the vendor IRQ handlers.
@@ -67,9 +67,16 @@ async fn main(_spawner: Spawner) {
         Timer::after_millis(100).await;
     }
 
-    // Pin tracer: walk through LQFP48 physical pins 1-24.
-    // Each pin HIGH for 10 seconds, name printed to COM6.
-    pin_trace::sweep();
+    // LCD bring-up: ST7789V init + color-bar test pattern.
+    async fn say(msg: &'static [u8]) {
+        unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
+        Timer::after_millis(500).await;
+    }
+    say(b"[lcd] FNB58 r41: init ST7789V\r\n").await;
+    unsafe { fnb58_lcd_init() };
+    say(b"[lcd] init done, drawing bars\r\n").await;
+    unsafe { fnb58_lcd_test_pattern() };
+    say(b"[lcd] pattern drawn\r\n").await;
 
     // After the sweep: normal echo operation.
     let mut rx = [0u8; 64];
