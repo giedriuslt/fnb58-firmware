@@ -90,19 +90,24 @@ async fn main(_spawner: Spawner) {
         ) -> u16;
     }
 
-    say(b"[lcd] FNB58 r46: V/A/W meter\r\n").await;
+    say(b"[lcd] FNB58 r51: bitbang meter
+").await;
+
     unsafe { fnb58_lcd_init() };
-    say(b"[lcd] init done, drawing bars\r\n").await;
+    say(b"[lcd] init done, drawing bars
+").await;
     unsafe { fnb58_lcd_test_pattern() };
-    say(b"[lcd] pattern drawn\r\n").await;
+    say(b"[lcd] pattern drawn
+").await;
     Timer::after_millis(1500).await;
 
-    // Meter screen.
-    unsafe {
-        fnb58_measure_init();
-        fnb58_lcd_fill(0x0000);
-    }
-    say(b"[meter] tpa626 init, shunt assumed 10 mOhm\r\n").await;
+    unsafe { fnb58_lcd_fill(0x0000) };
+    unsafe { fnb58_measure_init() };
+    say(b"[meter] bitbang tpa init (shunt assumed 10 mOhm)
+").await;
+
+    // Meter loop (same as r46).
+    unsafe { fnb58_lcd_fill(0x0000) };
 
     // Fixed-width opaque text lines (12 chars incl. trailing spaces) so
     // updates fully overwrite the previous value.
@@ -190,6 +195,38 @@ async fn main(_spawner: Spawner) {
         tick = tick.wrapping_add(1);
         Timer::after_millis(250).await;
     }
+}
+
+/// Append decimal representation of `v` to `buf` at `pos`, returning the
+/// new position (uncapped by design; callers size buffers generously).
+fn push_dec(buf: &mut [u8; 96], pos: usize, v: u32) -> usize {
+    let mut tmp = [0u8; 10];
+    let mut n = 0;
+    let mut x = v;
+    if x == 0 {
+        tmp[0] = b'0';
+        n = 1;
+    } else {
+        while x > 0 && n < 10 {
+            tmp[n] = b'0' + (x % 10) as u8;
+            x /= 10;
+            n += 1;
+        }
+    }
+    let mut p = pos;
+    for k in (0..n).rev() {
+        buf[p] = tmp[k];
+        p += 1;
+    }
+    p
+}
+
+/// Append `v` as two lowercase hex digits.
+fn push_hex8(buf: &mut [u8; 96], pos: usize, v: u32) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    buf[pos] = HEX[((v >> 4) & 0xF) as usize];
+    buf[pos + 1] = HEX[(v & 0xF) as usize];
+    pos + 2
 }
 
 /// 12-char NUL-terminated line buffer for the meter rows.
