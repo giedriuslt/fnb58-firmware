@@ -87,11 +87,19 @@ unsafe fn pin_input(base: usize, num: u8) {
     (reg as *mut u32).write_volatile(val);
 }
 
-/// Busy-wait ~10 seconds (generous across 48-192 MHz).
+static mut DELAY_DUMMY: u32 = 0;
+
+/// Busy-wait ~10 seconds. Uses a volatile write that the compiler cannot
+/// optimize away (opt-level=z + LTO eliminates bare nop loops entirely).
+/// At ~192 MHz HCLK: 384 outer x 1M inner = 384M iterations,
+/// ~5 cycles each (volatile store + loop overhead) = 1.92G cycles = 10s.
 fn delay_10s() {
-    for _ in 0..10 {
-        for _ in 0..2_000_000 {
-            cortex_m::asm::nop();
+    for _ in 0..384 {
+        for _ in 0..1_000_000 {
+            // SAFETY: static mut, single-threaded bring-up.
+            unsafe {
+                core::ptr::write_volatile(core::ptr::addr_of_mut!(DELAY_DUMMY), 0);
+            }
         }
     }
 }
