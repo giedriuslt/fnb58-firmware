@@ -62,8 +62,8 @@ async fn main(_spawner: Spawner) {
     // The I2C lines drive the bus scanner's waits.
     
     unsafe {
-        cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_L_CAN1_RX0);
-        cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_H_CAN1_TX);
+        cortex_m::peripheral::NVIC::unmask(embassy_at32::pac::at32f403a::interrupt::USBFS_L_CAN1_RX0);
+        cortex_m::peripheral::NVIC::unmask(embassy_at32::pac::at32f403a::interrupt::USBFS_H_CAN1_TX);
     }
 
     // Vendor init: CRM USB clock enable, cell reset, usbd_core_init with
