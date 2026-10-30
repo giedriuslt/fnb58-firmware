@@ -48,7 +48,7 @@ fn delay_ms(ms: u32) {
 /// Send via vendor CDC + 500ms gap for the host to collect the packet.
 /// Without this gap, the next send is REJECTED (endpoint buffer busy).
 fn send_trace(msg: &[u8]) {
-    send_trace(msg);
+    unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16); }
     delay_ms(500);
 }
 
