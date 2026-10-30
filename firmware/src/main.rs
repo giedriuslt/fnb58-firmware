@@ -78,7 +78,7 @@ async fn main(_spawner: Spawner) {
 
     // Pin tracer: walk through GPIOs, set each HIGH for 30s.
     // The user probes display connector wires with a multimeter.
-    pin_trace::sweep(send_line);
+    pin_trace::sweep();
 
     let mut rx = [0u8; 64];
     let mut last_scan = Instant::now();
