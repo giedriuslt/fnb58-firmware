@@ -18,6 +18,7 @@
 
 mod board;
 mod buttons;
+mod pin_trace;
 
 static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 #[allow(dead_code)]
@@ -74,6 +75,10 @@ async fn main(_spawner: Spawner) {
 
     // Button discovery monitor (round 24).
     buttons::init();
+
+    // Pin tracer: walk through GPIOs, set each HIGH for 30s.
+    // The user probes display connector wires with a multimeter.
+    pin_trace::sweep(send_line);
 
     let mut rx = [0u8; 64];
     let mut last_scan = Instant::now();
