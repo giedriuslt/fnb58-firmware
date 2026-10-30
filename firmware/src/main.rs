@@ -74,12 +74,6 @@ async fn main(_spawner: Spawner) {
         Timer::after_millis(500).await;
     }
     unsafe extern "C" {
-        fn fnb58_measure_init();
-        fn fnb58_measure_read(
-            mv: *mut u32,
-            ua: *mut i32,
-            mw: *mut i32,
-        ) -> u32;
         fn fnb58_lcd_fill(color: u16);
         fn fnb58_lcd_draw_text(
             x: u16,
@@ -91,7 +85,7 @@ async fn main(_spawner: Spawner) {
         ) -> u16;
     }
 
-    say(b"[lcd] FNB58 r54: hw i2c fixed (addr shift)\r\n").await;
+    say(b"[lcd] FNB58 r55: rust i2c meter\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
@@ -138,8 +132,66 @@ async fn main(_spawner: Spawner) {
     Timer::after_millis(1500).await;
 
     unsafe { fnb58_lcd_fill(0x0000) };
-    unsafe { fnb58_measure_init() };
-    say(b"[meter] hw tpa init\r\n").await;
+
+    // --- r55: meter transport on the Rust embassy I2C driver ---
+    // First hardware run of the HAL driver (host-tested only until now).
+    // The C glue's boot check above already proved the bus; this is the
+    // Rust engine doing the live measurement.
+    use embedded_hal_async::i2c::Operation;
+    use embedded_hal_async::i2c::I2c as _;
+    use embassy_at32::gpio::{AlternatePin, Drive, Port};
+    use embassy_at32::i2c::{I2c, Speed};
+
+    // PB6/PB7 as I2C1 mux open-drain, then the async master at 100 kHz.
+    let _scl = unsafe { AlternatePin::new_open_drain(Port::B, 6, Drive::Moderate) };
+    let _sda = unsafe { AlternatePin::new_open_drain(Port::B, 7, Drive::Moderate) };
+    let mut tpa = match unsafe { I2c::new_i2c1(clocks.pclk1_hz, Speed::Standard) } {
+        Ok(i2c) => i2c,
+        Err(_) => {
+            say(b"[meter] rust i2c config FAIL\r\n").await;
+            loop {
+                Timer::after_millis(1000).await;
+            }
+        }
+    };
+
+    async fn tpa_write(tpa: &mut I2c, reg: u8, val: u16) -> Result<(), embassy_at32::i2c::Error> {
+        let mut wr = [reg, (val >> 8) as u8, val as u8];
+        tpa.transaction(0x40, &mut [Operation::Write(&mut wr)]).await
+    }
+    async fn tpa_read(tpa: &mut I2c, reg: u8) -> Result<u16, embassy_at32::i2c::Error> {
+        let mut reg_buf = [reg];
+        let mut buf = [0u8; 2];
+        tpa.transaction(
+            0x40,
+            &mut [Operation::Write(&mut reg_buf), Operation::Read(&mut buf)],
+        )
+        .await?;
+        Ok(((buf[0] as u16) << 8) | buf[1] as u16)
+    }
+
+    // Identify + configure the TPA626 (INA226 protocol).
+    match tpa_read(&mut tpa, 0xFE).await {
+        Ok(0x5549) => say(b"[meter] rust i2c OK mfr=5549\r\n").await,
+        Ok(v) => {
+            let mut d = [0u8; 96];
+            let mut n = 0;
+            for &b in b"[meter] rust i2c mfr ODD=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_hex8(&mut d, n, v as u32);
+            d[n] = 13;
+            d[n + 1] = 10;
+            unsafe { fnb58_usb_send(d.as_ptr(), (n + 2) as u16) };
+            Timer::after_millis(500).await;
+        }
+        Err(_) => say(b"[meter] rust i2c read FAIL\r\n").await,
+    }
+    let _ = tpa_write(&mut tpa, 0x00, 0x4897).await; // AVG=64, cont
+    let cal: u16 = (5_120_000u32 / 500u32) as u16; // 10 mOhm shunt, 50 uA LSB
+    let _ = tpa_write(&mut tpa, 0x05, cal).await;
+    say(b"[meter] rust tpa configured\r\n").await;
 
     // Meter loop (same as r46).
     unsafe { fnb58_lcd_fill(0x0000) };
@@ -152,7 +204,19 @@ async fn main(_spawner: Spawner) {
         let mut mv: u32 = 0;
         let mut ua: i32 = 0;
         let mut mw: i32 = 0;
-        let ok = unsafe { fnb58_measure_read(&mut mv, &mut ua, &mut mw) } == 0;
+        let ok = match (
+            tpa_read(&mut tpa, 0x02).await,
+            tpa_read(&mut tpa, 0x04).await,
+            tpa_read(&mut tpa, 0x03).await,
+        ) {
+            (Ok(bus), Ok(cur), Ok(pwr)) => {
+                mv = (bus as u32 * 5) / 4; // 1.25 mV/LSB
+                ua = (cur as i16 as i32) * 50; // 50 uA/LSB
+                mw = ((pwr as i16 as i32) * 5) / 4; // 1.25 mW/LSB
+                true
+            }
+            _ => false,
+        };
 
         if ok {
             // Voltage: "20.000 V"
