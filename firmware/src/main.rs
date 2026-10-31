@@ -14,7 +14,11 @@ mod ui;
 
 static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-use crate::ui::Line12;
+/// Build tag, carried on every [meter] console line so a paste can
+/// never be mistaken for another build (the boot banner is usually lost
+/// before the host opens the port).
+const BUILD: &[u8] = b"r78";
+
 use crate::ui::Press;
 use crate::ui::push_pdo;
 use crate::ui::Screen;
@@ -62,9 +66,9 @@ async fn main(_spawner: Spawner) {
         fnb58_usb_init();
     }
 
-    // Wait for USB CDC to be configured (max 15 seconds).
+    // Wait for USB CDC to be configured (max 3 seconds).
     // The host needs time to enumerate and open the COM port.
-    for _ in 0..150 {
+    for _ in 0..30 {
         unsafe {
             if fnb58_usb_configured() == 1 {
                 break;
@@ -78,7 +82,7 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r71: nonblocking console\r\n").await;
+    say(b"[lcd] FNB58 r78: reboot detector\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
@@ -213,6 +217,9 @@ async fn main(_spawner: Spawner) {
     ui.enter(Screen::Power);
 
     let mut tick: u32 = 0;
+    sender.push(b"[boot] loop start
+");
+
     loop {
         let mut mv: u32 = 0;
         let mut ua: i32 = 0;
@@ -234,61 +241,60 @@ async fn main(_spawner: Spawner) {
         if ok && ui.screen == Screen::Power {
             ui.draw_power(mv, ua, mw);
         }
-        // Console status ~every 2 s (CDC needs the 500 ms gap).
-        if tick % 20 == 0 {
-            if ok {
-                let mut l1 = Line12::new();
-                l1.num_u32(mv, 3);
-                l1.push(b" V");
-                let mut l2 = Line12::new();
-                let neg = ua < 0;
-                let a = (if neg { -ua } else { ua }) as u32;
-                if a >= 1_000_000 {
-                    l2.sign(neg);
-                    l2.num_u32(a / 1_000, 3);
-                    l2.push(b" A");
-                } else {
-                    l2.sign(neg);
-                    l2.num_u32(a / 100, 1);
-                    l2.push(b" mA");
-                }
-                let mut dbg = [0u8; 64];
-                let mut n = 0;
-                for &b in b"[meter] " {
-                    dbg[n] = b;
-                    n += 1;
-                }
-                for &b in l1.bytes() {
-                    dbg[n] = b;
-                    n += 1;
-                }
-                dbg[n] = b' ';
-                n += 1;
-                dbg[n] = b'|';
-                n += 1;
-                dbg[n] = b' ';
-                n += 1;
-                for &b in l2.bytes() {
-                    dbg[n] = b;
-                    n += 1;
-                }
-                dbg[n] = b'\r';
-                dbg[n + 1] = b'\n';
-                sender.push(&dbg[..n + 2]);
-            } else {
-                sender.push(b"[meter] tpa626 read FAIL\r\n");
-            }
-        }
+        // (The TPA626 console feed is gone — the screen shows the values;
+        // the [pd] diag line below is the periodic console heartbeat and
+        // carries the build tag.)
 
         // PD poll: parse Source_Capabilities as they appear on the CC
         // lines (the source re-sends them whenever the DUT hard-resets).
         if matches!(pd::poll(&mut tpa, &mut caps, &mut listener).await, Ok(true)) {
             report_caps(&caps, &mut sender);
         }
+        // Tester-initiated discovery, automatic: while no caps have been
+        // captured, ask the source every 5 s (Get_Source_Cap + Request of
+        // the first fixed PDO inside discover()).
+        if caps.updates == 0 && tick % 50 == 0 && tick > 0 {
+            match pd::discover(&mut tpa, &mut caps, &mut listener).await {
+                Ok(true) => report_caps(&caps, &mut sender),
+                Ok(false) => {}
+                Err(_) => sender.push(b"[pd] auto scan FAIL\r\n"),
+            }
+        }
+        // Periodic diag heartbeat with the build tag, queue depth and
+        // send-failure count (f>0 = the host is not collecting packets).
         if tick % 20 == 0 {
             let mut d = [0u8; 64];
-            let n = listener.write_diag(&mut d);
-            sender.push(&d[..n]);
+            let mut n = 0;
+            for &b in b"[pd " {
+                d[n] = b;
+                n += 1;
+            }
+            for &b in BUILD {
+                d[n] = b;
+                n += 1;
+            }
+            for &b in b"] t=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, tick % 100000);
+            for &b in b" q=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, sender.qlen as u32);
+            for &b in b" f=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, sender.take_fails());
+            n = listener.write_diag(&mut d, n);
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            sender.push(&d[..n + 2]);
+        }
+        if ui.screen == Screen::Pd {
+            ui.draw_pd(&caps);
         }
 
         // Buttons: debounced active-low; events to the console queue,
@@ -317,28 +323,27 @@ async fn main(_spawner: Spawner) {
             match ui.on_press(i) {
                 Press::Switch(screen) => ui.enter(screen),
                 Press::Discover => {
-                    // Restart the passive listener from scratch: re-init
-                    // the FUSB302 and forget the old caps. The next
-                    // negotiation (DUT re-plug or source reset) is then
-                    // captured fresh.
+                    // Active discovery (PD switch ON, no DUT):
+                    // Get_Source_Cap -> caps -> Request the first
+                    // fixed PDO, so the source holds the contract.
                     caps = pd::SourceCaps::default();
                     listener = pd::Listener::default();
                     match pd::init(&mut tpa).await {
-                        Ok(id) => {
-                            let mut d = [0u8; 64];
-                            let mut n = 0;
-                            for &b in b"[pd] rediscover id=" {
-                                d[n] = b;
-                                n += 1;
+                        Ok(_) => match pd::discover(&mut tpa, &mut caps, &mut listener).await {
+                            Ok(true) => {
+                                let mut d = [0u8; 64];
+                                let mut n = 0;
+                                for &b in b"[pd] scan ok, contract requested\r\n" {
+                                    d[n] = b;
+                                    n += 1;
+                                }
+                                sender.push(&d[..n]);
                             }
-                            n = push_hex8(&mut d, n, id as u32);
-                            d[n] = b'\r';
-                            d[n + 1] = b'\n';
-                            sender.push(&d[..n + 2]);
-                        }
-                        Err(_) => sender.push(b"[pd] rediscover FAIL\r\n"),
+                            Ok(false) => sender.push(b"[pd] scan: no reply\r\n"),
+                            Err(_) => sender.push(b"[pd] scan FAIL\r\n"),
+                        },
+                        Err(_) => sender.push(b"[pd] reinit FAIL\r\n"),
                     }
-                    ui.enter(Screen::Pd);
                 }
                 Press::None => {}
             }
@@ -391,10 +396,12 @@ fn report_caps(caps: &pd::SourceCaps, out: &mut Sender) {
 /// flight, so every console line the main loop produces (meter status,
 /// button events, PD capabilities) is queued here and drained with 500 ms
 /// gaps — one drain point guarantees the sends never collide.
-struct Sender {
+pub(crate) struct Sender {
     queue: [[u8; 64]; 20],
     qhead: usize,
     qlen: usize,
+    /// Send attempts rejected by the busy endpoint since last take_fails().
+    fails: u32,
 }
 
 impl Sender {
@@ -403,10 +410,11 @@ impl Sender {
             queue: [[0; 64]; 20],
             qhead: 0,
             qlen: 0,
+            fails: 0,
         }
     }
 
-    fn push(&mut self, line: &[u8]) {
+    pub(crate) fn push(&mut self, line: &[u8]) {
         if self.qlen == self.queue.len() || line.len() > 64 {
             return; // backlog or oversize: drop, the next report suffices
         }
@@ -431,7 +439,16 @@ impl Sender {
         if ok {
             self.qhead = (self.qhead + 1) % self.queue.len();
             self.qlen -= 1;
+        } else {
+            self.fails += 1;
         }
+    }
+
+    /// Rejected-send count since the last call.
+    pub(crate) fn take_fails(&mut self) -> u32 {
+        let f = self.fails;
+        self.fails = 0;
+        f
     }
 }
 

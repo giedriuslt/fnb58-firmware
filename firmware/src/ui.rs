@@ -154,7 +154,7 @@ impl Ui {
         self.last_n = caps.n;
         unsafe { fnb58_lcd_fill_window(0, 32, 319, 210, BLACK) };
         if caps.n == 0 {
-            text(8, 60, b"REPLUG DUT", 2, GRAY);
+            text(8, 60, b"NO CAPS - PRESS OK", 2, GRAY);
             return;
         }
         for i in 0..caps.n {
