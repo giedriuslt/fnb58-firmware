@@ -87,7 +87,7 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(500).await;
     }
-    say(b"[lcd] FNB58 r56: pd profile reading\r\n").await;
+    say(b"[lcd] FNB58 r57: i2c ack fix + pd rx\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
@@ -197,6 +197,7 @@ async fn main(_spawner: Spawner) {
 
     // --- FUSB302 passive PD listener ---
     let mut caps = pd::SourceCaps::default();
+    let mut listener = pd::Listener::default();
     match pd::init(&mut tpa).await {
         Ok(id) => {
             let mut d = [0u8; 96];
@@ -314,7 +315,7 @@ async fn main(_spawner: Spawner) {
 
         // PD poll: parse Source_Capabilities as they appear on the CC
         // lines (the source re-sends them whenever the DUT hard-resets).
-        if matches!(pd::poll(&mut tpa, &mut caps).await, Ok(true)) {
+        if matches!(pd::poll(&mut tpa, &mut caps, &mut listener).await, Ok(true)) {
             report_caps(&caps).await;
         }
 
