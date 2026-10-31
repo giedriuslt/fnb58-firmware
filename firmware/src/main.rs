@@ -85,7 +85,7 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(500).await;
     }
-    say(b"[lcd] FNB58 r64: meter + pd + buttons\r\n").await;
+    say(b"[lcd] FNB58 r69: pdo amp display fix\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
@@ -291,7 +291,7 @@ async fn main(_spawner: Spawner) {
             }
 
             // Console status ~every 2 s (CDC needs the 500 ms gap).
-            if tick % 8 == 0 {
+            if tick % 20 == 0 {
                 let mut dbg = [0u8; 64];
                 let mut n = 0;
                 for &b in b"[meter] " {
@@ -316,7 +316,7 @@ async fn main(_spawner: Spawner) {
                 dbg[n + 1] = b'\n';
                 sender.push(&dbg[..n + 2]);
             }
-        } else if tick % 8 == 0 {
+        } else if tick % 20 == 0 {
             sender.push(b"[meter] tpa626 read FAIL\r\n");
         }
 
@@ -324,6 +324,11 @@ async fn main(_spawner: Spawner) {
         // lines (the source re-sends them whenever the DUT hard-resets).
         if matches!(pd::poll(&mut tpa, &mut caps, &mut listener).await, Ok(true)) {
             report_caps(&caps, &mut sender);
+        }
+        if tick % 20 == 0 {
+            let mut d = [0u8; 64];
+            let n = listener.write_diag(&mut d);
+            sender.push(&d[..n]);
         }
 
         // Buttons: debounced active-low; LCD indicator top-left, events
@@ -376,7 +381,7 @@ async fn main(_spawner: Spawner) {
         sender.drain().await;
 
         tick = tick.wrapping_add(1);
-        Timer::after_millis(250).await;
+        Timer::after_millis(100).await;
     }
 }
 
@@ -450,7 +455,7 @@ fn push_pdo(buf: &mut [u8], pos: usize, pdo: &pd::Pdo) -> usize {
     buf[p] = b' ';
     p += 1;
     if pdo.ma >= 1000 {
-        p = push_num_dec(buf, p, pdo.ma / 1000, 1);
+        p = push_num_dec(buf, p, pdo.ma / 100, 1);
         buf[p] = b'A';
     } else {
         p = push_num_dec(buf, p, pdo.ma, 0);

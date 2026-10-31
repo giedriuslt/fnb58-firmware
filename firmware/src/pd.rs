@@ -28,6 +28,7 @@ const REG_SWITCHES0: u8 = 0x02;
 const REG_CONTROL1: u8 = 0x07;
 const REG_POWER: u8 = 0x0b;
 const REG_RESET: u8 = 0x0c;
+const REG_STATUS0: u8 = 0x40;
 const REG_STATUS1: u8 = 0x41;
 const REG_INTERRUPT: u8 = 0x42;
 const REG_FIFOS: u8 = 0x43;
@@ -45,6 +46,8 @@ const MEAS_CC2: u8 = 0x08;
 /// INTERRUPT (0x42), read-clear: BMC activity started/stopped on the
 /// measured CC line.
 const I_ACTIVITY: u8 = 0x40;
+/// INTERRUPT (0x42), read-clear: a received packet's CRC was checked.
+const I_CRC_CHK: u8 = 0x10;
 /// STATUS1 (0x41): the RX FIFO holds a complete message.
 const RX_EMPTY: u8 = 0x20;
 
@@ -65,28 +68,53 @@ pub struct Pdo {
 pub struct SourceCaps {
     pub n: usize,
     pub pdos: [Pdo; 7],
-    /// PD spec revision of the message (header bits 15:14).
+    /// PD spec revision of the message (header bits 7:6).
     pub spec_rev: u8,
     /// Bumped on every new Source_Capabilities message.
     pub updates: u32,
 }
 
-/// Sticky state for the CC-line alternation between polls.
+/// Sticky state for the CC-line scanning listener.
 pub struct Listener {
     /// CC line currently routed to the receiver: 1 or 2.
     cc: u8,
-    /// Consecutive polls with no BMC activity on the routed line.
-    quiet: u32,
+    /// Ticks of lock remaining on the active CC; latched activity re-arms
+    /// it. Scanning alternates lines only while unlocked.
+    lock_ticks: u32,
+    /// Latched I_ACTIVITY per CC since the last diagnostic print.
+    activity: [bool; 2],
+    /// Last STATUS0/STATUS1 read while that CC was routed.
+    st0: [u8; 2],
+    st1: [u8; 2],
+    /// Last poll error as a one-digit diagnostic code (0 = none).
+    err: u8,
+    /// The CRC-check latch has vouched for the FIFO contents; frames may
+    /// be parsed. Cleared when the FIFO drains empty.
+    validated: bool,
+    /// Ticks with non-empty, unvalidated FIFO bytes (stale-flush counter).
+    stale: u32,
 }
 
 impl Default for Listener {
     fn default() -> Self {
-        Self { cc: 1, quiet: 0 }
+        Self {
+            cc: 1,
+            lock_ticks: 0,
+            activity: [false; 2],
+            st0: [0; 2],
+            st1: [0; 2],
+            err: 0,
+            validated: false,
+            stale: 0,
+        }
     }
 }
 
-/// Polls with no activity before trying the other CC line.
-const QUIET_SWITCH_AFTER: u32 = 2;
+/// Lock ticks after latched activity (1 s at the 100 ms poll cadence).
+const LOCK_TICKS: u32 = 10;
+
+/// Ticks of non-empty, unvalidated FIFO bytes before a flush (500 ms).
+const STALE_FLUSH_TICKS: u32 = 5;
 
 async fn wr(i2c: &mut I2c, reg: u8, val: u8) -> Result<(), Error> {
     let mut buf = [reg, val];
@@ -120,64 +148,181 @@ pub async fn init(i2c: &mut I2c) -> Result<u8, Error> {
     Ok(id[0])
 }
 
-/// Poll for a received message; parse Source_Capabilities into `caps`.
-/// Ok(true) = new source capabilities were stored.
+/// Poll one tick (100 ms cadence); parse Source_Capabilities into `caps`.
+/// Scans both CC lines and locks onto one that shows latched BMC
+/// activity. Ok(true) = new source capabilities were stored.
 pub async fn poll(
     i2c: &mut I2c,
     caps: &mut SourceCaps,
     lis: &mut Listener,
 ) -> Result<bool, Error> {
-    // Read-clear interrupt latch: BMC activity on the routed CC line.
+    match poll_inner(i2c, caps, lis).await {
+        Ok(v) => {
+            lis.err = 0;
+            Ok(v)
+        }
+        Err(e) => {
+            lis.err = err_code(&e);
+            Err(e)
+        }
+    }
+}
+
+fn err_code(e: &Error) -> u8 {
+    match e {
+        Error::Timeout => 1,
+        Error::ArbitrationLoss => 2,
+        Error::Bus => 3,
+        Error::Overrun => 4,
+        Error::ClockTimeout => 5,
+        Error::NoAcknowledge(_) => 6,
+    }
+}
+
+async fn poll_inner(
+    i2c: &mut I2c,
+    caps: &mut SourceCaps,
+    lis: &mut Listener,
+) -> Result<bool, Error> {
+    // Read-clear interrupt latch: BMC activity and CRC validation on the
+    // routed CC line, both latched since the last tick.
     let mut int = [0u8];
     rd(i2c, REG_INTERRUPT, &mut int).await?;
     if int[0] & I_ACTIVITY != 0 {
-        lis.quiet = 0;
+        let idx = (lis.cc - 1) as usize;
+        lis.activity[idx] = true;
+        lis.lock_ticks = LOCK_TICKS;
+    } else if lis.lock_ticks > 0 {
+        lis.lock_ticks -= 1;
     } else {
-        lis.quiet += 1;
-        if lis.quiet > QUIET_SWITCH_AFTER {
-            // Nothing heard on this line; try the other one.
-            lis.cc = if lis.cc == 1 { 2 } else { 1 };
-            lis.quiet = 0;
-            let meas = if lis.cc == 1 { MEAS_CC1 } else { MEAS_CC2 };
-            wr(i2c, REG_SWITCHES0, meas).await?;
-        }
+        // Scanning: dwell one tick per CC, then swap.
+        lis.cc = if lis.cc == 1 { 2 } else { 1 };
+        let meas = if lis.cc == 1 { MEAS_CC1 } else { MEAS_CC2 };
+        wr(i2c, REG_SWITCHES0, meas).await?;
+    }
+    if int[0] & I_CRC_CHK != 0 {
+        // A frame completed with a hardware CRC check; the FIFO now
+        // holds at least one validated frame (possibly queued behind
+        // older bytes).
+        lis.validated = true;
     }
 
+    // Snapshot the receiver state for the currently routed line.
+    let idx = (lis.cc - 1) as usize;
+    let mut st0 = [0u8];
+    rd(i2c, REG_STATUS0, &mut st0).await?;
     let mut st1 = [0u8];
     rd(i2c, REG_STATUS1, &mut st1).await?;
+    lis.st0[idx] = st0[0];
+    lis.st1[idx] = st1[0];
     if st1[0] & RX_EMPTY != 0 {
+        lis.stale = 0;
+        lis.validated = false;
         return Ok(false);
     }
-
-    // FIFO order: SOP token, 16-bit header, N data objects, CRC32.
-    let mut head = [0u8; 3];
-    rd(i2c, REG_FIFOS, &mut head).await?;
-    // The token's top three bits address the SOP* variant (DS Table 42);
-    // 7 = SOP. Anything else is a non-SOP frame or a desynced FIFO.
-    if head[0] >> 5 != 7 {
-        wr(i2c, REG_CONTROL1, ENSOP1 | RX_FLUSH).await?;
+    if !lis.validated {
+        // FIFO bytes that no CRC check has vouched for: a frame still
+        // arriving, or one that failed validation. Give it a few ticks,
+        // then flush so the FIFO can never wedge.
+        lis.stale += 1;
+        if lis.stale > STALE_FLUSH_TICKS {
+            wr(i2c, REG_CONTROL1, ENSOP1 | RX_FLUSH).await?;
+            lis.stale = 0;
+        }
         return Ok(false);
     }
-    let header = u16::from_le_bytes([head[1], head[2]]);
-    let n = ((header >> 12) & 0x7) as usize;
-    let mut rest = [0u8; 28 + 4];
-    rd(i2c, REG_FIFOS, &mut rest[..n * 4 + 4]).await?;
+    lis.stale = 0;
 
-    // SOP data message type 1 with payload = Source_Capabilities; GoodCRC
-    // and other control messages (n = 0) are ignored.
-    if n == 0 || (header & 0x1F) != 1 {
-        return Ok(false);
+    // Drain validated frames; Source_Capabilities may sit anywhere in
+    // the queue behind GoodCRC responses.
+    let mut caps_found = false;
+    for _ in 0..4 {
+        let mut st1b = [0u8];
+        rd(i2c, REG_STATUS1, &mut st1b).await?;
+        if st1b[0] & RX_EMPTY != 0 {
+            lis.validated = false;
+            break;
+        }
+        // FIFO order: SOP token, 16-bit header, N data objects, CRC32.
+        let mut head = [0u8; 3];
+        rd(i2c, REG_FIFOS, &mut head).await?;
+        // The token's top three bits address the SOP* variant (DS Table
+        // 42); 7 = SOP. Anything else is a non-SOP frame or a desynced
+        // FIFO: flush so the next frame starts aligned.
+        if head[0] >> 5 != 7 {
+            wr(i2c, REG_CONTROL1, ENSOP1 | RX_FLUSH).await?;
+            lis.validated = false;
+            return Ok(caps_found);
+        }
+        let header = u16::from_le_bytes([head[1], head[2]]);
+        let n = ((header >> 12) & 0x7) as usize;
+        let mut rest = [0u8; 28 + 4];
+        rd(i2c, REG_FIFOS, &mut rest[..n * 4 + 4]).await?;
+        // SOP data message type 1 with payload = Source_Capabilities.
+        // Rejected: extended messages (B15 set — Source_Capabilities_
+        // Extended shares type 1 and would parse as garbage PDOs) and
+        // control messages such as GoodCRC (n = 0).
+        if header & 0x8000 != 0 || n == 0 || (header & 0x1F) != 1 {
+            continue;
+        }
+        caps.n = n.min(7);
+        // Specification revision is header bits 7:6 (00 = PD 2.0,
+        // 01 = PD 3.0); bits 15:14 are the Extended flag plus the top
+        // object-count bit.
+        caps.spec_rev = ((header >> 6) & 0x3) as u8;
+        for i in 0..caps.n {
+            let o = &rest[i * 4..i * 4 + 4];
+            let pdo = u32::from_le_bytes([o[0], o[1], o[2], o[3]]);
+            caps.pdos[i] = parse_pdo(pdo);
+        }
+        caps.updates = caps.updates.wrapping_add(1);
+        caps_found = true;
     }
+    Ok(caps_found)
+}
 
-    caps.n = n.min(7);
-    caps.spec_rev = ((header >> 14) & 0x3) as u8;
-    for i in 0..caps.n {
-        let o = &rest[i * 4..i * 4 + 4];
-        let pdo = u32::from_le_bytes([o[0], o[1], o[2], o[3]]);
-        caps.pdos[i] = parse_pdo(pdo);
+fn hex8(buf: &mut [u8], w: usize, v: u8) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    buf[w] = HEX[(v >> 4) as usize];
+    buf[w + 1] = HEX[(v & 0xF) as usize];
+    w + 2
+}
+
+impl Listener {
+    /// Diagnostic line: per-CC last STATUS0/STATUS1 (hex), the latched
+    /// activity flag (a0/a1) and the last poll error code. STATUS0/
+    /// STATUS1 reflect the line as of the last tick it was routed.
+    pub fn write_diag(&self, buf: &mut [u8]) -> usize {
+        let mut w = 0;
+        for &b in b"[pd] " {
+            buf[w] = b;
+            w += 1;
+        }
+        for (i, cc) in [1u8, 2].iter().enumerate() {
+            if i == 1 {
+                buf[w] = b' ';
+                w += 1;
+            }
+            buf[w] = b'c';
+            buf[w + 1] = b'0' + cc;
+            buf[w + 2] = b'=';
+            w += 3;
+            w = hex8(buf, w, self.st0[i]);
+            buf[w] = b'/';
+            w += 1;
+            w = hex8(buf, w, self.st1[i]);
+            buf[w] = b',';
+            buf[w + 1] = b'a';
+            buf[w + 2] = if self.activity[i] { b'1' } else { b'0' };
+            buf[w + 3] = b',';
+            buf[w + 4] = b'e';
+            buf[w + 5] = b'0' + self.err;
+            w += 6;
+        }
+        buf[w] = b'\r';
+        buf[w + 1] = b'\n';
+        w + 2
     }
-    caps.updates = caps.updates.wrapping_add(1);
-    Ok(true)
 }
 
 fn parse_pdo(pdo: u32) -> Pdo {
