@@ -255,7 +255,7 @@ void fnb58_lcd_test_pattern(void)
 /* Glyphs are 5 columns x 7 rows; each byte is one column, bit r = row r
  * (bit 0 = top). Characters: 0-9 . space V A W m u - P S C D plus the
  * uppercase letters the button labels need (BEFGHIKLMNORTUY) and ':'. */
-static const char FONT_CHARS[] = "0123456789. VAWmu-PSCDBEFGHIKLMNORTUY:";
+static const char FONT_CHARS[] = "0123456789. VAWmu-PSCDBEFGHIKLMNORTUY:/";
 static const uint8_t FONT_5X7[][5] = {
     /* 0 */ {0x3E, 0x51, 0x49, 0x45, 0x3E},
     /* 1 */ {0x00, 0x42, 0x7F, 0x40, 0x00},
@@ -295,6 +295,7 @@ static const uint8_t FONT_5X7[][5] = {
     /* U */ {0x3F, 0x40, 0x40, 0x40, 0x3F},
     /* Y */ {0x03, 0x04, 0x78, 0x04, 0x03},
     /* : */ {0x00, 0x36, 0x36, 0x00, 0x00},
+    /* / */ {0x00, 0x60, 0x18, 0x06, 0x01},
 };
 
 /* Draw one character at (x, y), `scale` pixels per font pixel, fg on bg.

@@ -97,6 +97,12 @@ const BTN_PINS: [(&[u8], usize, u8); 4] = [
 /// Debounce length in poll calls (the meter loop polls at 250 ms).
 const BTN_DEB: u8 = 2;
 
+/// Button indices (BTN_PINS order).
+pub const LEFT: usize = 0;
+pub const OK: usize = 1;
+pub const BACK: usize = 2;
+pub const RIGHT: usize = 3;
+
 /// The four verified FNB58 buttons (see README pin map): to-GND switches,
 /// no external pulls — internal pull-ups latched here once at init.
 pub struct Buttons {
