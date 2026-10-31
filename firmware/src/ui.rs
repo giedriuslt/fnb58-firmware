@@ -99,6 +99,23 @@ impl Ui {
         }
     }
 
+    /// Show the reset-cause flags in the title bar so a reboot loop is
+    /// visible standalone (no PC needed).
+    pub fn draw_rst(&self, flags: u8) {
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        for &b in b"rst=" {
+            line[n] = b;
+            n += 1;
+        }
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        line[n] = HEX[(flags >> 4) as usize];
+        line[n + 1] = HEX[(flags & 0xF) as usize];
+        n += 2;
+        line[n] = 0;
+        unsafe { fnb58_lcd_draw_text(180, 8, line.as_ptr(), 2, GRAY, BLACK) };
+    }
+
     /// Power screen: the three big live values (12-char padded overdraws,
     /// so shrinking values leave no ghosts).
     pub fn draw_power(&self, mv: u32, ua: i32, mw: i32) {

@@ -17,7 +17,7 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r78";
+const BUILD: &[u8] = b"r83";
 
 use crate::ui::Press;
 use crate::ui::push_pdo;
@@ -67,7 +67,6 @@ async fn main(_spawner: Spawner) {
     }
 
     // Wait for USB CDC to be configured (max 3 seconds).
-    // The host needs time to enumerate and open the COM port.
     for _ in 0..30 {
         unsafe {
             if fnb58_usb_configured() == 1 {
@@ -82,7 +81,7 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r78: reboot detector\r\n").await;
+    say(b"[lcd] FNB58 r83: usb send fixed\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
@@ -217,8 +216,39 @@ async fn main(_spawner: Spawner) {
     ui.enter(Screen::Power);
 
     let mut tick: u32 = 0;
-    sender.push(b"[boot] loop start
-");
+    // Reset-cause flags (CRM CTRLSTS bits 26..=31, sticky until cleared):
+    // 0x01 pin, 0x02 POR/LVR, 0x04 software, 0x08 WDT, 0x10 WWT, 0x20 LP.
+    let rst_flags = {
+        let crm = unsafe { embassy_at32::pac::at32f403a::CRM::steal() };
+        let flags = ((crm.ctrlsts().read().bits() >> 26) & 0x3F) as u8;
+        // Clear the flags so the NEXT boot reports only its own fresh
+        // cause (the bits are sticky and would otherwise accumulate).
+        crm.ctrlsts().write(|w| {
+            w.licken().set_bit(); // keep the LSI enabled as before
+            w.rstfc().set_bit()  // clear all reset-cause flags
+        });
+        flags
+    };
+    ui.draw_rst(rst_flags);
+    {
+        let mut d = [0u8; 64];
+        let mut n = 0;
+        for &b in b"[boot] rst=" {
+            d[n] = b;
+            n += 1;
+        }
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        d[n] = HEX[(rst_flags >> 4) as usize];
+        d[n + 1] = HEX[(rst_flags & 0xF) as usize];
+        n += 2;
+        for &b in b" loop start" {
+            d[n] = b;
+            n += 1;
+        }
+        d[n] = b'\r';
+        d[n + 1] = b'\n';
+        sender.push(&d[..n + 2]);
+    }
 
     loop {
         let mut mv: u32 = 0;

@@ -37,9 +37,13 @@ uint16_t fnb58_usb_recv(uint8_t *buffer)
   return usb_vcp_get_rxdata(&usb_core_dev, buffer);
 }
 
-error_status fnb58_usb_send(const uint8_t *data, uint16_t len)
+/* Rust contract: 0 = packet accepted, nonzero = endpoint busy.
+ * usb_vcp_send_data returns error_status, where (at32f403a_407.h)
+ * ERROR = 0 and SUCCESS = 1 - the opposite ordering. Translate here so
+ * the Rust side can never mix them up again. */
+int32_t fnb58_usb_send(const uint8_t *data, uint16_t len)
 {
-  return usb_vcp_send_data(&usb_core_dev, (uint8_t *)data, len);
+  return (usb_vcp_send_data(&usb_core_dev, (uint8_t *)data, len) == SUCCESS) ? 0 : 1;
 }
 
 /* USB interrupt lines: the vendor example uses the L line; H is wired to
