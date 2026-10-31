@@ -84,6 +84,71 @@ unsafe extern "C" {
     fn fnb58_usb_send(data: *const u8, len: u16) -> i32;
 }
 
+// --- Production button consumer (r62): the four verified buttons ---
+
+/// (name, GPIO base, pin number).
+const BTN_PINS: [(&[u8], usize, u8); 4] = [
+    (b"LEFT", GPIOA_BASE, 15),
+    (b"OK", GPIOB_BASE, 4),
+    (b"BACK", GPIOB_BASE, 9),
+    (b"RIGHT", GPIOB_BASE, 8),
+];
+
+/// Debounce length in poll calls (the meter loop polls at 250 ms).
+const BTN_DEB: u8 = 2;
+
+/// The four verified FNB58 buttons (see README pin map): to-GND switches,
+/// no external pulls — internal pull-ups latched here once at init.
+pub struct Buttons {
+    stable: [bool; 4],
+    deb: [u8; 4],
+}
+
+impl Buttons {
+    /// Enable GPIO clocks and latch internal pull-ups on all four pins.
+    pub fn new() -> Self {
+        // SAFETY: production consumer; idempotent clock enables alongside
+        // the LCD/I2C C glue.
+        let crm = unsafe { embassy_at32::pac::at32f403a::CRM::steal() };
+        crm.apb2en().modify(|_, w| {
+            w.gpioa().bit(true);
+            w.gpiob().bit(true);
+            w
+        });
+        for &(_, base, num) in &BTN_PINS {
+            pull_up(base, num);
+        }
+        Self {
+            stable: [false; 4],
+            deb: [0; 4],
+        }
+    }
+
+    /// Poll once; returns (button index, down) on a debounced change.
+    pub fn poll(&mut self) -> Option<(usize, bool)> {
+        for i in 0..BTN_PINS.len() {
+            let (_, base, num) = BTN_PINS[i];
+            let down = read_levels(base) & (1u32 << num) == 0;
+            if down != self.stable[i] {
+                self.deb[i] = self.deb[i].saturating_add(1);
+                if self.deb[i] >= BTN_DEB {
+                    self.deb[i] = 0;
+                    self.stable[i] = down;
+                    return Some((i, down));
+                }
+            } else {
+                self.deb[i] = 0;
+            }
+        }
+        None
+    }
+
+    /// Button name bytes ("LEFT", "OK", ...).
+    pub fn name(i: usize) -> &'static [u8] {
+        BTN_PINS[i].0
+    }
+}
+
 fn flat(port: u8, num: u8) -> usize {
     (port - b'A') as usize * 16 + num as usize
 }
