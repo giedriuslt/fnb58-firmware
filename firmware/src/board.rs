@@ -44,7 +44,22 @@ pub const MADCTL_FLIPPED: u8 = 0xA0;
 pub const X_OFFSET: u16 = 0;
 pub const Y_OFFSET: u16 = 0;
 
-// --- UNVERIFIED PIN MAP (correct here after hardware RE) ---
+// --- VERIFIED PINS (hardware-confirmed; full map in the README) ---
+
+/// Buttons (verified r59-r61 tracer): to-GND switches with NO external
+/// pull-ups. Enable an internal pull-up on each and treat active-low as
+/// pressed. PA15 and PB4 are the freed-JTAG pins (SWJTAG remap); PB8/PB9
+/// are the unused I2C1-remap alternates (I2C1 runs on PB6/PB7).
+#[allow(dead_code)]
+pub const PIN_BTN_LEFT: (Port, u8) = (Port::A, 15);
+#[allow(dead_code)]
+pub const PIN_BTN_OK: (Port, u8) = (Port::B, 4);
+#[allow(dead_code)]
+pub const PIN_BTN_BACK: (Port, u8) = (Port::B, 9);
+#[allow(dead_code)]
+pub const PIN_BTN_RIGHT: (Port, u8) = (Port::B, 8);
+
+// --- UNVERIFIED PIN MAP (historical guesses; see README) ---
 
 /// SPI1 SCK (F1-style fixed alternate function).
 pub const PIN_SPI_SCK: (Port, u8) = (Port::A, 5);

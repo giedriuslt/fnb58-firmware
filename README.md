@@ -20,15 +20,29 @@ Build a flashable binary (vector table at 0x08000000):
 ./make-bin.sh    # cargo build + rust-objcopy -O binary
 ```
 
-## ⚠️ The pin map is UNVERIFIED
+## Verified hardware pin map (probed on the real board)
 
-`firmware/src/board.rs` holds every hardware assumption in one block:
-display pins (SPI1 SCK/MOSI, D/C, RST, CS, backlight), the DMA channel and
-the clock profile. These are the F1-style defaults for SPI1 (PA5/PA7) and
-adjacent pins — **not traced from an actual FNB58 board yet**. First light
-requires correcting them against the real 12-pin display connector
-(continuity from the connector to the AT32's LQFP48 pins), after which the
-same block records the verified map.
+| Function | Pins | Verified by |
+|---|---|---|
+| LCD ST7789V 320x240 | SPI2: SCK=PB13, MOSI=PB15, CS=PB12, DC=PB11, RST=PB10 | r40-r53: full driver + pattern on glass |
+| LCD backlight | PB3 (active high) | user trace, r42+ |
+| I2C1 bus | PB6=SCL, PB7=SDA | r18-r21 scans; TPA626@0x40, FUSB302B@0x22, KXTJ3@0x0E, mystery@0x0C (write-only) |
+| Buttons (to GND, need internal pull-ups) | LEFT=PA15, OK=PB4, BACK=PB9, RIGHT=PB8 | r59-r61 tracer (HIT with pull-up window) |
+| USB FS | PA11=D-, PA12=D+ | working CDC since r15 |
+| SWD | PA13=SWDIO, PA14=SWCLK | ICP flashing path |
+| Crystal | 8 MHz HEXT | vendor example boots; 192 MHz PLL |
+| W25Q128 flash | shares SPI2 (SCK=PB13, MISO=PB14, MOSI=PB15), CS unconfirmed | r33 probe |
+
+Button notes: PA15 and PB4 are the freed-JTAG pins (the firmware's
+SWJTAG remap releases PA15+PB3+PB4); PB8/PB9 are the I2C1-remap
+alternate pins, unused because I2C1 runs on PB6/PB7. None of the four
+buttons has an external pull-up — a button pin reads low when floating,
+so the driver must enable an internal pull-up on each button pin and
+treat active-low as pressed.
+
+`firmware/src/board.rs` still contains the original UNVERIFIED guess
+block (SPI1 pins etc.) — historical only; the verified map above and
+the C glue (`c/fnb58_lcd.c`, `c/fnb58_i2c.c`) are the source of truth.
 
 The backlight is driven as a plain GPIO for now; move it to a
 `embassy_at32::pwm` TMR3 channel once its true pin (and timer channel) is
