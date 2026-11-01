@@ -15,6 +15,10 @@ charger on demand.
 - **I²C1**: the vendor C `i2c_application` library (`c/fnb58_i2c.c`
   glue, PB6/PB7). The Rust embassy I2C driver also works and runs the
   TPA626 meter transactions.
+- **LCD**: also on the vendor C side — the ST7789V driver is C glue
+  (`c/fnb58_lcd.c`: init, text, fill, test pattern) called from Rust
+  through `fnb58_lcd_*` externs; the Rust `panel.rs` transport is
+  historical and unused.
 - **Everything else is Rust** on `embassy-at32`: clocks (192 MHz PLL
   from the 8 MHz HEXT crystal + USB DIV_4), GPIO, EXINT, the UI, the
   PD driver (`pd.rs`, register-level FUSB302B), buttons, console queue.
@@ -33,13 +37,14 @@ charger on demand.
 | TPA626 power monitor | I2C 0x40 (mfr 0x5549, die 0x2260 = INA226-compatible), 10 mΩ shunt assumed | r20-r23 live VBUS, r62+ V/A/W |
 | FUSB302B PD PHY | I2C 0x22, **INT_N = PC13** (LQFP48 pin 2, open-drain, needs pull-up) | r20 id=91; PC13 traced by user, r102 EXTINT proven |
 | KXTJ3-1057 accelerometer | I2C 0x0E (whoami 0x35) | r20 |
-| Mystery device | I2C 0x0C — ACKs address, ignores all reads (write-only) | r20-r22 |
+| "Mystery" 0x0C | **SMBus Alert Response Address of the TPA626** — its ALERT function shares the I2C bus; ACKs 0x0C and ignores all reads (that is what the ARA does) | r20-r22 dump behavior; identified later |
 | Buttons (to GND, internal pull-ups, active-low) | LEFT=PA15, OK=PB4, BACK=PB9, RIGHT=PB8 | r59-r61 tracer; r102 EXINT |
 | FUSB302 INT_N | PC13 → EXINT13 falling | r102: `isr line=13 ok` |
 | USB FS | PA11=D-, PA12=D+ | working CDC since r15 |
 | SWD | PA13=SWDIO, PA14=SWCLK | ICP flashing path |
 | Crystal | 8 MHz on PD0/PD1 (OSC_IN/OUT — NOT PC14/15) | vendor example + r15 |
-| LEXT 32 kHz footprint | PC14/PC15 — **not populated** (r86 lext=0) | r86 probe |
+| 32 kHz footprint | PC14/PC15 — **still suspected: something IS populated** there (visible component), but the r86 LEXT probe never saw it stabilize (`lext=0`); either not a crystal, a crystal the probe missed, or a different part. Do not treat PC14/15 as free GPIO. | r86 probe + user inspection |
+| RS2228 USB2 mux | present on the board — **pins and purpose unidentified** | board inspection |
 | W25Q128 flash | shares SPI2 (SCK=PB13, MISO=PB14, MOSI=PB15), CS unconfirmed | r33 probe |
 | PD power path | side slider isolates the CC load ("PD switch"); internal FUSB302 Rd (SWITCHES0 PDWN bits) also presents a sink | r84+ behavior |
 
@@ -89,6 +94,14 @@ Flash `fnb58-firmware.bin` at 0x08000000 with Artery ICP over SWD
 (AT-Link). Each round ships a uniquely named copy (`fnb58-rNNN-tag.bin`)
 plus the build tag in every heartbeat — three flashes silently failed
 to take before that protocol existed.
+
+**⚠ One-way door:** flashing this firmware requires a full flash erase,
+which destroys the stock FNIRSI firmware *and* its USB bootloader.
+After that the device cannot boot stock again — the bootloader only
+accepts encrypted `.ufn` files over its own USB interface, and it no
+longer exists once erased. There is no supported way back to stock;
+the archived `Fnb58V0.68.ufn` in `../fnb58-research/` is useless
+without the bootloader.
 
 ## Roadmap
 

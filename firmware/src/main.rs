@@ -34,7 +34,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r104";
+const BUILD: &[u8] = b"r108";
 
 use crate::ui::Press;
 use crate::ui::push_pdo;
@@ -107,7 +107,7 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r104: reinit+sr\r\n").await;
+    say(b"[lcd] FNB58 r108: request diag\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
@@ -457,11 +457,9 @@ async fn main(_spawner: Spawner) {
                         Err(_) => sender.push(b"[pd] init FAIL\r\n"),
                     }
                     if pd_on {
-                        // r94: the r93 session settled the line — CC2
-                        // acked our TX (r=0), CC1 is dead (r=1). Always
-                        // scan the measured line now.
-                        let _ = pd::route(&mut tpa, scan_cc).await;
-                        listener.set_cc(scan_cc);
+                        // r107: discover() itself re-measures the
+                        // orientation, routes (incl. the GoodCRC spec
+                        // revision) and soft-resets before asking.
                         let acked = match pd::discover(&mut tpa, &mut caps, &mut listener).await {
                             Ok(true) => {
                                 report_caps(&caps, &mut sender);
@@ -644,15 +642,28 @@ fn report_caps(caps: &pd::SourceCaps, out: &mut Sender) {
 }
 
 /// Report the auto-Request's transmission outcome after a caps capture
-/// (0 = acked — the contract should stand; 1 = retryfail; 2 = timeout).
+/// (0 = acked — the contract should stand; 1 = retryfail; 2 = timeout),
+/// plus the r108 wedge evidence: STATUS1 after the attempt (TX_FULL =
+/// tokens never consumed; TX_EMPTY = consumed, protocol layer silent)
+/// and the raw INTERRUPTA byte.
 fn report_request(out: &mut Sender, lis: &pd::Listener) {
-    let mut d = [0u8; 32];
+    let mut d = [0u8; 48];
     let mut n = 0;
     for &b in b"[pd] request r=" {
         d[n] = b;
         n += 1;
     }
     n = push_dec(&mut d, n, lis.last_tx_code() as u32);
+    for &b in b" s1=" {
+        d[n] = b;
+        n += 1;
+    }
+    n = push_hex8(&mut d, n, lis.st1() as u32);
+    for &b in b" ia=" {
+        d[n] = b;
+        n += 1;
+    }
+    n = push_hex8(&mut d, n, lis.ia() as u32);
     d[n] = b'\r';
     d[n + 1] = b'\n';
     out.push(&d[..n + 2]);

@@ -41,19 +41,20 @@ const REG_INTERRUPTA: u8 = 0x3e;
 const REG_FIFOS: u8 = 0x43;
 
 /// SWITCHES1 (0x03): auto-GoodCRC for received packets, BMC transmit
-/// driver on CC1/CC2, GoodCRC spec revision (SPECREV[1:0] = 01 at bits
-/// 6:5 = revision 2.0 — without it we ack a 2.0/3.0 source with a
-/// revision-1.0 GoodCRC and it ignores us).
+/// driver on CC1/CC2. SPECREV[1:0] = GoodCRC spec revision: 01 = 2.0,
+/// 10 = 3.0 — r106's f= dumps showed the charger's caps arrive as PD 3.0
+/// (header rev bits 10, n=6, retransmitted forever): a 2.0 GoodCRC for a
+/// 3.0 message is discarded by the source, so the sink must match.
 const AUTO_CRC: u8 = 0x04;
 const TXCC1_EN: u8 = 0x01;
 const TXCC2_EN: u8 = 0x02;
 const SPECREV_2_0: u8 = 0x20;
+const SPECREV_3_0: u8 = 0x40;
 /// CONTROL3 (0x09): automatic retransmission while no GoodCRC arrives,
 /// N_RETRIES[1:0] = 3 retries.
 const AUTO_RETRY: u8 = 0x01;
-/// CONTROL0 (0x06): flush the TX FIFO (self-clearing) — drop stale
-/// bytes a previous attempt left behind.
-const TX_FLUSH: u8 = 0x40;
+/// STATUS1 (0x41): the TX FIFO is empty (kws-x1's pre-TX precondition).
+const TX_EMPTY: u8 = 0x08;
 /// INTERRUPTA (0x3E): a sent packet was GoodCRC'd / retries exhausted.
 const I_TXSENT: u8 = 0x04;
 const I_RETRYFAIL: u8 = 0x10;
@@ -142,9 +143,11 @@ pub struct Listener {
     /// MessageID for the next transmitted message (wraps 0..=7).
     tx_id: u8,
     /// Spec revision bits for OUR message headers (header 7:6): 0x40 =
-    /// 2.0, 0x80 = 3.0. The GoodCRC SPECREV in SWITCHES1 stays 2.0
-    /// (kws-x1 keeps it fixed; GoodCRC echoes the received revision).
+    /// 2.0, 0x80 = 3.0. r107: adapted from the source's caps revision —
+    /// the charger speaks PD 3.0 and discards mismatched GoodCRCs.
     tx_rev: u16,
+    /// PD 3.0 mode (drives tx_rev and the GoodCRC SPECREV in route()).
+    rev3: bool,
     /// Last auto-scan outcome: true = the source acked our
     /// Get_Source_Cap. None until the first scan.
     last_scan: Option<bool>,
@@ -159,6 +162,10 @@ pub struct Listener {
     collided: bool,
     /// BC_LVL of both lines at the last orientation measure ([CC1, CC2]).
     last_meas: [u8; 2],
+    /// Raw INTERRUPTA byte at the end of the last TX wait.
+    last_ia: u8,
+    /// STATUS1 byte after a timed-out TX (TX_FULL vs TX_EMPTY).
+    last_st1: u8,
     /// Idle poll ticks since the last activity latch (idle re-check).
     idle: u32,
 }
@@ -175,11 +182,14 @@ impl Default for Listener {
             stale: 0,
             tx_id: 0,
             tx_rev: 0x40,
+            rev3: false,
             last_scan: None,
             last_tx: 0,
             gcrc: false,
             collided: false,
             last_meas: [0; 2],
+            last_ia: 0,
+            last_st1: 0,
             idle: 0,
         }
     }
@@ -220,8 +230,20 @@ async fn tx_message(
         }
         Timer::after_millis(1).await;
     }
-    // Drop any stale bytes a previous attempt left in the TX FIFO.
-    wr(i2c, REG_CONTROL0, TX_FLUSH).await?;
+    // r106: require the TX FIFO to be EMPTY (kws-x1's pre-TX check) —
+    // the old TX_FLUSH (CONTROL0 0x40) written right after the
+    // hardware's auto-GoodCRC for the source's caps wedged the
+    // transmitter: the Request, sent seconds after the caps, never
+    // started (r=2, no TXSENT and no RETRYFAIL), while the first
+    // message after PD_RESET (no preceding auto-GoodCRC) always worked.
+    for _ in 0..20 {
+        let mut st1 = [0u8; 1];
+        rd(i2c, REG_STATUS1, &mut st1).await?;
+        if st1[0] & TX_EMPTY != 0 {
+            break;
+        }
+        Timer::after_millis(1).await;
+    }
 
     // r99: clear stale INTERRUPTA flags first — a late TXSENT from an
     // earlier timed-out attempt would otherwise be read as THIS
@@ -272,9 +294,11 @@ async fn tx_message(
     // difference (retryfail = TX left the chip, timeout = it may not
     // even have started).
     lis.last_tx = 2;
+    lis.last_ia = 0;
     for _ in 0..50 {
         let mut a = [0u8; 1];
         rd(i2c, REG_INTERRUPTA, &mut a).await?;
+        lis.last_ia = a[0];
         if a[0] & I_TXSENT != 0 {
             lis.last_tx = 0;
             return Ok(true);
@@ -284,6 +308,13 @@ async fn tx_message(
             return Ok(false);
         }
         Timer::after_millis(5).await;
+    }
+    // r108: the transmitter never reported anything — snapshot the FIFO
+    // state: TX_FULL = the tokens were never consumed, TX_EMPTY =
+    // consumed but the protocol layer stayed silent.
+    let mut s1 = [0u8; 1];
+    if rd(i2c, REG_STATUS1, &mut s1).await.is_ok() {
+        lis.last_st1 = s1[0];
     }
     Ok(false)
 }
@@ -306,7 +337,15 @@ async fn request_first_fixed(
             | ((ma10 as u32) << 10)
             | (ma10 as u32);
         let bytes = rdo.to_le_bytes();
-        return tx_message(i2c, lis, DATA_REQUEST, &bytes).await;
+        let mut acked = tx_message(i2c, lis, DATA_REQUEST, &bytes).await?;
+        if !acked && lis.last_tx == 2 {
+            // r108: the transmitter occasionally ignores the first TXON
+            // after the caps' auto-GoodCRC (r=2: neither TXSENT nor
+            // RETRYFAIL latches). One immediate retry — a same-MessageID
+            // retransmission is spec-legal either way.
+            acked = tx_message(i2c, lis, DATA_REQUEST, &bytes).await?;
+        }
+        return Ok(acked);
     }
     Ok(false)
 }
@@ -364,6 +403,19 @@ async fn capture_window(
         }
         caps.updates = caps.updates.wrapping_add(1);
 
+        // r107: match the source's spec revision. caps.spec_rev = header
+        // bits 7:6 (2 = PD 3.0): the f= dumps showed the charger's caps
+        // arriving as PD 3.0 and being retransmitted forever, because
+        // our auto-GoodCRC said 2.0 and a revision-mismatched GoodCRC is
+        // discarded by the source. Flip the whole port (message headers
+        // + GoodCRC SPECREV) to the source's revision and re-route
+        // before the Request.
+        if caps.spec_rev == 2 && !lis.rev3 {
+            lis.rev3 = true;
+            lis.tx_rev = 0x80;
+            let _ = route(i2c, lis.cc, true).await;
+        }
+
         // Request the first fixed PDO (usually 5 V); the source answers
         // Accept + PS_RDY, our hardware acks those automatically, and the
         // contract stands at the PDO's voltage.
@@ -383,7 +435,7 @@ pub async fn discover(
     // the Rp wherever it is right now.
     let (meas, cc) = measure_cc(i2c).await?;
     lis.last_meas = meas;
-    let _ = route(i2c, cc).await;
+    let _ = route(i2c, cc, lis.rev3).await;
     lis.set_cc(cc);
 
     // r104: Soft_Reset first (user suggestion + spec): the source's
@@ -402,27 +454,11 @@ pub async fn discover(
     }
 
     // First window: an alert source answers a real Get_Source_Cap
-    // directly.
-    if capture_window(i2c, caps, lis, 250).await? {
-        return Ok(true);
-    }
-
-    // r101: no answer — force a fresh attach. A source whose policy
-    // engine slept after an unanswered announce (r100: the receiver
-    // caught exactly ONE spontaneous caps frame during the user's
-    // switch toggles) ignores Get_Source_Cap forever; the spec's way
-    // back is a NEW ATTACH. Removing our internal Rd for a moment is a
-    // real detach when the board's switch-gated Rd is OFF (the source
-    // drops VBUS, then re-attaches and announces into our armed
-    // receiver); with the switch ON the board Rd keeps the attach and
-    // the pulse is a no-op.
-    let meas = if lis.cc == 1 { MEAS_CC1 } else { MEAS_CC2 };
-    wr(i2c, REG_SWITCHES0, meas).await?;
-    Timer::after_millis(400).await;
-    wr(i2c, REG_SWITCHES0, PDWN1 | PDWN2 | meas).await?;
-
-    // Second window: the fresh attach announces within a few hundred ms.
-    capture_window(i2c, caps, lis, 600).await
+    // directly (r105: ONE window — the r101 re-attach pulse that
+    // followed a failed window stripped our internal Rd for 400 ms, the
+    // source saw a detach and dropped VBUS, and charger-only power
+    // browned the board out on every PD request).
+    capture_window(i2c, caps, lis, 500).await
 }
 
 async fn wr(i2c: &mut I2c, reg: u8, val: u8) -> Result<(), Error> {
@@ -517,15 +553,16 @@ pub async fn status(i2c: &mut I2c) -> Result<(u8, u8), Error> {
 
 /// Route the receiver AND the BMC TX driver to one CC line (1 or 2),
 /// kws-x1 SWITCHES0/1 form: internal Rd stays on both, measure block on
-/// `cc`, TX driver on `cc`, RX FIFO flushed for the new line. r93: each
-/// scan picks its line, because the r91/r92 evidence (self-TX heard on
-/// CC1 when both drivers were armed, silence on CC2 with TXCC2 alone)
-/// leaves the TX electrical path as the open question.
-pub async fn route(i2c: &mut I2c, cc: u8) -> Result<(), Error> {
+/// `cc`, TX driver on `cc`, RX FIFO flushed for the new line. `rev3`
+/// sets the auto-GoodCRC spec revision (PD 3.0 vs 2.0) — r106 evidence:
+/// the charger's caps arrive as 3.0 and a mismatched GoodCRC is
+/// discarded, so it retransmits forever and never accepts a Request.
+pub async fn route(i2c: &mut I2c, cc: u8, rev3: bool) -> Result<(), Error> {
     let meas = if cc == 1 { MEAS_CC1 } else { MEAS_CC2 };
     wr(i2c, REG_SWITCHES0, PDWN1 | PDWN2 | meas).await?;
     let txc = if cc == 1 { TXCC1_EN } else { TXCC2_EN };
-    wr(i2c, REG_SWITCHES1, AUTO_CRC | SPECREV_2_0 | txc).await?;
+    let spec = if rev3 { SPECREV_3_0 } else { SPECREV_2_0 };
+    wr(i2c, REG_SWITCHES1, AUTO_CRC | spec | txc).await?;
     wr(i2c, REG_CONTROL1, ENSOP1 | RX_FLUSH).await?;
     Ok(())
 }
@@ -739,6 +776,16 @@ impl Listener {
     /// BC_LVL of both lines at the last orientation measure ([CC1, CC2]).
     pub fn meas(&self) -> [u8; 2] {
         self.last_meas
+    }
+
+    /// STATUS1 after the last timed-out TX (r108 wedge diagnostic).
+    pub fn st1(&self) -> u8 {
+        self.last_st1
+    }
+
+    /// Raw INTERRUPTA at the end of the last TX wait (r108).
+    pub fn ia(&self) -> u8 {
+        self.last_ia
     }
 
     /// Whether any transmit collided with live CC traffic.
