@@ -175,7 +175,7 @@ fn set_cfg(base: usize, num: u8, nibble: u32) {
 }
 
 /// Latch the ODT pull direction HIGH, then switch the pin to pull mode.
-fn pull_up(base: usize, num: u8) {
+pub(crate) fn pull_up(base: usize, num: u8) {
     let scr = (base + 0x10) as *mut u32;
     // SAFETY: SCR set-bits are write-1-to-set per pin; other bits unaffected.
     unsafe { scr.write_volatile(1u32 << num) };
@@ -183,11 +183,11 @@ fn pull_up(base: usize, num: u8) {
 }
 
 /// Back to floating input (the latched ODT value is ignored in this mode).
-fn floating(base: usize, num: u8) {
+pub(crate) fn floating(base: usize, num: u8) {
     set_cfg(base, num, 0b0001);
 }
 
-fn read_levels(base: usize) -> u32 {
+pub(crate) fn read_levels(base: usize) -> u32 {
     // SAFETY: valid GPIO register block, clocks enabled by new().
     unsafe { ((base + 8) as *const u32).read_volatile() }
 }

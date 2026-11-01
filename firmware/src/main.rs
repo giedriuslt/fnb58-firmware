@@ -1,13 +1,17 @@
-//! FNB58 r90: kws-x1-faithful FUSB302 init. The r88/r89 build's init
-//! deviated from the proven kws-x1 sink startup in three ways — TX
-//! drivers enabled on BOTH CC lines (garbles the source's decode: r88's
-//! 'no reply'), the measure block routed while unpowered (POWER 0x0B
-//! without the MEASURE bit), and no orientation measurement (CC1
-//! hardcoded). r90 init now mirrors phy.rs: internal Rd on both lines
-//! always, bandgap+osc first, both CCs measured, single-CC TX driver,
-//! POWER 0x0F at the end. OK on the PD screen = init + Get_Source_Cap +
-//! Request first fixed PDO (the contract that stops the charger
-//! power-cycling VBUS); the 10 ms poll keeps it alive afterwards.
+//! FNB58 r102: EXINT everywhere. The user traced the FUSB302 INT_N to
+//! PC13 (LQFP48 pin 2 - the last untraced pin of the PD path). Buttons
+//! (PA15/PB4/PB9/PB8) and PC13 now run on external interrupts: each line
+//! latches in the ISR and wakes the main loop through a signal - buttons
+//! double as the interrupt canary (one '[exti] isr line=N ok' line per
+//! line on its first ISR), the PD poll runs immediately on every INT
+//! edge instead of waiting the 10 ms tick, and an i=N counter in the
+//! heartbeat shows whether the FUSB302 ever asserts INT_N. PD RX (r100:
+//! spontaneous caps parsed correctly) was poll-only; the INT path is
+//! what a real sink needs to hit tSenderResponse reliably.
+//! (History r88-r101: PD-on-request bisect chain - boot-time init
+//! rebooted the board; kws-x1-init fixes; TX SOP fix; PING-vs-
+//! Get_Source_Cap (type 5 vs 7); RDO bit 25; carrier-idle RX gate;
+//! re-attach pulse. See git log for the full chain.)
 
 #![no_std]
 #![no_main]
@@ -20,17 +24,33 @@ mod ui;
 
 static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// EXINT line bits latched by the ISRs (bit n = line n saw an edge).
+static EXTI_LATCH: AtomicU32 = AtomicU32::new(0);
+/// FUSB302 INT_N (PC13, line 13) edge count.
+static INT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// ISR -> main-loop doorbell (coalescing-safe: the latch carries the bits).
+static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r90";
+const BUILD: &[u8] = b"r103";
 
 use crate::ui::Press;
 use crate::ui::push_pdo;
 use crate::ui::Screen;
 use crate::ui::Ui;
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering;
 use embassy_executor::Spawner;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
+use embassy_time::Duration;
 use embassy_time::Timer;
+use embassy_time::with_timeout;
+// The cortex_m_rt::interrupt attribute macro expands references to the
+// device's `interrupt` module — bring it into scope for the handlers.
+use embassy_at32::pac::at32f403a::interrupt;
 
 // --- Vendor C stack glue (compiled by build.rs into libvendorusb.a) ---
 
@@ -87,7 +107,7 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r90: kws-x1 init\r\n").await;
+    say(b"[lcd] FNB58 r103: follow rp\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
@@ -201,12 +221,66 @@ async fn main(_spawner: Spawner) {
     let mut ui = Ui::new();
     ui.enter(Screen::Power);
 
+    // r102: EXINT lines. Buttons keep their pull-ups (Buttons::new) and
+    // gain edge interrupts (both edges — the loop level-debounces as
+    // before, but a press now WAKES it). PC13 = the user-traced FUSB302
+    // INT_N: open-drain, so an internal pull-up, falling edge.
+    let _btn_exti_left = unsafe {
+        embassy_at32::exti::ExtiInput::new(
+            embassy_at32::gpio::Port::A,
+            15,
+            embassy_at32::exti::Trigger::Both,
+        )
+    }
+    .expect("PA15 exti");
+    let _btn_exti_ok = unsafe {
+        embassy_at32::exti::ExtiInput::new(
+            embassy_at32::gpio::Port::B,
+            4,
+            embassy_at32::exti::Trigger::Both,
+        )
+    }
+    .expect("PB4 exti");
+    let _btn_exti_back = unsafe {
+        embassy_at32::exti::ExtiInput::new(
+            embassy_at32::gpio::Port::B,
+            9,
+            embassy_at32::exti::Trigger::Both,
+        )
+    }
+    .expect("PB9 exti");
+    let _btn_exti_right = unsafe {
+        embassy_at32::exti::ExtiInput::new(
+            embassy_at32::gpio::Port::B,
+            8,
+            embassy_at32::exti::Trigger::Both,
+        )
+    }
+    .expect("PB8 exti");
+    let pc13 =
+        unsafe { embassy_at32::gpio::InputPin::new_pull_up(embassy_at32::gpio::Port::C, 13) }
+            .expect("PC13 claim");
+    let _pd_int =
+        unsafe { embassy_at32::exti::ExtiInput::from_input(pc13, embassy_at32::exti::Trigger::Falling) };
+    unsafe {
+        use embassy_at32::pac::at32f403a::interrupt;
+        cortex_m::peripheral::NVIC::unmask(interrupt::EXINT4);
+        cortex_m::peripheral::NVIC::unmask(interrupt::EXINT9_5);
+        cortex_m::peripheral::NVIC::unmask(interrupt::EXINT15_10);
+    }
+
     // r88: no FUSB302 init at boot. `pd_on` gates EVERY pd:: call — the
     // controller powers up only on the first explicit scan (OK on the PD
     // screen); from then on the poll keeps the sink contract alive.
     let mut caps = pd::SourceCaps::default();
     let mut listener = pd::Listener::default();
     let mut pd_on = false;
+    // r93: the line each scan transmits/receives on — starts on the line
+    // init() measured, then every OK press flips to the other one. The
+    // r91/r92 logs (self-TX heard on CC1 with both drivers armed,
+    // silence on CC2 with TXCC2 alone) make the TX path the open
+    // question; alternating answers it in one session.
+    let mut scan_cc = 0u8;
 
     let mut tick: u32 = 0;
     // LEXT probe: enable the 32.768 kHz crystal oscillator on PC14/PC15
@@ -263,14 +337,46 @@ async fn main(_spawner: Spawner) {
         sender.push(&d[..n + 2]);
     }
 
+    // One-time ISR proof per EXINT line (the buttons double as the
+    // interrupt canary; line 13 = the FUSB302 INT_N).
+    let mut isr_seen = [false; 16];
+
     loop {
-        // PD poll at the full 10 ms cadence — only after an explicit scan
-        // request powered the FUSB302 up. A captured caps frame triggers
-        // the Request inline (inside the poll), well inside the source's
-        // re-send window, so the contract holds and VBUS stays up.
+        // Wake on ANY EXTI edge (buttons, FUSB302 INT_N) or every 10 ms
+        // as the fallback cadence. The ISR latches line bits and rings
+        // the doorbell; nothing is lost when several edges coalesce.
+        let _ = with_timeout(Duration::from_millis(10), DOORBELL.wait()).await;
+        let events = EXTI_LATCH.swap(0, Ordering::AcqRel);
+        tick = tick.wrapping_add(1);
+
+        for line in [4u8, 8, 9, 13, 15] {
+            if !isr_seen[line as usize] && events & (1u32 << line) != 0 {
+                isr_seen[line as usize] = true;
+                let mut d = [0u8; 32];
+                let mut n = 0;
+                for &b in b"[exti] isr line=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                n = push_dec(&mut d, n, line as u32);
+                for &b in b" ok\r\n" {
+                    d[n] = b;
+                    n += 1;
+                }
+                sender.push(&d[..n]);
+            }
+        }
+        if events & (1u32 << 13) != 0 {
+            INT_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // PD poll — every iteration (the 10 ms fallback cadence), plus
+        // immediately after each FUSB302 INT_N edge: the interrupt wake
+        // is what makes the Request meet tSenderResponse reliably.
         if pd_on {
             if matches!(pd::poll(&mut tpa, &mut caps, &mut listener).await, Ok(true)) {
                 report_caps(&caps, &mut sender);
+                report_request(&mut sender, &listener);
             }
             if ui.screen == Screen::Pd {
                 ui.draw_pd(&caps);
@@ -314,6 +420,7 @@ async fn main(_spawner: Spawner) {
                         match pd::init(&mut tpa).await {
                             Ok((id, cc)) => {
                                 pd_on = true;
+                                scan_cc = cc;
                                 listener.set_cc(cc);
                                 let st = pd::status(&mut tpa).await;
                                 let mut d = [0u8; 64];
@@ -352,14 +459,69 @@ async fn main(_spawner: Spawner) {
                         }
                     }
                     if pd_on {
-                        match pd::discover(&mut tpa, &mut caps, &mut listener).await {
+                        // r94: the r93 session settled the line — CC2
+                        // acked our TX (r=0), CC1 is dead (r=1). Always
+                        // scan the measured line now.
+                        let _ = pd::route(&mut tpa, scan_cc).await;
+                        listener.set_cc(scan_cc);
+                        let acked = match pd::discover(&mut tpa, &mut caps, &mut listener).await {
                             Ok(true) => {
                                 report_caps(&caps, &mut sender);
-                                sender.push(b"[pd] scan ok, contract requested\r\n");
+                                report_request(&mut sender, &listener);
+                                sender.push(b"[pd] contract requested\r\n");
+                                true
                             }
-                            Ok(false) => sender.push(b"[pd] scan: no reply\r\n"),
-                            Err(_) => sender.push(b"[pd] scan FAIL\r\n"),
+                            Ok(false) => false,
+                            Err(_) => false,
+                        };
+                        // Per-scan evidence on ONE line (the pd=1 diag
+                        // lines tend to scroll away): soft-reset ack, TX
+                        // outcome, ever-acked-incoming, and a raw dump of
+                        // whatever still sits in the RX FIFO.
+                        let mut d = [0u8; 96];
+                        let mut n = 0;
+                        for &b in b"[pd] scan cc=" {
+                            d[n] = b;
+                            n += 1;
                         }
+                        d[n] = b'0' + scan_cc;
+                        n += 1;
+                        // BC_LVL of both lines at the scan's orientation
+                        // measure (r103: high nibble CC1, low CC2; 0 = no
+                        // Rp on that line — the port state in one byte).
+                        let mm = listener.meas();
+                        for &b in b" m=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        n = push_hex8(&mut d, n, ((mm[0] << 4) | mm[1]) as u32);
+                        for &b in b" r=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        n = push_dec(&mut d, n, listener.last_tx_code() as u32);
+                        for &b in b" g=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        d[n] = b'0' + listener.gcrc_seen() as u8;
+                        n += 1;
+                        if !acked {
+                            for &b in b" f=" {
+                                d[n] = b;
+                                n += 1;
+                            }
+                            n += pd::rx_dump(&mut tpa, &mut d[n..]).await;
+                        }
+                        if acked {
+                            for &b in b" ACKED" {
+                                d[n] = b;
+                                n += 1;
+                            }
+                        }
+                        d[n] = b'\r';
+                        d[n + 1] = b'\n';
+                        sender.push(&d[..n + 2]);
                     }
                 }
                 Press::None => {}
@@ -416,6 +578,11 @@ async fn main(_spawner: Spawner) {
                 n += 1;
             }
             n = push_dec(&mut d, n, sender.take_fails());
+            for &b in b" i=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, INT_COUNT.load(Ordering::Relaxed) % 100000);
             for &b in b" pd=" {
                 d[n] = b;
                 n += 1;
@@ -433,9 +600,6 @@ async fn main(_spawner: Spawner) {
         }
 
         sender.drain();
-
-        tick = tick.wrapping_add(1);
-        Timer::after_millis(10).await;
     }
 }
 
@@ -473,6 +637,21 @@ fn report_caps(caps: &pd::SourceCaps, out: &mut Sender) {
         out.push(&d[..n]);
     }
 
+}
+
+/// Report the auto-Request's transmission outcome after a caps capture
+/// (0 = acked — the contract should stand; 1 = retryfail; 2 = timeout).
+fn report_request(out: &mut Sender, lis: &pd::Listener) {
+    let mut d = [0u8; 32];
+    let mut n = 0;
+    for &b in b"[pd] request r=" {
+        d[n] = b;
+        n += 1;
+    }
+    n = push_dec(&mut d, n, lis.last_tx_code() as u32);
+    d[n] = b'\r';
+    d[n + 1] = b'\n';
+    out.push(&d[..n + 2]);
 }
 
 /// CDC line queue. The vendor send rejects a second call while one is in
@@ -565,6 +744,37 @@ fn push_hex8(buf: &mut [u8], pos: usize, v: u32) -> usize {
     buf[pos] = HEX[((v >> 4) & 0xF) as usize];
     buf[pos + 1] = HEX[(v & 0xF) as usize];
     pos + 2
+}
+
+/// EXINT ISR body: clear the hardware pending flags, latch the line
+/// bits, ring the main-loop doorbell.
+fn exti_isr(lo: u8, hi: u8) {
+    embassy_at32::exti::on_interrupts_in(lo..=hi);
+    let mut bits = 0u32;
+    for line in lo..=hi {
+        if embassy_at32::exti::take_edge(line) {
+            bits |= 1u32 << line;
+        }
+    }
+    if bits != 0 {
+        EXTI_LATCH.fetch_or(bits, Ordering::AcqRel);
+        DOORBELL.signal(());
+    }
+}
+
+#[cortex_m_rt::interrupt]
+unsafe fn EXINT4() {
+    exti_isr(4, 4);
+}
+
+#[cortex_m_rt::interrupt]
+unsafe fn EXINT9_5() {
+    exti_isr(5, 9);
+}
+
+#[cortex_m_rt::interrupt]
+unsafe fn EXINT15_10() {
+    exti_isr(10, 15);
 }
 
 #[cortex_m_rt::exception]
