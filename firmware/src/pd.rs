@@ -29,6 +29,7 @@ const REG_DEVICE_ID: u8 = 0x01;
 const REG_SWITCHES0: u8 = 0x02;
 const REG_SWITCHES1: u8 = 0x03;
 const REG_CONTROL1: u8 = 0x07;
+const REG_CONTROL0: u8 = 0x06;
 const REG_CONTROL3: u8 = 0x09;
 const REG_POWER: u8 = 0x0b;
 const REG_RESET: u8 = 0x0c;
@@ -49,6 +50,9 @@ const SPECREV_2_0: u8 = 0x20;
 /// CONTROL3 (0x09): automatic retransmission while no GoodCRC arrives,
 /// N_RETRIES[1:0] = 3 retries.
 const AUTO_RETRY: u8 = 0x01;
+/// CONTROL0 (0x06): flush the TX FIFO (self-clearing) — drop stale
+/// bytes a previous attempt left behind.
+const TX_FLUSH: u8 = 0x40;
 /// INTERRUPTA (0x3E): a sent packet was GoodCRC'd / retries exhausted.
 const I_TXSENT: u8 = 0x04;
 const I_RETRYFAIL: u8 = 0x10;
@@ -65,8 +69,14 @@ const TK_EOP: u8 = 0x14;
 const TK_TXOFF: u8 = 0xfe;
 const TK_TXON: u8 = 0xa1;
 
-/// POWER (0x0B): bandgap+wake, receiver, internal oscillator.
-const POWER_ON: u8 = 0x01 | 0x02 | 0x08;
+/// POWER (0x0B): bandgap+wake + oscillator first (kws-x1 stage 1); the
+/// receiver and MEASURE block are added only at the end of init.
+const POWER_CORE: u8 = 0x01 | 0x08;
+const POWER_FULL: u8 = 0x01 | 0x02 | 0x04 | 0x08;
+/// SWITCHES0 (0x02): device pull-downs = Rd, kept on BOTH CC lines at
+/// all times (kws-x1: "keep Rd on both CCs"), plus the measure routing.
+const PDWN1: u8 = 0x01;
+const PDWN2: u8 = 0x02;
 /// RESET (0x0C): reset the PD transmitter/receiver logic; self-clearing.
 const PD_RESET: u8 = 0x02;
 /// CONTROL1 (0x07): receive SOP packets / flush the RX FIFO (self-clearing).
@@ -127,6 +137,11 @@ pub struct Listener {
     stale: u32,
     /// MessageID for the next transmitted message (wraps 0..=7).
     tx_id: u8,
+    /// Last auto-scan outcome: true = the source acked our
+    /// Get_Source_Cap. None until the first scan.
+    last_scan: Option<bool>,
+    /// A Request was already sent for the current caps capture.
+    requested: bool,
 }
 
 impl Default for Listener {
@@ -141,6 +156,8 @@ impl Default for Listener {
             validated: false,
             stale: 0,
             tx_id: 0,
+            last_scan: None,
+            requested: false,
         }
     }
 }
@@ -175,6 +192,8 @@ async fn tx_message(
         }
         Timer::after_millis(1).await;
     }
+    // Drop any stale bytes a previous attempt left in the TX FIFO.
+    wr(i2c, REG_CONTROL0, TX_FLUSH).await?;
 
     // Header: type, MessageID, sink power role, spec rev 2.0 (revision
     // bits 7:6: 00 = 1.0, 01 = 2.0, 10 = 3.0 — accepted by every source).
@@ -218,6 +237,27 @@ async fn tx_message(
     Ok(false)
 }
 
+/// Send a Request for the first fixed PDO in `caps` at its full maximum
+/// current. RDO (usbpd crate layout): object position 28..=31,
+/// no_usb_suspend bit 24, operating current 10..=19, max operating
+/// current 0..=9 — both in 10 mA units.
+async fn request_first_fixed(
+    i2c: &mut I2c,
+    caps: &SourceCaps,
+    lis: &mut Listener,
+) -> Result<bool, Error> {
+    if let Some(i) = (0..caps.n).find(|&i| !caps.pdos[i].is_pps) {
+        let ma10 = (caps.pdos[i].ma / 10) as u16;
+        let rdo: u32 = ((i as u32 + 1) << 28)
+            | (1 << 24) // no_usb_suspend
+            | ((ma10 as u32) << 10)
+            | (ma10 as u32);
+        let bytes = rdo.to_le_bytes();
+        return tx_message(i2c, lis, DATA_REQUEST, &bytes).await;
+    }
+    Ok(false)
+}
+
 /// Tester-initiated discovery: Get_Source_Cap, capture the response
 /// caps, then Request the first fixed PDO so the source establishes a
 /// contract and stops hard-resetting VBUS (a compliant source power-cycles
@@ -230,7 +270,9 @@ pub async fn discover(
     caps: &mut SourceCaps,
     lis: &mut Listener,
 ) -> Result<bool, Error> {
-    if !tx_message(i2c, lis, CTRL_GET_SOURCE_CAP, &[]).await? {
+    let acked = tx_message(i2c, lis, CTRL_GET_SOURCE_CAP, &[]).await?;
+    lis.last_scan = Some(acked);
+    if !acked {
         return Ok(false);
     }
 
@@ -275,21 +317,11 @@ pub async fn discover(
         }
         caps.updates = caps.updates.wrapping_add(1);
 
-        // Request the first fixed PDO (usually 5 V) at its full maximum
-        // current. RDO (usbpd crate layout): object position 28..=31,
-        // no_usb_suspend bit 24, operating current 10..=19, max operating
-        // current 0..=9 — both in 10 mA units.
-        if let Some(i) = (0..caps.n).find(|&i| !caps.pdos[i].is_pps) {
-            let ma10 = (caps.pdos[i].ma / 10) as u16;
-            let rdo: u32 = ((i as u32 + 1) << 28)
-                | (1 << 24) // no_usb_suspend
-                | ((ma10 as u32) << 10)
-                | (ma10 as u32);
-            let bytes = rdo.to_le_bytes();
-            let _ = tx_message(i2c, lis, DATA_REQUEST, &bytes).await?;
-            // The source answers Accept + PS_RDY; our hardware acks those
-            // automatically and the contract stands at the PDO's voltage.
-        }
+        // Request the first fixed PDO (usually 5 V); the source answers
+        // Accept + PS_RDY, our hardware acks those automatically, and the
+        // contract stands at the PDO's voltage.
+        lis.requested = true;
+        let _ = request_first_fixed(i2c, caps, lis).await?;
         return Ok(true);
     }
     Ok(false)
@@ -322,33 +354,59 @@ async fn rd(i2c: &mut I2c, reg: u8, out: &mut [u8]) -> Result<(), Error> {
     .await
 }
 
-/// Power up and configure the FUSB302. AUTO_CRC (rev 2.0 GoodCRC) with
-/// hardware retries and both TX drivers enabled: the meter participates
-/// as a sink. CAVEAT: see the module doc — standalone use only while a
-/// DUT would also receive our acks.
-pub async fn init(i2c: &mut I2c) -> Result<u8, Error> {
+/// Power up and configure the FUSB302, kws-x1-faithful (phy.rs sink
+/// start): bandgap+oscillator first, CC orientation MEASURED (Rp on the
+/// source-driven line) with the internal Rd on both lines, then the BMC
+/// TX driver + auto-GoodCRC on the SELECTED line only, and the measure
+/// block powered before it is routed. r88/r89 fixes: TX on both lines
+/// garbles the source's decode of our messages ('no reply'), and the
+/// measure block was routed while unpowered. Returns (device id, CC).
+pub async fn init(i2c: &mut I2c) -> Result<(u8, u8), Error> {
     // Reset the PD logic first so the config below starts from known
     // defaults.
     wr(i2c, REG_RESET, PD_RESET).await?;
     Timer::after_millis(1).await;
-    wr(i2c, REG_POWER, POWER_ON).await?;
-    // Route CC1 to the receiver (poll() re-routes as needed) and enable
-    // SOP reception; the self-clearing flush drops anything from before
-    // reset.
-    wr(i2c, REG_SWITCHES0, MEAS_CC1).await?;
-    wr(i2c, REG_CONTROL1, ENSOP1 | RX_FLUSH).await?;
-    // Sink participation: auto-GoodCRC rev 2.0 + retries, TX driver on
-    // both CC lines (only the cable-connected one reaches the source).
-    wr(
-        i2c,
-        REG_SWITCHES1,
-        AUTO_CRC | SPECREV_2_0 | TXCC1_EN | TXCC2_EN,
-    )
-    .await?;
+    wr(i2c, REG_POWER, POWER_CORE).await?;
+    wr(i2c, REG_CONTROL1, RX_FLUSH).await?;
+
+    // CC orientation: STATUS0 BC_LVL is nonzero on the line the source
+    // drives its Rp onto (kws-x1 measures both, 10 ms settle each).
+    let mut st = [0u8; 1];
+    wr(i2c, REG_SWITCHES0, PDWN1 | PDWN2 | MEAS_CC1).await?;
+    Timer::after_millis(10).await;
+    rd(i2c, REG_STATUS0, &mut st).await?;
+    let cc1 = st[0] & 0x03;
+    wr(i2c, REG_SWITCHES0, PDWN1 | PDWN2 | MEAS_CC2).await?;
+    Timer::after_millis(10).await;
+    rd(i2c, REG_STATUS0, &mut st).await?;
+    let cc2 = st[0] & 0x03;
+    let cc = if cc1 != 0 || cc2 == 0 { 1 } else { 2 };
+
+    // Route the (now powered) measure block and arm the sink: auto-CRC
+    // rev 2.0 GoodCRC + hardware retries, BMC TX driver on the selected
+    // line ONLY.
+    let meas = if cc == 1 { MEAS_CC1 } else { MEAS_CC2 };
+    wr(i2c, REG_SWITCHES0, PDWN1 | PDWN2 | meas).await?;
+    let txc = if cc == 1 { TXCC1_EN } else { TXCC2_EN };
+    wr(i2c, REG_SWITCHES1, AUTO_CRC | SPECREV_2_0 | txc).await?;
     wr(i2c, REG_CONTROL3, AUTO_RETRY | (0b11 << 1)).await?;
-    let mut id = [0u8];
+    wr(i2c, REG_POWER, POWER_FULL).await?;
+    // Receive SOP packets; the flush drops anything from before the
+    // receiver was powered.
+    wr(i2c, REG_CONTROL1, ENSOP1 | RX_FLUSH).await?;
+    let mut id = [0u8; 1];
     rd(i2c, REG_DEVICE_ID, &mut id).await?;
-    Ok(id[0])
+    Ok((id[0], cc))
+}
+
+/// One-shot receiver snapshot: (STATUS0, STATUS1). Read-only — no
+/// transmit, no CC re-routing; whatever CC line init() routed is shown.
+pub async fn status(i2c: &mut I2c) -> Result<(u8, u8), Error> {
+    let mut st0 = [0u8];
+    rd(i2c, REG_STATUS0, &mut st0).await?;
+    let mut st1 = [0u8];
+    rd(i2c, REG_STATUS1, &mut st1).await?;
+    Ok((st0[0], st1[0]))
 }
 
 /// Poll one tick (100 ms cadence); parse Source_Capabilities into `caps`.
@@ -398,10 +456,11 @@ async fn poll_inner(
     } else if lis.lock_ticks > 0 {
         lis.lock_ticks -= 1;
     } else {
-        // Scanning: dwell one tick per CC, then swap.
+        // Scanning: dwell one tick per CC, then swap. The internal Rd
+        // stays on both lines (never write MEAS alone).
         lis.cc = if lis.cc == 1 { 2 } else { 1 };
         let meas = if lis.cc == 1 { MEAS_CC1 } else { MEAS_CC2 };
-        wr(i2c, REG_SWITCHES0, meas).await?;
+        wr(i2c, REG_SWITCHES0, PDWN1 | PDWN2 | meas).await?;
     }
     if int[0] & I_CRC_CHK != 0 {
         // A frame completed with a hardware CRC check; the FIFO now
@@ -477,6 +536,13 @@ async fn poll_inner(
         }
         caps.updates = caps.updates.wrapping_add(1);
         caps_found = true;
+        // Sink protocol reply: a captured Source_Capabilities gets a
+        // Request immediately (the source re-sends caps, then hard-resets
+        // VBUS, if no Request follows). One Request per capture.
+        if !lis.requested {
+            lis.requested = true;
+            return Ok(request_first_fixed(i2c, caps, lis).await?);
+        }
     }
     Ok(caps_found)
 }
@@ -489,6 +555,12 @@ fn hex8(buf: &mut [u8], w: usize, v: u8) -> usize {
 }
 
 impl Listener {
+    /// Point the CC scan at the line init() measured as the source side
+    /// (1 or 2); the scan then only alternates while the line is quiet.
+    pub fn set_cc(&mut self, cc: u8) {
+        self.cc = cc;
+    }
+
     /// Diagnostic line: per-CC last STATUS0/STATUS1 (hex), the latched
     /// activity flag (a0/a1) and the last poll error code. STATUS0/
     /// STATUS1 reflect the line as of the last tick it was routed.
@@ -515,6 +587,15 @@ impl Listener {
             buf[w + 5] = b'0' + self.err;
             w += 6;
         }
+        // Last auto-scan outcome: 1 = source acked, 0 = no reply, -= never.
+        buf[w] = b',';
+        buf[w + 1] = b's';
+        buf[w + 2] = match self.last_scan {
+            Some(true) => b'1',
+            Some(false) => b'0',
+            None => b'-',
+        };
+        w += 3;
         buf[w] = b'\r';
         buf[w + 1] = b'\n';
         w + 2

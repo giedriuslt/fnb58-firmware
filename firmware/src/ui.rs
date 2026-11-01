@@ -1,8 +1,9 @@
 //! Two-screen UI in the kws-x1 style: a POWER monitor (live V/A/W) and a
-//! PD screen (source capabilities from the passive FUSB302 listener).
-//! LEFT/RIGHT (and BACK) switch screens; OK on the PD screen restarts
-//! discovery. Rendering goes through the C 5x7 text API — every string
-//! here must only contain glyphs from c/fnb58_lcd.c FONT_CHARS.
+//! PD screen (source capabilities from the FUSB302 listener). LEFT/RIGHT
+//! (and BACK) switch screens; OK on the PD screen requests a scan (r88:
+//! the scan also powers the FUSB302 up — no boot-time PD init). Rendering
+//! goes through the C 5x7 text API — every string here must only contain
+//! glyphs from c/fnb58_lcd.c FONT_CHARS.
 
 use crate::buttons;
 use crate::pd::Pdo;
@@ -69,7 +70,7 @@ impl Ui {
     }
 
     /// Map a button press. LEFT = previous screen, RIGHT = next, BACK =
-    /// power screen; OK means discovery on the PD screen.
+    /// power screen; OK means scan on the PD screen.
     pub fn on_press(&mut self, i: usize) -> Press {
         match i {
             buttons::LEFT => Press::Switch(Screen::Power),
@@ -94,7 +95,7 @@ impl Ui {
             Screen::Pd => {
                 text(8, 8, b"PD", 2, WHITE);
                 text(272, 8, b"2/2", 2, GRAY);
-                text(8, 216, b"OK: DISCOVERY", 2, GRAY);
+                text(8, 216, b"OK: SCAN", 2, GRAY);
             }
         }
     }
@@ -160,9 +161,8 @@ impl Ui {
     }
 
     /// PD screen: the caps list (redrawn only when the caps change) or
-    /// the replug hint while nothing has been captured. The passive
-    /// listener cannot request caps — a new negotiation (DUT re-plug or
-    /// source reset) is needed after OK.
+    /// the scan hint while nothing has been captured. OK sends
+    /// Get_Source_Cap and Requests the first fixed PDO (r88).
     pub fn draw_pd(&mut self, caps: &SourceCaps) {
         if caps.updates == self.last_updates && caps.n == self.last_n {
             return;

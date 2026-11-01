@@ -1,7 +1,13 @@
-//! FNB58 r62: the working meter screen — TPA626 V/A/W (Rust embassy I2C
-//! driver, ACK-state fix verified), FUSB302 passive PD listener with the
-//! source-capability strip on the LCD, and the four verified buttons
-//! (LEFT=PA15, OK=PB4, BACK=PB9, RIGHT=PB8) shown on-screen.
+//! FNB58 r90: kws-x1-faithful FUSB302 init. The r88/r89 build's init
+//! deviated from the proven kws-x1 sink startup in three ways — TX
+//! drivers enabled on BOTH CC lines (garbles the source's decode: r88's
+//! 'no reply'), the measure block routed while unpowered (POWER 0x0B
+//! without the MEASURE bit), and no orientation measurement (CC1
+//! hardcoded). r90 init now mirrors phy.rs: internal Rd on both lines
+//! always, bandgap+osc first, both CCs measured, single-CC TX driver,
+//! POWER 0x0F at the end. OK on the PD screen = init + Get_Source_Cap +
+//! Request first fixed PDO (the contract that stops the charger
+//! power-cycling VBUS); the 10 ms poll keeps it alive afterwards.
 
 #![no_std]
 #![no_main]
@@ -17,7 +23,7 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r83";
+const BUILD: &[u8] = b"r90";
 
 use crate::ui::Press;
 use crate::ui::push_pdo;
@@ -81,7 +87,7 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r83: usb send fixed\r\n").await;
+    say(b"[lcd] FNB58 r90: kws-x1 init\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
@@ -187,26 +193,6 @@ async fn main(_spawner: Spawner) {
     let _ = tpa_write(&mut tpa, 0x05, cal).await;
     say(b"[meter] rust tpa configured\r\n").await;
 
-    // --- FUSB302 passive PD listener ---
-    let mut caps = pd::SourceCaps::default();
-    let mut listener = pd::Listener::default();
-    match pd::init(&mut tpa).await {
-        Ok(id) => {
-            let mut d = [0u8; 96];
-            let mut n = 0;
-            for &b in b"[pd] fusb302 id=" {
-                d[n] = b;
-                n += 1;
-            }
-            n = push_hex8(&mut d, n, id as u32);
-            d[n] = 13;
-            d[n + 1] = 10;
-            unsafe { fnb58_usb_send(d.as_ptr(), (n + 2) as u16) };
-            Timer::after_millis(500).await;
-        }
-        Err(_) => say(b"[pd] fusb302 init FAIL\r\n").await,
-    }
-
     // --- UI: POWER + PD screens; buttons navigate (r70) ---
     // Buttons: to-GND switches, internal pull-ups latched at init
     // (README pin map: LEFT=PA15, OK=PB4, BACK=PB9, RIGHT=PB8).
@@ -215,7 +201,32 @@ async fn main(_spawner: Spawner) {
     let mut ui = Ui::new();
     ui.enter(Screen::Power);
 
+    // r88: no FUSB302 init at boot. `pd_on` gates EVERY pd:: call — the
+    // controller powers up only on the first explicit scan (OK on the PD
+    // screen); from then on the poll keeps the sink contract alive.
+    let mut caps = pd::SourceCaps::default();
+    let mut listener = pd::Listener::default();
+    let mut pd_on = false;
+
     let mut tick: u32 = 0;
+    // LEXT probe: enable the 32.768 kHz crystal oscillator on PC14/PC15
+    // and wait for its stable flag. If the board has the RTC crystal
+    // footprint populated, lextstblf sets within a second; with nothing
+    // fitted it never does.
+    let lext_ok = {
+        let crm = unsafe { embassy_at32::pac::at32f403a::CRM::steal() };
+        crm.bpdc().modify(|_, w| w.lexten().set_bit());
+        let mut ok = false;
+        for _ in 0..2000 {
+            if crm.clkint().read().lextstblf().bit() {
+                ok = true;
+                break;
+            }
+            cortex_m::asm::delay(192000); // ~1 ms at 192 MHz
+        }
+        ok
+    };
+
     // Reset-cause flags (CRM CTRLSTS bits 26..=31, sticky until cleared):
     // 0x01 pin, 0x02 POR/LVR, 0x04 software, 0x08 WDT, 0x10 WWT, 0x20 LP.
     let rst_flags = {
@@ -241,94 +252,33 @@ async fn main(_spawner: Spawner) {
         d[n] = HEX[(rst_flags >> 4) as usize];
         d[n + 1] = HEX[(rst_flags & 0xF) as usize];
         n += 2;
-        for &b in b" loop start" {
+        for &b in b" loop start lext=" {
             d[n] = b;
             n += 1;
         }
+        d[n] = b'0' + lext_ok as u8;
+        n += 1;
         d[n] = b'\r';
         d[n + 1] = b'\n';
         sender.push(&d[..n + 2]);
     }
 
     loop {
-        let mut mv: u32 = 0;
-        let mut ua: i32 = 0;
-        let mut mw: i32 = 0;
-        let ok = match (
-            tpa_read(&mut tpa, 0x02).await,
-            tpa_read(&mut tpa, 0x04).await,
-            tpa_read(&mut tpa, 0x03).await,
-        ) {
-            (Ok(bus), Ok(cur), Ok(pwr)) => {
-                mv = (bus as u32 * 5) / 4; // 1.25 mV/LSB
-                ua = (cur as i16 as i32) * 50; // 50 uA/LSB
-                mw = ((pwr as i16 as i32) * 5) / 4; // 1.25 mW/LSB
-                true
+        // PD poll at the full 10 ms cadence — only after an explicit scan
+        // request powered the FUSB302 up. A captured caps frame triggers
+        // the Request inline (inside the poll), well inside the source's
+        // re-send window, so the contract holds and VBUS stays up.
+        if pd_on {
+            if matches!(pd::poll(&mut tpa, &mut caps, &mut listener).await, Ok(true)) {
+                report_caps(&caps, &mut sender);
             }
-            _ => false,
-        };
-
-        if ok && ui.screen == Screen::Power {
-            ui.draw_power(mv, ua, mw);
-        }
-        // (The TPA626 console feed is gone — the screen shows the values;
-        // the [pd] diag line below is the periodic console heartbeat and
-        // carries the build tag.)
-
-        // PD poll: parse Source_Capabilities as they appear on the CC
-        // lines (the source re-sends them whenever the DUT hard-resets).
-        if matches!(pd::poll(&mut tpa, &mut caps, &mut listener).await, Ok(true)) {
-            report_caps(&caps, &mut sender);
-        }
-        // Tester-initiated discovery, automatic: while no caps have been
-        // captured, ask the source every 5 s (Get_Source_Cap + Request of
-        // the first fixed PDO inside discover()).
-        if caps.updates == 0 && tick % 50 == 0 && tick > 0 {
-            match pd::discover(&mut tpa, &mut caps, &mut listener).await {
-                Ok(true) => report_caps(&caps, &mut sender),
-                Ok(false) => {}
-                Err(_) => sender.push(b"[pd] auto scan FAIL\r\n"),
+            if ui.screen == Screen::Pd {
+                ui.draw_pd(&caps);
             }
-        }
-        // Periodic diag heartbeat with the build tag, queue depth and
-        // send-failure count (f>0 = the host is not collecting packets).
-        if tick % 20 == 0 {
-            let mut d = [0u8; 64];
-            let mut n = 0;
-            for &b in b"[pd " {
-                d[n] = b;
-                n += 1;
-            }
-            for &b in BUILD {
-                d[n] = b;
-                n += 1;
-            }
-            for &b in b"] t=" {
-                d[n] = b;
-                n += 1;
-            }
-            n = push_dec(&mut d, n, tick % 100000);
-            for &b in b" q=" {
-                d[n] = b;
-                n += 1;
-            }
-            n = push_dec(&mut d, n, sender.qlen as u32);
-            for &b in b" f=" {
-                d[n] = b;
-                n += 1;
-            }
-            n = push_dec(&mut d, n, sender.take_fails());
-            n = listener.write_diag(&mut d, n);
-            d[n] = b'\r';
-            d[n + 1] = b'\n';
-            sender.push(&d[..n + 2]);
-        }
-        if ui.screen == Screen::Pd {
-            ui.draw_pd(&caps);
         }
 
-        // Buttons: debounced active-low; events to the console queue,
-        // presses drive the UI screens.
+        // Buttons: debounced active-low (50 ms at this cadence); events
+        // to the console queue, presses drive the UI screens.
         while let Some((i, down)) = btns.poll() {
             let name = buttons::Buttons::name(i);
             let mut line = [0u8; 64];
@@ -353,36 +303,139 @@ async fn main(_spawner: Spawner) {
             match ui.on_press(i) {
                 Press::Switch(screen) => ui.enter(screen),
                 Press::Discover => {
-                    // Active discovery (PD switch ON, no DUT):
-                    // Get_Source_Cap -> caps -> Request the first
-                    // fixed PDO, so the source holds the contract.
-                    caps = pd::SourceCaps::default();
-                    listener = pd::Listener::default();
-                    match pd::init(&mut tpa).await {
-                        Ok(_) => match pd::discover(&mut tpa, &mut caps, &mut listener).await {
-                            Ok(true) => {
+                    // Explicit scan request (OK on the PD screen). The
+                    // FIRST press powers the FUSB302 up with the
+                    // kws-x1-faithful init (orientation measured, single-
+                    // CC TX driver, measure block powered); every press
+                    // then runs Get_Source_Cap -> caps -> Request the
+                    // first fixed PDO, so the source holds the contract
+                    // and stops power-cycling VBUS.
+                    if !pd_on {
+                        match pd::init(&mut tpa).await {
+                            Ok((id, cc)) => {
+                                pd_on = true;
+                                listener.set_cc(cc);
+                                let st = pd::status(&mut tpa).await;
                                 let mut d = [0u8; 64];
                                 let mut n = 0;
-                                for &b in b"[pd] scan ok, contract requested\r\n" {
+                                for &b in b"[pd] fusb302 id=" {
                                     d[n] = b;
                                     n += 1;
                                 }
-                                sender.push(&d[..n]);
+                                n = push_hex8(&mut d, n, id as u32);
+                                for &b in b" cc=" {
+                                    d[n] = b;
+                                    n += 1;
+                                }
+                                d[n] = b'0' + cc;
+                                n += 1;
+                                for &b in b" st=" {
+                                    d[n] = b;
+                                    n += 1;
+                                }
+                                if let Ok((st0, st1)) = st {
+                                    n = push_hex8(&mut d, n, st0 as u32);
+                                    d[n] = b'/';
+                                    n += 1;
+                                    n = push_hex8(&mut d, n, st1 as u32);
+                                } else {
+                                    for &b in b"ERR" {
+                                        d[n] = b;
+                                        n += 1;
+                                    }
+                                }
+                                d[n] = b'\r';
+                                d[n + 1] = b'\n';
+                                sender.push(&d[..n + 2]);
+                            }
+                            Err(_) => sender.push(b"[pd] init FAIL\r\n"),
+                        }
+                    }
+                    if pd_on {
+                        match pd::discover(&mut tpa, &mut caps, &mut listener).await {
+                            Ok(true) => {
+                                report_caps(&caps, &mut sender);
+                                sender.push(b"[pd] scan ok, contract requested\r\n");
                             }
                             Ok(false) => sender.push(b"[pd] scan: no reply\r\n"),
                             Err(_) => sender.push(b"[pd] scan FAIL\r\n"),
-                        },
-                        Err(_) => sender.push(b"[pd] reinit FAIL\r\n"),
+                        }
                     }
                 }
                 Press::None => {}
             }
         }
 
+        // Meter: 200 ms cadence (screen values; TPA conversion window).
+        if tick % 20 == 0 {
+            let ok = match (
+                tpa_read(&mut tpa, 0x02).await,
+                tpa_read(&mut tpa, 0x04).await,
+                tpa_read(&mut tpa, 0x03).await,
+            ) {
+                (Ok(bus), Ok(cur), Ok(pwr)) => {
+                    let mv = (bus as u32 * 5) / 4; // 1.25 mV/LSB
+                    let ua = (cur as i16 as i32) * 50; // 50 uA/LSB
+                    let mw = ((pwr as i16 as i32) * 5) / 4; // 1.25 mW/LSB
+                    if ui.screen == Screen::Power {
+                        ui.draw_power(mv, ua, mw);
+                    }
+                    true
+                }
+                _ => false,
+            };
+            let _ = ok;
+        }
+
+        // Periodic diag heartbeat with the build tag, queue depth, the
+        // send-failure count (f>0 = the host is not collecting packets)
+        // and the PD power state (pd=1 adds the per-CC receiver diag).
+        if tick % 200 == 0 {
+            let mut d = [0u8; 96];
+            let mut n = 0;
+            for &b in b"[diag " {
+                d[n] = b;
+                n += 1;
+            }
+            for &b in BUILD {
+                d[n] = b;
+                n += 1;
+            }
+            for &b in b"] t=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, tick % 100000);
+            for &b in b" q=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, sender.qlen as u32);
+            for &b in b" f=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, sender.take_fails());
+            for &b in b" pd=" {
+                d[n] = b;
+                n += 1;
+            }
+            d[n] = b'0' + pd_on as u8;
+            n += 1;
+            if pd_on {
+                n = listener.write_diag(&mut d, n);
+            } else {
+                d[n] = b'\r';
+                d[n + 1] = b'\n';
+                n += 2;
+            }
+            sender.push(&d[..n]);
+        }
+
         sender.drain();
 
         tick = tick.wrapping_add(1);
-        Timer::after_millis(100).await;
+        Timer::after_millis(10).await;
     }
 }
 
