@@ -195,6 +195,9 @@ const STALE_FLUSH_TICKS: u32 = 5;
 /// 7 is Get_Source_Cap — r88-r98 sent Pings, which the PHY GoodCRC'd
 /// and the policy engine rightly ignored.
 const CTRL_GET_SOURCE_CAP: u16 = 7;
+/// Soft_Reset returns the source's protocol layer to ready (Accept
+/// comes back, hardware-acked) and re-arms its caps announce.
+const CTRL_SOFT_RESET: u16 = 13;
 /// Data message types (USB PD Table 6-6).
 const DATA_REQUEST: u16 = 2;
 
@@ -375,16 +378,23 @@ pub async fn discover(
     caps: &mut SourceCaps,
     lis: &mut Listener,
 ) -> Result<bool, Error> {
-    // r99: a REAL Get_Source_Cap (type 7 — r88-r98 sent a Ping, which
-    // the source's PHY GoodCRC'd and its policy engine rightly ignored,
-    // hence 'acked but no caps' every round). r103: re-measure the
-    // orientation first — the r102 session saw the port with NO Rp at
-    // all (charger detached); the scan must follow the Rp wherever it
-    // is right now.
+    // r103: re-measure the orientation first — the r102 session saw the
+    // port with NO Rp at all (charger detached); the scan must follow
+    // the Rp wherever it is right now.
     let (meas, cc) = measure_cc(i2c).await?;
     lis.last_meas = meas;
     let _ = route(i2c, cc).await;
     lis.set_cc(cc);
+
+    // r104: Soft_Reset first (user suggestion + spec): the source's
+    // protocol layer returns to ready, its Accept is hardware-acked,
+    // and MessageIDs reset to zero on both sides — the r103 session
+    // showed the FIRST scan after a fresh init works and everything
+    // after that fails to transmit (r=2), so every scan now rebuilds
+    // the whole state (init in main.rs) and re-syncs the protocol.
+    let _ = tx_message(i2c, lis, CTRL_SOFT_RESET, &[]).await?;
+    lis.tx_id = 0;
+    Timer::after_millis(10).await;
     let acked = tx_message(i2c, lis, CTRL_GET_SOURCE_CAP, &[]).await?;
     lis.last_scan = Some(acked);
     if !acked {
@@ -729,6 +739,11 @@ impl Listener {
     /// BC_LVL of both lines at the last orientation measure ([CC1, CC2]).
     pub fn meas(&self) -> [u8; 2] {
         self.last_meas
+    }
+
+    /// Whether any transmit collided with live CC traffic.
+    pub fn collided(&self) -> bool {
+        self.collided
     }
 
     /// Diagnostic line: per-CC last STATUS0/STATUS1 (hex), the latched

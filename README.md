@@ -1,24 +1,27 @@
 # fnb58-firmware
 
-Open firmware scaffold for the **FNIRSI FNB58** USB tester (Artery
-AT32F403A), built on [`embassy-at32`](../at32f403a-embassy-rs) and ported
-from [kws-x1-standalone-rs](https://github.com/kralonur/kws-x1-standalone-rs).
+Open firmware for the **FNIRSI FNB58** USB tester (Artery AT32F403A),
+built on [`embassy-at32`](../at32f403a-embassy-rs) and ported from
+[kws-x1-standalone-rs](https://github.com/kralonur/kws-x1-standalone-rs).
+Status: **r104** — working USB CDC console, 320x240 UI, live V/A/W
+meter, and a PD sink scan flow that reads source capabilities from a
+charger on demand.
 
-## Current state: USB CDC smoke test
+## Architecture
 
-The firmware enumerates as a **CDC serial port** (VID 0x2e3c, PID 0x5859)
-and echoes received bytes plus a one-per-second `FNB58 alive <n>`
-heartbeat. If the port appears and echoes, the MCU, flash execution, the
-240 MHz clock tree, the 48 MHz USB clock, the USBFS cell and its
-interrupt all work — the bring-up baseline, independent of the unverified
-display pins. The ST7789 panel transport (`panel.rs`) is kept for the
-next stage but not started.
-
-Build a flashable binary (vector table at 0x08000000):
-
-```sh
-./make-bin.sh    # cargo build + rust-objcopy -O binary
-```
+- **USB CDC**: the vendor AT32 C stack (usbd_core/cdc_class) compiled
+  into the firmware by `build.rs` (`c/fnb58_usb.c` glue). Proven path —
+  the hand-rolled Rust USB stack was retired after rounds 1-14.
+- **I²C1**: the vendor C `i2c_application` library (`c/fnb58_i2c.c`
+  glue, PB6/PB7). The Rust embassy I2C driver also works and runs the
+  TPA626 meter transactions.
+- **Everything else is Rust** on `embassy-at32`: clocks (192 MHz PLL
+  from the 8 MHz HEXT crystal + USB DIV_4), GPIO, EXINT, the UI, the
+  PD driver (`pd.rs`, register-level FUSB302B), buttons, console queue.
+- **Interrupts**: buttons and the FUSB302 INT_N run on EXINT (ISR
+  latches a line bit and wakes the main loop via a signal); the main
+  loop waits on the doorbell with a 10 ms fallback tick. PD RX reacts
+  to INT edges instead of polling blind.
 
 ## Verified hardware pin map (probed on the real board)
 
@@ -26,51 +29,71 @@ Build a flashable binary (vector table at 0x08000000):
 |---|---|---|
 | LCD ST7789V 320x240 | SPI2: SCK=PB13, MOSI=PB15, CS=PB12, DC=PB11, RST=PB10 | r40-r53: full driver + pattern on glass |
 | LCD backlight | PB3 (active high) | user trace, r42+ |
-| I2C1 bus | PB6=SCL, PB7=SDA | r18-r21 scans; TPA626@0x40, FUSB302B@0x22, KXTJ3@0x0E, mystery@0x0C (write-only) |
-| Buttons (to GND, need internal pull-ups) | LEFT=PA15, OK=PB4, BACK=PB9, RIGHT=PB8 | r59-r61 tracer (HIT with pull-up window) |
+| I2C1 bus | PB6=SCL, PB7=SDA | r18-r21 scans; devices below |
+| TPA626 power monitor | I2C 0x40 (mfr 0x5549, die 0x2260 = INA226-compatible), 10 mΩ shunt assumed | r20-r23 live VBUS, r62+ V/A/W |
+| FUSB302B PD PHY | I2C 0x22, **INT_N = PC13** (LQFP48 pin 2, open-drain, needs pull-up) | r20 id=91; PC13 traced by user, r102 EXTINT proven |
+| KXTJ3-1057 accelerometer | I2C 0x0E (whoami 0x35) | r20 |
+| Mystery device | I2C 0x0C — ACKs address, ignores all reads (write-only) | r20-r22 |
+| Buttons (to GND, internal pull-ups, active-low) | LEFT=PA15, OK=PB4, BACK=PB9, RIGHT=PB8 | r59-r61 tracer; r102 EXINT |
+| FUSB302 INT_N | PC13 → EXINT13 falling | r102: `isr line=13 ok` |
 | USB FS | PA11=D-, PA12=D+ | working CDC since r15 |
 | SWD | PA13=SWDIO, PA14=SWCLK | ICP flashing path |
-| Crystal | 8 MHz HEXT | vendor example boots; 192 MHz PLL |
+| Crystal | 8 MHz on PD0/PD1 (OSC_IN/OUT — NOT PC14/15) | vendor example + r15 |
+| LEXT 32 kHz footprint | PC14/PC15 — **not populated** (r86 lext=0) | r86 probe |
 | W25Q128 flash | shares SPI2 (SCK=PB13, MISO=PB14, MOSI=PB15), CS unconfirmed | r33 probe |
+| PD power path | side slider isolates the CC load ("PD switch"); internal FUSB302 Rd (SWITCHES0 PDWN bits) also presents a sink | r84+ behavior |
 
-Button notes: PA15 and PB4 are the freed-JTAG pins (the firmware's
-SWJTAG remap releases PA15+PB3+PB4); PB8/PB9 are the I2C1-remap
-alternate pins, unused because I2C1 runs on PB6/PB7. None of the four
-buttons has an external pull-up — a button pin reads low when floating,
-so the driver must enable an internal pull-up on each button pin and
-treat active-low as pressed.
+LQFP48 leftovers (unclaimed, untraced): PA0-PA10, PB0/PB1/PB2/PB5, and
+the load-bank FET gates — **never drive them blindly** (r24/25 heated
+the board doing that).
 
-`firmware/src/board.rs` still contains the original UNVERIFIED guess
-block (SPI1 pins etc.) — historical only; the verified map above and
-the C glue (`c/fnb58_lcd.c`, `c/fnb58_i2c.c`) are the source of truth.
+## PD sink flow (r104)
 
-The backlight is driven as a plain GPIO for now; move it to a
-`embassy_at32::pwm` TMR3 channel once its true pin (and timer channel) is
-known.
+1. Boot does **not** touch the FUSB302 (boot-time init browned the
+   board out on charger-only power — r87).
+2. **OK on the PD screen** = a scan: full FUSB302 re-init (orientation
+   measured per line with the measure block powered, single-CC BMC TX
+   driver, auto-GoodCRC rev 2.0 + retries), Soft_Reset, then
+   Get_Source_Cap (type **7** — type 5 is Ping, which cost rounds
+   r88-r98), capture, and a Request for the first fixed PDO.
+3. While PD is on, the 10 ms / INT-driven poll answers every
+   Source_Capabilities with a Request (tSenderResponse is 24-30 ms).
+4. The scan line carries the diagnostics:
+   `[pd] scan cc=2 m=03 r=2 g=1 x=0 f=…` — cc = routed line, m = BC_LVL
+   of both lines (high nibble CC1, low CC2; 0 = no Rp there), r = last
+   TX outcome (0 acked / 1 retryfail / 2 never started), g = hardware
+   ever auto-acked an incoming frame, x = transmit collision, f = raw
+   hex of whatever still sits in the RX FIFO.
 
-## Clocks
+Known issue: the Request itself usually comes back `r=2` (the
+transmitter does not start for the second back-to-back message), so the
+contract does not hold yet — the caps/scan path is fully working. The
+FUSB302's CC2 line is the charger's active line on this unit.
 
-Internal-HICK profile (no crystal dependency): PLL input HICK/2 = 4 MHz ×
-60 → SCLK/AHB 240 MHz, APB1/APB2 120 MHz, timers 240 MHz, SPI1 SCK 30 MHz
-(conservative first-light rate; /2 = 60 MHz is near the ST7789 write limit
-and can be tried next). If the board carries a crystal, switch
-`board::CLOCK` to `PllSource::Hext`.
+## Console
 
-## Flashing
+115200 8N1 CDC. Boot banner, `[i2c]`/`[meter]` bring-up lines,
+`[boot] rst=…` (fresh CRM reset-cause flags, sticky ones cleared each
+boot) with the LEXT probe result, `[exti] isr line=N ok` once per
+interrupt line (buttons = the canary), `[diag rNNN] t= q= f= i= pd=…`
+heartbeats, and the PD lines above. The console queue is non-blocking;
+a slow host delays lines instead of losing them.
 
-Not yet possible over USB: the stock FNIRSI bootloader only accepts
-encrypted `.ufn` images (see the bootloader investigation notes in the
-parent project). The image targets SWD (full flash takeover at
-`0x08000000`, 1 MiB / 96 KiB SRAM assumed) — Artery ICP Programmer with an
-AT-Link or compatible CMSIS-DAP probe. Mass-erasing destroys the stock
-firmware; the stock `v0.68` `.ufn` is archived in `../fnb58-research/` for
-restoration over USB.
+## Build and flash
+
+```sh
+./make-bin.sh    # cargo build --release + rust-objcopy -> fnb58-firmware.bin
+```
+
+Flash `fnb58-firmware.bin` at 0x08000000 with Artery ICP over SWD
+(AT-Link). Each round ships a uniquely named copy (`fnb58-rNNN-tag.bin`)
+plus the build tag in every heartbeat — three flashes silently failed
+to take before that protocol existed.
 
 ## Roadmap
 
-1. Verify the display pin map on hardware → first light.
-2. I²C bus bring-up: TPA626 monitor (INA226-compatible), KXTJ3-1057
-   accelerometer, FUSB302B PD controller (the `fusb302-pd` crate ports
-   as-is).
-3. Port the KWS-X1 board layer: gated I²C bus, PD task, buttons, UI.
-4. `embassy-at32` ADC module (line voltages, ripple) and flash storage.
+1. Fix the Request transmission (r=2) so the sink contract holds and
+   the charger stops power-cycling VBUS.
+2. PD profiles screen: request a chosen PDO (the RDO builder is in
+   place), PPS support.
+3. KXTJ3 accelerometer driver, W25Q128 logging, ADC (ripple/VBUS taps).

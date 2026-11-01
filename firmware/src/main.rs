@@ -34,7 +34,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r103";
+const BUILD: &[u8] = b"r104";
 
 use crate::ui::Press;
 use crate::ui::push_pdo;
@@ -107,7 +107,7 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r103: follow rp\r\n").await;
+    say(b"[lcd] FNB58 r104: reinit+sr\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
@@ -409,20 +409,19 @@ async fn main(_spawner: Spawner) {
             match ui.on_press(i) {
                 Press::Switch(screen) => ui.enter(screen),
                 Press::Discover => {
-                    // Explicit scan request (OK on the PD screen). The
-                    // FIRST press powers the FUSB302 up with the
-                    // kws-x1-faithful init (orientation measured, single-
-                    // CC TX driver, measure block powered); every press
-                    // then runs Get_Source_Cap -> caps -> Request the
-                    // first fixed PDO, so the source holds the contract
-                    // and stops power-cycling VBUS.
-                    if !pd_on {
-                        match pd::init(&mut tpa).await {
-                            Ok((id, cc)) => {
-                                pd_on = true;
-                                scan_cc = cc;
-                                listener.set_cc(cc);
-                                let st = pd::status(&mut tpa).await;
+                    // r104: re-init on EVERY scan. The r103 log showed
+                    // the first scan after a cold boot works end-to-end
+                    // (fresh FUSB302 state) while every later scan on
+                    // the same chip state fails to transmit (r=2: no
+                    // TXSENT, no RETRYFAIL — the transmitter never
+                    // starts). The full reset + config replicates the
+                    // working state each press.
+                    match pd::init(&mut tpa).await {
+                        Ok((id, cc)) => {
+                            pd_on = true;
+                            scan_cc = cc;
+                            listener.set_cc(cc);
+                            let st = pd::status(&mut tpa).await;
                                 let mut d = [0u8; 64];
                                 let mut n = 0;
                                 for &b in b"[pd] fusb302 id=" {
@@ -454,9 +453,8 @@ async fn main(_spawner: Spawner) {
                                 d[n] = b'\r';
                                 d[n + 1] = b'\n';
                                 sender.push(&d[..n + 2]);
-                            }
-                            Err(_) => sender.push(b"[pd] init FAIL\r\n"),
                         }
+                        Err(_) => sender.push(b"[pd] init FAIL\r\n"),
                     }
                     if pd_on {
                         // r94: the r93 session settled the line — CC2
@@ -505,6 +503,12 @@ async fn main(_spawner: Spawner) {
                             n += 1;
                         }
                         d[n] = b'0' + listener.gcrc_seen() as u8;
+                        n += 1;
+                        for &b in b" x=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        d[n] = b'0' + listener.collided() as u8;
                         n += 1;
                         if !acked {
                             for &b in b" f=" {
