@@ -124,6 +124,28 @@ fn stop_requested() -> bool {
 }
 
 /// The engine's error mapped to a diagnostic code for the PD screen.
+/// Write the power-on configuration back: a session that dies mid-startup
+/// (Hard Reset received, bus error) leaves SWITCHES0/1 and POWER in session
+/// state, and every later attempt would fail the crate's Baseline gate
+/// (the r113 first-run err=0x102 = register 0x02). DEVICE_ID is read-only
+/// and skipped.
+async fn restore_baseline(bus: &mut embassy_at32::i2c::I2c) -> Result<(), ()> {
+    use fusb302_pd::phy::Platform as _;
+    let baseline = <crate::pd_phy::FnbPlatform as fusb302_pd::phy::Platform>::BASELINE;
+    // REGISTERS is 13 wide (the two dynamic STATUS bytes trail); the
+    // BASELINE covers the first 11, and DEVICE_ID (read-only) is skipped.
+    use embedded_hal_async::i2c::I2c as _;
+    for (reg, value) in fusb302_pd::snapshot::REGISTERS
+        .iter()
+        .skip(1)
+        .take(10)
+        .zip(baseline.iter().skip(1))
+    {
+        let _ = bus.write(0x22, &[*reg, *value]).await.map_err(|_| ())?;
+    }
+    Ok(())
+}
+
 fn error_code(error: &pd_phy::Error<embassy_at32::i2c::Error>) -> u16 {
     use pd_phy::Error as E;
     match error {
@@ -193,6 +215,13 @@ pub async fn run() {
             let Some(bus) = guard.0.as_mut() else {
                 continue;
             };
+            // Restore the power-on configuration FIRST: a previous session
+            // that died mid-startup leaves the registers in session state
+            // and the crate's Baseline gate would fail every later attempt.
+            if restore_baseline(bus).await.is_err() {
+                VIEW.error.store(0x300, Ordering::Relaxed);
+                continue;
+            }
             let snapshot = match fusb302_pd::snapshot::snapshot(bus).await {
                 Ok(snapshot) => snapshot,
                 Err(failure) => {
@@ -287,7 +316,14 @@ pub async fn run() {
             error = phy.take_error();
         }
         if let Some(failure) = &error {
-            VIEW.error.store(error_code(failure), Ordering::Relaxed);
+            let code = error_code(failure);
+            VIEW.error.store(code, Ordering::Relaxed);
+            // A Hard Reset received mid-session means the charger reset
+            // VBUS: give it the tSrcRecover + tSrcTurnOn window (with
+            // margin) before the next attempt can start.
+            if code == 7 {
+                embassy_time::Timer::after_millis(1_600).await;
+            }
         }
         publish(phy.observation);
         if !phy.stopped() {
