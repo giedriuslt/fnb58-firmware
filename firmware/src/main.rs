@@ -36,7 +36,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r119";
+const BUILD: &[u8] = b"r120";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -125,7 +125,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r119: kws flow\r\n").await;
+    say(b"[lcd] FNB58 r120: safe mode\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)

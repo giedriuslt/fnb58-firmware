@@ -258,11 +258,22 @@ fn restart_requested() -> bool {
 
 #[embassy_executor::task]
 pub async fn run() {
-    // The BOOT session starts immediately: the charger is still announcing
-    // its capabilities (nCapsCount: up to ~50 announcements over ~10 s) and
-    // the engine's passive wait (~16 s budget) catches them — kws-x1's
-    // exact boot flow. Later sessions wait for an OK request.
-    let mut first = true;
+    // The BOOT session starts immediately ONLY on PC power (r119's
+    // lesson: the charger Hard-Reset loops VBUS when its caps are acked
+    // but the Request is never accepted, and charger-only power browns
+    // out on every dip). Charger-only waits for an explicit OK.
+    unsafe extern "C" {
+        fn fnb58_usb_configured() -> u32;
+    }
+    let mut powered = false;
+    for _ in 0..40 {
+        if unsafe { fnb58_usb_configured() } == 1 {
+            powered = true;
+            break;
+        }
+        embassy_time::Timer::after_millis(100).await;
+    }
+    let mut first = powered;
     loop {
         if !first {
             START.wait().await;
@@ -337,8 +348,12 @@ pub async fn run() {
         // The engine selects the target and drives Requests; our Platform
         // supplies VBUS and policy.
         let selection = pd_spr::Selection::<FnbLimits>::new();
+        // r120: ONE-SHOT sessions. A persistent engine loops Hard Resets
+        // when the charger refuses to acknowledge the Request, and every
+        // Hard Reset dips VBUS - a brownout on charger-only power. One
+        // clean attempt per OK press; the result lands in the view.
         let config = pd_phy::Config {
-            persistent: true,
+            persistent: false,
             selection: Some(&selection),
             control: None,
             identity_started: None,
