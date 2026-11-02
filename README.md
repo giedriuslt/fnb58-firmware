@@ -12,9 +12,10 @@ charger on demand.
 - **USB CDC**: the vendor AT32 C stack (usbd_core/cdc_class) compiled
   into the firmware by `build.rs` (`c/fnb58_usb.c` glue). Proven path —
   the hand-rolled Rust USB stack was retired after rounds 1-14.
-- **I²C1**: the vendor C `i2c_application` library (`c/fnb58_i2c.c`
-  glue, PB6/PB7). The Rust embassy I2C driver also works and runs the
-  TPA626 meter transactions.
+- **I²C1**: **Rust on the embassy HAL** (r112) — every I²C transaction
+  (TPA626 meter, FUSB302 PD) runs through the HAL's `i2c::I2c` driver
+  on PB6/PB7; the vendor C i2c code (glue + `i2c_application`
+  middleware) is removed from the build.
 - **LCD**: **Rust on the embassy HAL** (r111, `src/lcd.rs`) — SPI2 +
   GPIO pins driven by the HAL's `Spi`/`OutputPin`, a 1:1 port of the
   proven C driver (same init sequence, 5x7 font, 12 MHz rate); bulk
