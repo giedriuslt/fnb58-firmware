@@ -18,6 +18,7 @@
 
 mod board;
 mod buttons;
+mod lcd;
 mod pd;
 mod pin_trace;
 mod ui;
@@ -34,7 +35,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r108";
+const BUILD: &[u8] = b"r111";
 
 use crate::ui::Press;
 use crate::ui::push_pdo;
@@ -59,8 +60,6 @@ unsafe extern "C" {
     fn fnb58_usb_recv(buffer: *mut u8) -> u16;
     fn fnb58_usb_send(data: *const u8, len: u16) -> i32;
     fn fnb58_usb_configured() -> u32;
-    fn fnb58_lcd_init();
-    fn fnb58_lcd_test_pattern();
 }
 
 /// Called from the vendor IRQ handlers.
@@ -107,7 +106,7 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r108: request diag\r\n").await;
+    say(b"[lcd] FNB58 r111: rust lcd\r\n").await;
 
     unsafe extern "C" {
         fn fnb58_i2c_init();
@@ -147,9 +146,13 @@ async fn main(_spawner: Spawner) {
         Timer::after_millis(500).await;
     }
 
-    unsafe { fnb58_lcd_init() };
+    // --- r111: LCD on the Rust embassy HAL (SPI2 + GPIO) ---
+    // Lcd::new() performs the SWJTAG remap, so it must come before the
+    // button pins (PB4/PA15) are configured.
+    let mut lcd = unsafe { lcd::Lcd::new() };
+    lcd.init().await;
     say(b"[lcd] init done, drawing bars\r\n").await;
-    unsafe { fnb58_lcd_test_pattern() };
+    lcd.test_pattern().await;
     say(b"[lcd] pattern drawn\r\n").await;
     Timer::after_millis(1500).await;
 
@@ -219,7 +222,7 @@ async fn main(_spawner: Spawner) {
     let mut btns = buttons::Buttons::new();
     let mut sender = Sender::new();
     let mut ui = Ui::new();
-    ui.enter(Screen::Power);
+    ui.enter(&mut lcd, Screen::Power).await;
 
     // r102: EXINT lines. Buttons keep their pull-ups (Buttons::new) and
     // gain edge interrupts (both edges — the loop level-debounces as
@@ -314,7 +317,7 @@ async fn main(_spawner: Spawner) {
         });
         flags
     };
-    ui.draw_rst(rst_flags);
+    ui.draw_rst(&mut lcd, rst_flags).await;
     {
         let mut d = [0u8; 64];
         let mut n = 0;
@@ -379,7 +382,7 @@ async fn main(_spawner: Spawner) {
                 report_request(&mut sender, &listener);
             }
             if ui.screen == Screen::Pd {
-                ui.draw_pd(&caps);
+                ui.draw_pd(&mut lcd, &caps).await;
             }
         }
 
@@ -407,7 +410,7 @@ async fn main(_spawner: Spawner) {
                 continue;
             }
             match ui.on_press(i) {
-                Press::Switch(screen) => ui.enter(screen),
+                Press::Switch(screen) => ui.enter(&mut lcd, screen).await,
                 Press::Discover => {
                     // r104: re-init on EVERY scan. The r103 log showed
                     // the first scan after a cold boot works end-to-end
@@ -542,7 +545,7 @@ async fn main(_spawner: Spawner) {
                     let ua = (cur as i16 as i32) * 50; // 50 uA/LSB
                     let mw = ((pwr as i16 as i32) * 5) / 4; // 1.25 mW/LSB
                     if ui.screen == Screen::Power {
-                        ui.draw_power(mv, ua, mw);
+                        ui.draw_power(&mut lcd, mv, ua, mw).await;
                     }
                     true
                 }

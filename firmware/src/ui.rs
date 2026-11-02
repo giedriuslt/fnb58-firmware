@@ -2,25 +2,13 @@
 //! PD screen (source capabilities from the FUSB302 listener). LEFT/RIGHT
 //! (and BACK) switch screens; OK on the PD screen requests a scan (r88:
 //! the scan also powers the FUSB302 up — no boot-time PD init). Rendering
-//! goes through the C 5x7 text API — every string here must only contain
-//! glyphs from c/fnb58_lcd.c FONT_CHARS.
+//! goes through the Rust LCD driver (r111, embassy HAL) — every string
+//! here must only contain glyphs from lcd.rs FONT_CHARS.
 
 use crate::buttons;
+use crate::lcd::Lcd;
 use crate::pd::Pdo;
 use crate::pd::SourceCaps;
-
-unsafe extern "C" {
-    fn fnb58_lcd_fill(color: u16);
-    fn fnb58_lcd_fill_window(x0: u16, y0: u16, x1: u16, y1: u16, color: u16);
-    fn fnb58_lcd_draw_text(
-        x: u16,
-        y: u16,
-        s: *const u8,
-        scale: u8,
-        fg: u16,
-        bg: u16,
-    ) -> u16;
-}
 
 const BLACK: u16 = 0x0000;
 const WHITE: u16 = 0xFFFF;
@@ -53,11 +41,11 @@ pub struct Ui {
 }
 
 /// Draw a NUL-terminated copy of `s` (truncated to fit the buffer).
-fn text(x: u16, y: u16, s: &[u8], scale: u8, color: u16) {
+async fn text(lcd: &mut Lcd, x: u16, y: u16, s: &[u8], scale: u8, color: u16) {
     let mut buf = [0u8; 24];
     let n = s.len().min(23);
     buf[..n].copy_from_slice(&s[..n]);
-    unsafe { fnb58_lcd_draw_text(x, y, buf.as_ptr(), scale, color, BLACK) };
+    lcd.draw_text(x, y, &buf, scale, color, BLACK).await;
 }
 
 impl Ui {
@@ -82,27 +70,27 @@ impl Ui {
     }
 
     /// Switch screens: full clear, title and static chrome.
-    pub fn enter(&mut self, screen: Screen) {
+    pub async fn enter(&mut self, lcd: &mut Lcd, screen: Screen) {
         self.screen = screen;
         // Force the next screen-specific redraw.
         self.last_updates = u32::MAX;
-        unsafe { fnb58_lcd_fill(BLACK) };
+        lcd.fill(BLACK).await;
         match screen {
             Screen::Power => {
-                text(8, 8, b"POWER", 2, WHITE);
-                text(272, 8, b"1/2", 2, GRAY);
+                text(lcd, 8, 8, b"POWER", 2, WHITE).await;
+                text(lcd, 272, 8, b"1/2", 2, GRAY).await;
             }
             Screen::Pd => {
-                text(8, 8, b"PD", 2, WHITE);
-                text(272, 8, b"2/2", 2, GRAY);
-                text(8, 216, b"OK: SCAN", 2, GRAY);
+                text(lcd, 8, 8, b"PD", 2, WHITE).await;
+                text(lcd, 272, 8, b"2/2", 2, GRAY).await;
+                text(lcd, 8, 216, b"OK: SCAN", 2, GRAY).await;
             }
         }
     }
 
     /// Show the reset-cause flags in the title bar so a reboot loop is
     /// visible standalone (no PC needed).
-    pub fn draw_rst(&self, flags: u8) {
+    pub async fn draw_rst(&self, lcd: &mut Lcd, flags: u8) {
         let mut line = [0u8; 24];
         let mut n = 0;
         for &b in b"rst=" {
@@ -114,18 +102,18 @@ impl Ui {
         line[n + 1] = HEX[(flags & 0xF) as usize];
         n += 2;
         line[n] = 0;
-        unsafe { fnb58_lcd_draw_text(180, 8, line.as_ptr(), 2, GRAY, BLACK) };
+        lcd.draw_text(180, 8, &line, 2, GRAY, BLACK).await;
     }
 
     /// Power screen: the three big live values (12-char padded overdraws,
     /// so shrinking values leave no ghosts).
-    pub fn draw_power(&self, mv: u32, ua: i32, mw: i32) {
+    pub async fn draw_power(&self, lcd: &mut Lcd, mv: u32, ua: i32, mw: i32) {
         // Voltage: "20.000 V"
         let mut l1 = Line12::new();
         l1.num_u32(mv, 3);
         l1.push(b" V");
         l1.pad();
-        unsafe { fnb58_lcd_draw_text(20, 50, l1.as_ptr(), 3, GREEN, BLACK) };
+        lcd.draw_text(20, 50, l1.bytes(), 3, GREEN, BLACK).await;
 
         // Current: A (>= 1 A) else mA.
         let mut l2 = Line12::new();
@@ -141,7 +129,7 @@ impl Ui {
             l2.push(b" mA");
         }
         l2.pad();
-        unsafe { fnb58_lcd_draw_text(20, 110, l2.as_ptr(), 3, YELLOW, BLACK) };
+        lcd.draw_text(20, 110, l2.bytes(), 3, YELLOW, BLACK).await;
 
         // Power: W (>= 1 W) else mW.
         let mut l3 = Line12::new();
@@ -157,21 +145,21 @@ impl Ui {
             l3.push(b" mW");
         }
         l3.pad();
-        unsafe { fnb58_lcd_draw_text(20, 170, l3.as_ptr(), 3, CYAN, BLACK) };
+        lcd.draw_text(20, 170, l3.bytes(), 3, CYAN, BLACK).await;
     }
 
     /// PD screen: the caps list (redrawn only when the caps change) or
     /// the scan hint while nothing has been captured. OK sends
     /// Get_Source_Cap and Requests the first fixed PDO (r88).
-    pub fn draw_pd(&mut self, caps: &SourceCaps) {
+    pub async fn draw_pd(&mut self, lcd: &mut Lcd, caps: &SourceCaps) {
         if caps.updates == self.last_updates && caps.n == self.last_n {
             return;
         }
         self.last_updates = caps.updates;
         self.last_n = caps.n;
-        unsafe { fnb58_lcd_fill_window(0, 32, 319, 210, BLACK) };
+        lcd.fill_window(0, 32, 319, 210, BLACK).await;
         if caps.n == 0 {
-            text(8, 60, b"NO CAPS - PRESS OK", 2, GRAY);
+            text(lcd, 8, 60, b"NO CAPS - PRESS OK", 2, GRAY).await;
             return;
         }
         for i in 0..caps.n {
@@ -181,7 +169,7 @@ impl Ui {
             n = push_pdo(&mut line, n, pdo);
             line[n] = 0;
             let color = if pdo.is_pps { MAGENTA } else { WHITE };
-            text(8, 40 + (i as u16) * 22, &line, 2, color);
+            text(lcd, 8, 40 + (i as u16) * 22, &line, 2, color).await;
         }
     }
 }
