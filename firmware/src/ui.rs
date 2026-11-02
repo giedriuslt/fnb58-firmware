@@ -1,14 +1,12 @@
 //! Two-screen UI in the kws-x1 style: a POWER monitor (live V/A/W) and a
-//! PD screen (source capabilities from the FUSB302 listener). LEFT/RIGHT
-//! (and BACK) switch screens; OK on the PD screen requests a scan (r88:
-//! the scan also powers the FUSB302 up — no boot-time PD init). Rendering
-//! goes through the Rust LCD driver (r111, embassy HAL) — every string
-//! here must only contain glyphs from lcd.rs FONT_CHARS.
+//! PD screen (the engine view from the vendored fusb302-pd session,
+//! r113). LEFT/RIGHT (and BACK) switch screens; OK on the PD screen
+//! signals the PD task. Rendering goes through the Rust LCD driver —
+//! every string here must only contain glyphs from lcd.rs FONT_CHARS.
 
 use crate::buttons;
 use crate::lcd::Lcd;
-use crate::pd::Pdo;
-use crate::pd::SourceCaps;
+use crate::pd_task::View;
 
 const BLACK: u16 = 0x0000;
 const WHITE: u16 = 0xFFFF;
@@ -34,10 +32,11 @@ pub enum Press {
 
 pub struct Ui {
     pub screen: Screen,
-    /// Caps identity at the last PD-list redraw (updates counter + row
-    /// count, so a cleared-caps redraw also triggers).
-    last_updates: u32,
-    last_n: usize,
+    /// PD-view identity at the last redraw (values that change rarely).
+    pd_phase: u8,
+    pd_mv: u16,
+    pd_ma: u16,
+    pd_err: u16,
 }
 
 /// Draw a NUL-terminated copy of `s` (truncated to fit the buffer).
@@ -52,8 +51,10 @@ impl Ui {
     pub fn new() -> Self {
         Self {
             screen: Screen::Power,
-            last_updates: 0,
-            last_n: 0,
+            pd_phase: 0xFF,
+            pd_mv: 0xFFFF,
+            pd_ma: 0xFFFF,
+            pd_err: 0xFFFF,
         }
     }
 
@@ -73,7 +74,7 @@ impl Ui {
     pub async fn enter(&mut self, lcd: &mut Lcd, screen: Screen) {
         self.screen = screen;
         // Force the next screen-specific redraw.
-        self.last_updates = u32::MAX;
+        self.pd_phase = 0xFF;
         lcd.fill(BLACK).await;
         match screen {
             Screen::Power => {
@@ -148,112 +149,98 @@ impl Ui {
         lcd.draw_text(20, 170, l3.bytes(), 3, CYAN, BLACK).await;
     }
 
-    /// PD screen: the caps list (redrawn only when the caps change) or
-    /// the scan hint while nothing has been captured. OK sends
-    /// Get_Source_Cap and Requests the first fixed PDO (r88).
-    pub async fn draw_pd(&mut self, lcd: &mut Lcd, caps: &SourceCaps) {
-        if caps.updates == self.last_updates && caps.n == self.last_n {
+    /// PD screen: the engine view (vendored fusb302-pd session). Redrawn
+    /// only when a tracked value changes.
+    pub async fn draw_pd(&mut self, lcd: &mut Lcd, view: &View) {
+        let phase = view.phase.load(core::sync::atomic::Ordering::Relaxed);
+        let mv = view.selected_mv.load(core::sync::atomic::Ordering::Relaxed);
+        let ma = view.selected_ma.load(core::sync::atomic::Ordering::Relaxed);
+        let err = view.error.load(core::sync::atomic::Ordering::Relaxed);
+        if phase == self.pd_phase && mv == self.pd_mv && ma == self.pd_ma && err == self.pd_err {
             return;
         }
-        self.last_updates = caps.updates;
-        self.last_n = caps.n;
+        self.pd_phase = phase;
+        self.pd_mv = mv;
+        self.pd_ma = ma;
+        self.pd_err = err;
         lcd.fill_window(0, 32, 319, 210, BLACK).await;
-        if caps.n == 0 {
-            text(lcd, 8, 60, b"NO CAPS - PRESS OK", 2, GRAY).await;
-            return;
-        }
-        for i in 0..caps.n {
-            let pdo = &caps.pdos[i];
-            let mut line = [0u8; 24];
-            let mut n = 0;
-            n = push_pdo(&mut line, n, pdo);
-            line[n] = 0;
-            let color = if pdo.is_pps { MAGENTA } else { WHITE };
-            text(lcd, 8, 40 + (i as u16) * 22, &line, 2, color).await;
-        }
-    }
-}
 
-/// Append `v` with `dec` digits after the decimal point, into `buf` at
-/// `pos`. `v` is in 10^-dec units (e.g. mv/100 with dec=1 for volts).
-/// Returns the new position.
-pub fn push_num_dec(buf: &mut [u8], pos: usize, v: u32, dec: usize) -> usize {
-    let mut tmp = [0u8; 10];
-    let mut n = 0;
-    let mut x = v;
-    if x == 0 {
-        tmp[0] = b'0';
-        n = 1;
-    } else {
-        while x > 0 && n < 10 {
-            tmp[n] = b'0' + (x % 10) as u8;
-            x /= 10;
+        const NAMES: [&[u8]; 13] = [
+            b"WAIT", b"PASSIVE", b"FAIL", b"SKIP", b"MEAS", b"GUARD", b"VERIFY", b"RX",
+            b"CAPTURED", b"NOCAPS", b"NEG", b"CONTRACT", b"HOLD",
+        ];
+        let name = NAMES.get(phase as usize).copied().unwrap_or(b"?");
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        for &b in b"PD " {
+            line[n] = b;
             n += 1;
         }
-    }
-    let mut p = pos;
-    if n <= dec {
-        buf[p] = b'0';
-        p += 1;
-        if dec > 0 {
-            buf[p] = b'.';
-            p += 1;
-            for _ in 0..(dec - n) {
-                buf[p] = b'0';
-                p += 1;
-            }
-        }
-    } else {
-        let mut k = n;
-        while k > dec {
-            k -= 1;
-            buf[p] = tmp[k];
-            p += 1;
-        }
-        if dec > 0 {
-            buf[p] = b'.';
-            p += 1;
-        }
-    }
-    if dec > 0 {
-        let mut k = dec.min(n);
-        while k > 0 {
-            k -= 1;
-            buf[p] = tmp[k];
-            p += 1;
-        }
-    }
-    p
-}
+        line[n..n + name.len()].copy_from_slice(name);
+        n += name.len();
+        line[n] = 0;
+        text(lcd, 8, 40, &line, 3, WHITE).await;
 
-/// Format one PDO as "x.xV y.yA" / "PPS a.a-b.bV y.yA" into `buf` at
-/// `pos`; returns the new position (NUL terminator NOT appended).
-pub fn push_pdo(buf: &mut [u8], pos: usize, pdo: &Pdo) -> usize {
-    let mut p = pos;
-    if pdo.is_pps {
-        for &b in b"PPS " {
-            buf[p] = b;
-            p += 1;
+        // Selected voltage/current: "SEL 5.0V 3.0A".
+        let mut l = Line12::new();
+        for &b in b"SEL " {
+            l.push(&[b]);
         }
-        p = push_num_dec(buf, p, pdo.min_mv / 100, 1);
-        buf[p] = b'-';
-        p += 1;
+        if mv >= 1000 {
+            l.num_u32(u32::from(mv), 1);
+            l.push(b"V ");
+        } else {
+            l.push(b"- ");
+        }
+        if ma >= 1000 {
+            l.num_u32(u32::from(ma), 0);
+            l.push(b"MA");
+        } else {
+            l.push(b"-MA");
+        }
+        l.pad();
+        lcd.draw_text(8, 90, l.bytes(), 2, GREEN, BLACK).await;
+
+        // Flags: "ACC:1 RDY:0 CON:1".
+        let acc = u8::from(view.accept.load(core::sync::atomic::Ordering::Relaxed));
+        let rdy = u8::from(view.psrdy.load(core::sync::atomic::Ordering::Relaxed));
+        let con = u8::from(view.contract.load(core::sync::atomic::Ordering::Relaxed));
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        for &b in b"ACC:1 RDY:1 CON:1" {
+            line[n] = b;
+            n += 1;
+        }
+        line[4] = b'0' + acc;
+        line[10] = b'0' + rdy;
+        line[16] = b'0' + con;
+        line[n] = 0;
+        text(lcd, 8, 130, &line, 2, CYAN).await;
+
+        // Diagnostics: "REV:3 ERR:0 PK:12".
+        let rev = view.peer_rev.load(core::sync::atomic::Ordering::Relaxed);
+        let pk = view.rx_packets.load(core::sync::atomic::Ordering::Relaxed);
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        for &b in b"REV:0 ERR:0 PK:0" {
+            line[n] = b;
+            n += 1;
+        }
+        line[4] = b'0' + (rev % 10);
+        line[11] = b'0' + (err % 10) as u8;
+        let mut pk_n = 0;
+        let mut v = pk;
+        while v > 0 && n + 1 < line.len() {
+            line[n - pk_n] = b'0' + (v % 10) as u8;
+            pk_n += 1;
+            v /= 10;
+        }
+        if pk == 0 {
+            line[n - 1] = b'0';
+        }
+        line[n] = 0;
+        text(lcd, 8, 160, &line, 2, YELLOW).await;
     }
-    p = push_num_dec(buf, p, pdo.mv / 100, 1);
-    buf[p] = b'V';
-    p += 1;
-    buf[p] = b' ';
-    p += 1;
-    if pdo.ma >= 1000 {
-        p = push_num_dec(buf, p, pdo.ma / 100, 1);
-        buf[p] = b'A';
-    } else {
-        p = push_num_dec(buf, p, pdo.ma, 0);
-        buf[p] = b'm';
-        buf[p + 1] = b'A';
-        p += 1;
-    }
-    p + 1
 }
 
 /// 12-char NUL-terminated line buffer for the meter rows.
@@ -335,10 +322,6 @@ impl Line12 {
             self.buf[self.len] = b' ';
             self.len += 1;
         }
-    }
-
-    pub fn as_ptr(&self) -> *const u8 {
-        self.buf.as_ptr()
     }
 
     pub fn bytes(&self) -> &[u8] {

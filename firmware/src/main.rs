@@ -17,9 +17,10 @@
 #![no_main]
 
 mod board;
+mod pd_phy;
+mod pd_task;
 mod buttons;
 mod lcd;
-mod pd;
 mod pin_trace;
 mod ui;
 
@@ -35,10 +36,9 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r112";
+const BUILD: &[u8] = b"r113";
 
 use crate::ui::Press;
-use crate::ui::push_pdo;
 use crate::ui::Screen;
 use crate::ui::Ui;
 use core::sync::atomic::AtomicU32;
@@ -67,7 +67,7 @@ unsafe extern "C" {
 extern "C" fn fnb58_usbd_event_hook() {}
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     // Crystal clock: 192 MHz PLL, USB /4.
     let Ok((clocks, _)) =
         (unsafe { embassy_at32::clocks::configure_usb(board::HEXT_HZ) })
@@ -106,7 +106,7 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r112: rust i2c\r\n").await;
+    say(b"[lcd] FNB58 r113: fusb crate\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -121,19 +121,19 @@ async fn main(_spawner: Spawner) {
     say(b"[lcd] pattern drawn\r\n").await;
     Timer::after_millis(1500).await;
 
-    // --- r55: meter transport on the Rust embassy I2C driver ---
-    // First hardware run of the HAL driver (host-tested only until now).
-    // The C glue's boot check above already proved the bus; this is the
-    // Rust engine doing the live measurement.
+    // --- r113: I2C1 goes to the PD task's shared bus ---
+    // PB6/PB7 as I2C1 mux open-drain, then the async master at 100 kHz.
+    // The bus lives in pd_task::BUS: the meter leases it per read, the
+    // vendored fusb302-pd session per transaction (each spun to
+    // completion inside its lease).
     use embedded_hal_async::i2c::Operation;
     use embedded_hal_async::i2c::I2c as _;
     use embassy_at32::gpio::{AlternatePin, Drive, Port};
     use embassy_at32::i2c::{I2c, Speed};
 
-    // PB6/PB7 as I2C1 mux open-drain, then the async master at 100 kHz.
     let _scl = unsafe { AlternatePin::new_open_drain(Port::B, 6, Drive::Moderate) };
     let _sda = unsafe { AlternatePin::new_open_drain(Port::B, 7, Drive::Moderate) };
-    let mut tpa = match unsafe { I2c::new_i2c1(clocks.pclk1_hz, Speed::Standard) } {
+    let i2c = match unsafe { I2c::new_i2c1(clocks.pclk1_hz, Speed::Standard) } {
         Ok(i2c) => i2c,
         Err(_) => {
             say(b"[meter] rust i2c config FAIL\r\n").await;
@@ -142,15 +142,20 @@ async fn main(_spawner: Spawner) {
             }
         }
     };
-
-    async fn tpa_write(tpa: &mut I2c, reg: u8, val: u16) -> Result<(), embassy_at32::i2c::Error> {
-        let mut wr = [reg, (val >> 8) as u8, val as u8];
-        tpa.transaction(0x40, &mut [Operation::Write(&mut wr)]).await
+    {
+        let mut guard = pd_task::BUS.lock().await;
+        *guard = pd_task::BusCell(Some(i2c));
     }
-    async fn tpa_read(tpa: &mut I2c, reg: u8) -> Result<u16, embassy_at32::i2c::Error> {
+    spawner.spawn(pd_task::run().expect("one pd task"));
+
+    async fn tpa_write(bus: &mut I2c, reg: u8, val: u16) -> Result<(), embassy_at32::i2c::Error> {
+        let mut wr = [reg, (val >> 8) as u8, val as u8];
+        bus.transaction(0x40, &mut [Operation::Write(&mut wr)]).await
+    }
+    async fn tpa_read(bus: &mut I2c, reg: u8) -> Result<u16, embassy_at32::i2c::Error> {
         let mut reg_buf = [reg];
         let mut buf = [0u8; 2];
-        tpa.transaction(
+        bus.transaction(
             0x40,
             &mut [Operation::Write(&mut reg_buf), Operation::Read(&mut buf)],
         )
@@ -159,26 +164,30 @@ async fn main(_spawner: Spawner) {
     }
 
     // Identify + configure the TPA626 (INA226 protocol).
-    match tpa_read(&mut tpa, 0xFE).await {
-        Ok(0x5549) => say(b"[meter] rust i2c OK mfr=5549\r\n").await,
-        Ok(v) => {
-            let mut d = [0u8; 96];
-            let mut n = 0;
-            for &b in b"[meter] rust i2c mfr ODD=" {
-                d[n] = b;
-                n += 1;
+    {
+        let mut guard = pd_task::BUS.lock().await;
+        match tpa_read(guard.0.as_mut().expect("I2C1"), 0xFE).await {
+            Ok(0x5549) => say(b"[meter] rust i2c OK mfr=5549\r\n").await,
+            Ok(v) => {
+                let mut d = [0u8; 96];
+                let mut n = 0;
+                for &b in b"[meter] rust i2c mfr ODD=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                n = push_hex8(&mut d, n, v as u32);
+                d[n] = 13;
+                d[n + 1] = 10;
+                unsafe { fnb58_usb_send(d.as_ptr(), (n + 2) as u16) };
+                Timer::after_millis(500).await;
             }
-            n = push_hex8(&mut d, n, v as u32);
-            d[n] = 13;
-            d[n + 1] = 10;
-            unsafe { fnb58_usb_send(d.as_ptr(), (n + 2) as u16) };
-            Timer::after_millis(500).await;
+            Err(_) => say(b"[meter] rust i2c read FAIL\r\n").await,
         }
-        Err(_) => say(b"[meter] rust i2c read FAIL\r\n").await,
+        let bus = guard.0.as_mut().expect("I2C1");
+        let _ = tpa_write(bus, 0x00, 0x4897).await; // AVG=64, cont
+        let cal: u16 = (5_120_000u32 / 500u32) as u16; // 10 mOhm shunt, 50 uA LSB
+        let _ = tpa_write(bus, 0x05, cal).await;
     }
-    let _ = tpa_write(&mut tpa, 0x00, 0x4897).await; // AVG=64, cont
-    let cal: u16 = (5_120_000u32 / 500u32) as u16; // 10 mOhm shunt, 50 uA LSB
-    let _ = tpa_write(&mut tpa, 0x05, cal).await;
     say(b"[meter] rust tpa configured\r\n").await;
 
     // --- UI: POWER + PD screens; buttons navigate (r70) ---
@@ -237,18 +246,10 @@ async fn main(_spawner: Spawner) {
         cortex_m::peripheral::NVIC::unmask(interrupt::EXINT15_10);
     }
 
-    // r88: no FUSB302 init at boot. `pd_on` gates EVERY pd:: call — the
-    // controller powers up only on the first explicit scan (OK on the PD
-    // screen); from then on the poll keeps the sink contract alive.
-    let mut caps = pd::SourceCaps::default();
-    let mut listener = pd::Listener::default();
-    let mut pd_on = false;
-    // r93: the line each scan transmits/receives on — starts on the line
-    // init() measured, then every OK press flips to the other one. The
-    // r91/r92 logs (self-TX heard on CC1 with both drivers armed,
-    // silence on CC2 with TXCC2 alone) make the TX path the open
-    // question; alternating answers it in one session.
-    let mut scan_cc = 0u8;
+    // r113: PD runs in its own task on the vendored fusb302-pd stack.
+    // The main loop only raises the START signal (OK on the PD screen),
+    // keeps the pressed-button bitmask current (BACK stops the session),
+    // and renders pd_task::VIEW.
 
     let mut tick: u32 = 0;
     // LEXT probe: enable the 32.768 kHz crystal oscillator on PC14/PC15
@@ -338,21 +339,15 @@ async fn main(_spawner: Spawner) {
             INT_COUNT.fetch_add(1, Ordering::Relaxed);
         }
 
-        // PD poll — every iteration (the 10 ms fallback cadence), plus
-        // immediately after each FUSB302 INT_N edge: the interrupt wake
-        // is what makes the Request meet tSenderResponse reliably.
-        if pd_on {
-            if matches!(pd::poll(&mut tpa, &mut caps, &mut listener).await, Ok(true)) {
-                report_caps(&caps, &mut sender);
-                report_request(&mut sender, &listener);
-            }
-            if ui.screen == Screen::Pd {
-                ui.draw_pd(&mut lcd, &caps).await;
-            }
+        // r113: the PD screen renders the engine view; the session runs
+        // in its own task on the shared bus.
+        if ui.screen == Screen::Pd {
+            ui.draw_pd(&mut lcd, &pd_task::VIEW).await;
         }
 
         // Buttons: debounced active-low (50 ms at this cadence); events
         // to the console queue, presses drive the UI screens.
+        let mut held: u8 = 0;
         while let Some((i, down)) = btns.poll() {
             let name = buttons::Buttons::name(i);
             let mut line = [0u8; 64];
@@ -371,139 +366,37 @@ async fn main(_spawner: Spawner) {
             }
             sender.push(&line[..w]);
 
+            if down {
+                held |= 1 << i;
+            } else {
+                held &= !(1 << i);
+            }
             if !down {
                 continue;
             }
             match ui.on_press(i) {
                 Press::Switch(screen) => ui.enter(&mut lcd, screen).await,
                 Press::Discover => {
-                    // r104: re-init on EVERY scan. The r103 log showed
-                    // the first scan after a cold boot works end-to-end
-                    // (fresh FUSB302 state) while every later scan on
-                    // the same chip state fails to transmit (r=2: no
-                    // TXSENT, no RETRYFAIL — the transmitter never
-                    // starts). The full reset + config replicates the
-                    // working state each press.
-                    match pd::init(&mut tpa).await {
-                        Ok((id, cc)) => {
-                            pd_on = true;
-                            scan_cc = cc;
-                            listener.set_cc(cc);
-                            let st = pd::status(&mut tpa).await;
-                                let mut d = [0u8; 64];
-                                let mut n = 0;
-                                for &b in b"[pd] fusb302 id=" {
-                                    d[n] = b;
-                                    n += 1;
-                                }
-                                n = push_hex8(&mut d, n, id as u32);
-                                for &b in b" cc=" {
-                                    d[n] = b;
-                                    n += 1;
-                                }
-                                d[n] = b'0' + cc;
-                                n += 1;
-                                for &b in b" st=" {
-                                    d[n] = b;
-                                    n += 1;
-                                }
-                                if let Ok((st0, st1)) = st {
-                                    n = push_hex8(&mut d, n, st0 as u32);
-                                    d[n] = b'/';
-                                    n += 1;
-                                    n = push_hex8(&mut d, n, st1 as u32);
-                                } else {
-                                    for &b in b"ERR" {
-                                        d[n] = b;
-                                        n += 1;
-                                    }
-                                }
-                                d[n] = b'\r';
-                                d[n + 1] = b'\n';
-                                sender.push(&d[..n + 2]);
-                        }
-                        Err(_) => sender.push(b"[pd] init FAIL\r\n"),
-                    }
-                    if pd_on {
-                        // r107: discover() itself re-measures the
-                        // orientation, routes (incl. the GoodCRC spec
-                        // revision) and soft-resets before asking.
-                        let acked = match pd::discover(&mut tpa, &mut caps, &mut listener).await {
-                            Ok(true) => {
-                                report_caps(&caps, &mut sender);
-                                report_request(&mut sender, &listener);
-                                sender.push(b"[pd] contract requested\r\n");
-                                true
-                            }
-                            Ok(false) => false,
-                            Err(_) => false,
-                        };
-                        // Per-scan evidence on ONE line (the pd=1 diag
-                        // lines tend to scroll away): soft-reset ack, TX
-                        // outcome, ever-acked-incoming, and a raw dump of
-                        // whatever still sits in the RX FIFO.
-                        let mut d = [0u8; 96];
-                        let mut n = 0;
-                        for &b in b"[pd] scan cc=" {
-                            d[n] = b;
-                            n += 1;
-                        }
-                        d[n] = b'0' + scan_cc;
-                        n += 1;
-                        // BC_LVL of both lines at the scan's orientation
-                        // measure (r103: high nibble CC1, low CC2; 0 = no
-                        // Rp on that line — the port state in one byte).
-                        let mm = listener.meas();
-                        for &b in b" m=" {
-                            d[n] = b;
-                            n += 1;
-                        }
-                        n = push_hex8(&mut d, n, ((mm[0] << 4) | mm[1]) as u32);
-                        for &b in b" r=" {
-                            d[n] = b;
-                            n += 1;
-                        }
-                        n = push_dec(&mut d, n, listener.last_tx_code() as u32);
-                        for &b in b" g=" {
-                            d[n] = b;
-                            n += 1;
-                        }
-                        d[n] = b'0' + listener.gcrc_seen() as u8;
-                        n += 1;
-                        for &b in b" x=" {
-                            d[n] = b;
-                            n += 1;
-                        }
-                        d[n] = b'0' + listener.collided() as u8;
-                        n += 1;
-                        if !acked {
-                            for &b in b" f=" {
-                                d[n] = b;
-                                n += 1;
-                            }
-                            n += pd::rx_dump(&mut tpa, &mut d[n..]).await;
-                        }
-                        if acked {
-                            for &b in b" ACKED" {
-                                d[n] = b;
-                                n += 1;
-                            }
-                        }
-                        d[n] = b'\r';
-                        d[n + 1] = b'\n';
-                        sender.push(&d[..n + 2]);
-                    }
+                    // r113: the session task does everything — CC
+                    // diagnostic, engine startup, negotiation. BACK held
+                    // during the session stops it; the screen shows the
+                    // engine view.
+                    sender.push(b"[pd] session requested\r\n");
+                    pd_task::START.signal(());
                 }
                 Press::None => {}
             }
         }
+        pd_task::BTN.store(held, Ordering::Relaxed);
 
         // Meter: 200 ms cadence (screen values; TPA conversion window).
         if tick % 20 == 0 {
+            let mut guard = pd_task::BUS.lock().await;
+            let bus = guard.0.as_mut().expect("I2C1");
             let ok = match (
-                tpa_read(&mut tpa, 0x02).await,
-                tpa_read(&mut tpa, 0x04).await,
-                tpa_read(&mut tpa, 0x03).await,
+                tpa_read(bus, 0x02).await,
+                tpa_read(bus, 0x04).await,
+                tpa_read(bus, 0x03).await,
             ) {
                 (Ok(bus), Ok(cur), Ok(pwr)) => {
                     let mv = (bus as u32 * 5) / 4; // 1.25 mV/LSB
@@ -557,11 +450,17 @@ async fn main(_spawner: Spawner) {
                 d[n] = b;
                 n += 1;
             }
-            d[n] = b'0' + pd_on as u8;
-            n += 1;
-            if pd_on {
-                n = listener.write_diag(&mut d, n);
-            } else {
+            for &b in b" ph=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, u32::from(pd_task::VIEW.phase.load(Ordering::Relaxed)));
+            for &b in b" err=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, u32::from(pd_task::VIEW.error.load(Ordering::Relaxed)));
+            if true {
                 d[n] = b'\r';
                 d[n + 1] = b'\n';
                 n += 2;
@@ -571,70 +470,6 @@ async fn main(_spawner: Spawner) {
 
         sender.drain();
     }
-}
-
-/// Report new source capabilities to the console queue (the PD
-/// screen in ui.rs owns the on-screen list).
-fn report_caps(caps: &pd::SourceCaps, out: &mut Sender) {
-    // Console header.
-    let mut d = [0u8; 96];
-    let mut n = 0;
-    for &b in b"[pd] src caps " {
-        d[n] = b;
-        n += 1;
-    }
-    n = push_dec(&mut d, n, caps.n as u32);
-    for &b in b" PDOs" {
-        d[n] = b;
-        n += 1;
-    }
-    d[n] = 13;
-    d[n + 1] = 10;
-    n += 2;
-    out.push(&d[..n]);
-
-    for i in 0..caps.n {
-        let mut d = [0u8; 96];
-        let mut n = 0;
-        for &b in b"[pd]  " {
-            d[n] = b;
-            n += 1;
-        }
-        n = push_pdo(&mut d, n, &caps.pdos[i]);
-        d[n] = 13;
-        d[n + 1] = 10;
-        n += 2;
-        out.push(&d[..n]);
-    }
-
-}
-
-/// Report the auto-Request's transmission outcome after a caps capture
-/// (0 = acked — the contract should stand; 1 = retryfail; 2 = timeout),
-/// plus the r108 wedge evidence: STATUS1 after the attempt (TX_FULL =
-/// tokens never consumed; TX_EMPTY = consumed, protocol layer silent)
-/// and the raw INTERRUPTA byte.
-fn report_request(out: &mut Sender, lis: &pd::Listener) {
-    let mut d = [0u8; 48];
-    let mut n = 0;
-    for &b in b"[pd] request r=" {
-        d[n] = b;
-        n += 1;
-    }
-    n = push_dec(&mut d, n, lis.last_tx_code() as u32);
-    for &b in b" s1=" {
-        d[n] = b;
-        n += 1;
-    }
-    n = push_hex8(&mut d, n, lis.st1() as u32);
-    for &b in b" ia=" {
-        d[n] = b;
-        n += 1;
-    }
-    n = push_hex8(&mut d, n, lis.ia() as u32);
-    d[n] = b'\r';
-    d[n + 1] = b'\n';
-    out.push(&d[..n + 2]);
 }
 
 /// CDC line queue. The vendor send rejects a second call while one is in

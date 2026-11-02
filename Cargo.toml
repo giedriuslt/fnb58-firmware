@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["firmware"]
+members = ["firmware", "fusb302-pd"]
 
 [workspace.dependencies]
 cortex-m = "0.7.10"
@@ -10,6 +10,11 @@ embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "execu
 embassy-time = { version = "0.5.1", features = ["tick-hz-1_000"] }
 embassy-sync = "0.8.0"
 embedded-hal-async = "1.0.0"
+fusb302-pd = { path = "fusb302-pd" }
+# The sink engine (Selection/Trial/Limits) and the driver traits, pinned to
+# the revisions kws-x1 ships against.
+pd-protocol = { git = "https://github.com/kralonur/embedded-charging-protocols-rs", rev = "2c3d511cb7214f1db9f5e3528900e1fd9d1bc323" }
+usbpd-traits = { git = "https://github.com/kralonur/usbpd", rev = "16b13a23dafad6c5dd0c18801ee978b785730f83" }
 
 [profile.release]
 opt-level = "z"
