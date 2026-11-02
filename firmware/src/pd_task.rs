@@ -309,9 +309,69 @@ pub async fn run() {
         };
         let Some(report) = report else { continue };
 
-        // The persistent sink session: the engine selects the target and
-        // drives Requests; our Platform supplies VBUS and policy.
-        let selection = pd_spr::Selection::new();
+        // --- Phase A: the kick (kws-x1's restart_unheard flow). The
+        // charger's policy engine has been asleep since attach (it
+        // announced caps, nothing requested, it gave up): the
+        // spec-sanctioned sink wake is Hard Reset Signaling —
+        // PE_SNK_Wait_For_Capabilities times out into Hard Reset. The
+        // ordered set consumes no MessageID, and the charger restarts
+        // into a FRESH attach whose policy engine is listening.
+        {
+            let config = pd_phy::Config {
+                persistent: false,
+                selection: None,
+                control: None,
+                identity_started: None,
+                publish: Some(&publish),
+                trace_steps: true,
+                trace_cable: false,
+                stop_requested: Some(stop_requested),
+                svids: None,
+                emarker: false,
+            };
+            let mut bus = SharedBus;
+            let clock = PdClock;
+            let mut delay = embassy_time::Delay;
+            let observation = Observation::new();
+            let (mut phy, started) =
+                pd_phy::Session::start(&mut bus, &mut delay, &clock, config, observation, report)
+                    .await;
+            let mut error = started.err();
+            if error.is_none() {
+                match phy.restart_unheard().await {
+                    Ok(()) if phy.hard_reset_sent() => {
+                        // The charger reset VBUS: wait out the cycle back
+                        // to vSafe5V, with the boot baseline restored.
+                        if let Err(failure) = phy.transition_to_default().await {
+                            error = Some(failure);
+                        }
+                    }
+                    Ok(()) => error = Some(pd_phy::Error::TxTimeout),
+                    Err(failure) => error = Some(failure),
+                }
+            }
+            if error.is_none() {
+                error = phy.take_error();
+            }
+            if let Some(failure) = &error {
+                let code = error_code(failure);
+                VIEW.error.store(code, Ordering::Relaxed);
+                if code == 3 {
+                    // VBUS outside the start window: settling, retryable.
+                    continue;
+                }
+                // Anything else: still run the main session — a refused
+                // kick costs nothing on a restored baseline.
+            }
+            if !phy.stopped() {
+                phy.stop();
+            }
+        }
+
+        // --- Phase B: the persistent sink session on the fresh attach.
+        // The engine selects the target and drives Requests; our Platform
+        // supplies VBUS and policy.
+        let selection = pd_spr::Selection::<FnbLimits>::new();
         let config = pd_phy::Config {
             persistent: true,
             selection: Some(&selection),
@@ -324,6 +384,60 @@ pub async fn run() {
             svids: None,
             emarker: false,
         };
+        let report = {
+            let mut guard = BUS.lock().await;
+            let Some(bus) = guard.0.as_mut() else {
+                continue;
+            };
+            if restore_baseline(bus).await.is_err() {
+                VIEW.error.store(0x300, Ordering::Relaxed);
+                continue;
+            }
+            let snapshot = match fusb302_pd::snapshot::snapshot(bus).await {
+                Ok(snapshot) => snapshot,
+                Err(failure) => {
+                    VIEW.error.store(u16::from(failure.register) | 0x100, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            VIEW.phase.store(phase_code(Phase::Measuring), Ordering::Relaxed);
+            let mut delay = embassy_time::Delay;
+            match fusb302_pd::startup::Diagnostic::once(
+                <crate::pd_phy::FnbPlatform as fusb302_pd::phy::Platform>::BASELINE,
+                MEASURE,
+            )
+            .run(bus, &mut delay, snapshot)
+            .await
+            {
+                Ok(report) => {
+                    VIEW.cc1.store(report.status[0], Ordering::Relaxed);
+                    VIEW.cc2.store(report.status[1], Ordering::Relaxed);
+                    VIEW.listen.store(
+                        u8::from(report.listen.is_some_and(|l| l.traffic.is_some())),
+                        Ordering::Relaxed,
+                    );
+                    Some(report)
+                }
+                Err(failure) => {
+                    VIEW.error.store(
+                        match failure.error {
+                            fusb302_pd::config::Error::Baseline { register, .. }
+                            | fusb302_pd::config::Error::Verify { register, .. } => {
+                                u16::from(register) | 0x100
+                            }
+                            fusb302_pd::config::Error::Bus { register, .. } => {
+                                u16::from(register) | 0x200
+                            }
+                        },
+                        Ordering::Relaxed,
+                    );
+                    None
+                }
+            }
+        };
+        let Some(report) = report else { continue };
+
+        let selection = pd_spr::Selection::<FnbLimits>::new();
         let mut bus = SharedBus;
         let clock = PdClock;
         let mut delay = embassy_time::Delay;

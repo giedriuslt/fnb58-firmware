@@ -36,7 +36,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r116";
+const BUILD: &[u8] = b"r117";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -106,7 +106,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r116: trace\r\n").await;
+    say(b"[lcd] FNB58 r117: hr kick\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -462,11 +462,39 @@ async fn main(spawner: Spawner) {
                 n += 1;
             }
             n = push_dec(&mut d, n, u32::from(pd_task::VIEW.error.load(Ordering::Relaxed)));
-            if true {
-                d[n] = b'\r';
-                d[n + 1] = b'\n';
-                n += 2;
+            for &b in b" cc=" {
+                d[n] = b;
+                n += 1;
             }
+            let cc1 = pd_task::VIEW.cc1.load(Ordering::Relaxed);
+            let cc2 = pd_task::VIEW.cc2.load(Ordering::Relaxed);
+            n = push_hex8(&mut d, n, (u32::from(cc1) << 4) | u32::from(cc2));
+            for &b in b" li=" {
+                d[n] = b;
+                n += 1;
+            }
+            d[n] = b'0' + pd_task::VIEW.listen.load(Ordering::Relaxed);
+            n += 1;
+            for &b in b" st=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, u32::from(pd_task::VIEW.boot_step.load(Ordering::Relaxed)));
+            d[n] = b'/';
+            n += 1;
+            d[n] = b'0' + u8::from(pd_task::VIEW.tx_written.load(Ordering::Relaxed));
+            n += 1;
+            d[n] = b'/';
+            n += 1;
+            n = push_dec(&mut d, n, u32::from(pd_task::VIEW.rx_packets.load(Ordering::Relaxed)));
+            for &b in b" rxe=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, u32::from(pd_task::VIEW.rx_error.load(Ordering::Relaxed)));
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            n += 2;
             sender.push(&d[..n]);
         }
 
