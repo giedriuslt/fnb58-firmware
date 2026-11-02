@@ -36,7 +36,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r114";
+const BUILD: &[u8] = b"r115";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -106,7 +106,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r114: baseline fix\r\n").await;
+    say(b"[lcd] FNB58 r115: engine codes\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -309,6 +309,9 @@ async fn main(spawner: Spawner) {
     // One-time ISR proof per EXINT line (the buttons double as the
     // interrupt canary; line 13 = the FUSB302 INT_N).
     let mut isr_seen = [false; 16];
+    // Held-button bitmask for the PD session's stop gate (persists across
+    // loop iterations; r114 reset it every pass, breaking BACK-stop).
+    let mut held: u8 = 0;
 
     loop {
         // Wake on ANY EXTI edge (buttons, FUSB302 INT_N) or every 10 ms
@@ -347,7 +350,6 @@ async fn main(spawner: Spawner) {
 
         // Buttons: debounced active-low (50 ms at this cadence); events
         // to the console queue, presses drive the UI screens.
-        let mut held: u8 = 0;
         while let Some((i, down)) = btns.poll() {
             let name = buttons::Buttons::name(i);
             let mut line = [0u8; 64];

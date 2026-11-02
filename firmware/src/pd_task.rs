@@ -66,6 +66,11 @@ pub struct View {
     /// `pd_phy::Error` code, 0 = none.
     pub error: AtomicU16,
     pub vbus_mv: AtomicU16,
+    /// CC diagnostic: BC_LVL of both lines at the last attempt.
+    pub cc1: AtomicU8,
+    pub cc2: AtomicU8,
+    /// The diagnostic's listen verdict (0 none, 1 traffic seen).
+    pub listen: AtomicU8,
 }
 
 pub static VIEW: View = View {
@@ -79,6 +84,9 @@ pub static VIEW: View = View {
     rx_packets: AtomicU16::new(0),
     error: AtomicU16::new(0),
     vbus_mv: AtomicU16::new(0),
+    cc1: AtomicU8::new(0),
+    cc2: AtomicU8::new(0),
+    listen: AtomicU8::new(0),
 };
 
 fn phase_code(phase: Phase) -> u8 {
@@ -174,6 +182,25 @@ fn error_code(error: &pd_phy::Error<embassy_at32::i2c::Error>) -> u16 {
     }
 }
 
+/// The ENGINE's error mapped to kws-x1's rx_error numbering (32..=44) —
+/// r114's log ended sessions silently because these were dropped.
+fn engine_error_code(failure: &pd_spr::Error) -> u16 {
+    match failure {
+        pd_spr::Error::Stopped => 32,
+        pd_spr::Error::UnsupportedPhy => 33,
+        pd_spr::Error::UnsafeCapabilities => 34,
+        pd_spr::Error::Peer => 35,
+        pd_spr::Error::ReceiveDiscarded => 36,
+        pd_spr::Error::HardResetReceived => 37,
+        pd_spr::Error::HardResetSent => 44,
+        pd_spr::Error::Transmit(_) => 38,
+        pd_spr::Error::Declined(_) => 39,
+        pd_spr::Error::RecoveryBlocked => 40,
+        pd_spr::Error::TransmissionBlocked => 41,
+        pd_spr::Error::Engine(_) => 42,
+    }
+}
+
 struct PdClock;
 impl fusb302_pd::phy::Clock for PdClock {
     fn now_ms(&self) -> u64 {
@@ -204,7 +231,6 @@ impl pd_spr::Timer for PdClock {
 #[embassy_executor::task]
 pub async fn run() {
     loop {
-        VIEW.phase.store(0, Ordering::Relaxed);
         START.wait().await;
 
         // One-shot CC diagnostic on the power-on configuration: measures
@@ -238,7 +264,17 @@ pub async fn run() {
             .run(bus, &mut delay, snapshot)
             .await
             {
-                Ok(report) => Some(report),
+                Ok(report) => {
+                    VIEW.cc1.store(report.status[0], Ordering::Relaxed);
+                    VIEW.cc2.store(report.status[1], Ordering::Relaxed);
+                    VIEW.listen.store(
+                        u8::from(
+                        report.listen.is_some_and(|l| l.traffic.is_some()),
+                    ),
+                        Ordering::Relaxed,
+                    );
+                    Some(report)
+                }
                 Err(failure) => {
                     // Baseline/verify failures report the offending
                     // register in the low byte.
@@ -290,18 +326,23 @@ pub async fn run() {
         )
         .await;
         let mut error = started.err();
+        let mut engine_code = 0u16;
         if error.is_none() {
             let trace = RefCell::new(pd_spr::MaintainedTrace::default());
             let mut trial = pd_spr::Trial::maintained();
-            if let Err(failure) = trial
+            match trial
                 .run_selectable::<_, PdClock>(&mut phy, &trace, &selection)
                 .await
             {
-                error = phy.take_error();
-                if error.is_none() {
-                    // The engine stopped itself (StopRequested) or failed:
-                    // finish the contract cleanly when it exists.
-                    if matches!(failure, pd_spr::Error::Stopped) {
+                // The engine loop ended without a stop request: kws-x1
+                // codes this 43 (should not happen for a persistent run).
+                Ok(()) => engine_code = 43,
+                Err(failure) => {
+                    engine_code = engine_error_code(&failure);
+                    error = phy.take_error();
+                    if error.is_none() && matches!(failure, pd_spr::Error::Stopped) {
+                        // The engine stopped itself: finish the contract
+                        // cleanly when it exists.
                         let contract = trace.borrow().contract.clone();
                         if let Some(contract) = contract {
                             if let Err(f) = phy.finish(&contract).await {
@@ -326,6 +367,9 @@ pub async fn run() {
             }
         }
         publish(phy.observation);
+        if error.is_none() && engine_code != 0 {
+            VIEW.error.store(engine_code, Ordering::Relaxed);
+        }
         if !phy.stopped() {
             phy.stop();
         }
