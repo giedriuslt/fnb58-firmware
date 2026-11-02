@@ -16,6 +16,16 @@ charger on demand.
   (TPA626 meter, FUSB302 PD) runs through the HAL's `i2c::I2c` driver
   on PB6/PB7; the vendor C i2c code (glue + `i2c_application`
   middleware) is removed from the build.
+- **PD**: the **vendored [`fusb302-pd`] crate, unchanged** (r113), with
+  `pd-protocol` (Selection/Trial/Limits sink engine) and `usbpd-traits`
+  pinned to the revisions kws-x1 ships against. The board supplies
+  `pd_phy.rs` (FnbPlatform: power-on baseline, MDAC, VBUS via the
+  TPA626; FnbLimits sink policy) and the `GatedBus` over the shared
+  I2C1 (one Mutex lease per transaction, transfers spun to completion
+  inside their lease). The sink session runs as its own embassy task;
+  the UI renders its published view.
+
+[`fusb302-pd`]: https://github.com/kralonur/kws-x1-standalone-rs/tree/master/fusb302-pd
 - **LCD**: **Rust on the embassy HAL** (r111, `src/lcd.rs`) — SPI2 +
   GPIO pins driven by the HAL's `Spi`/`OutputPin`, a 1:1 port of the
   proven C driver (same init sequence, 5x7 font, 12 MHz rate); bulk
