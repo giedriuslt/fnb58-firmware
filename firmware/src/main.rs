@@ -36,7 +36,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r118";
+const BUILD: &[u8] = b"r119";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -79,6 +79,25 @@ async fn main(spawner: Spawner) {
     unsafe { embassy_at32::init(clocks) };
     unsafe { cortex_m::interrupt::enable() };
 
+    // --- r119: the PD session starts AT BOOT (kws-x1 flow) ---
+    // The charger is still announcing its capabilities for ~10 s after
+    // attach; the earlier the engine's passive wait begins, the more of
+    // that window it catches. The I2C1 bus goes into the shared cell and
+    // the task spawns before the (up to 3 s) USB wait.
+    {
+        use embassy_at32::gpio::{AlternatePin, Drive, Port};
+        use embassy_at32::i2c::{I2c, Speed};
+
+        let _scl = unsafe { AlternatePin::new_open_drain(Port::B, 6, Drive::Moderate) };
+        let _sda = unsafe { AlternatePin::new_open_drain(Port::B, 7, Drive::Moderate) };
+        let i2c = unsafe { I2c::new_i2c1(clocks.pclk1_hz, Speed::Standard) };
+        {
+            let mut guard = pd_task::BUS.lock().await;
+            *guard = pd_task::BusCell(i2c.ok());
+        }
+        spawner.spawn(pd_task::run().expect("one pd task"));
+    }
+
     // Unmask USB interrupt lines.
     use embassy_at32::pac::at32f403a::interrupt;
     unsafe {
@@ -106,7 +125,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r118: gsc inject\r\n").await;
+    say(b"[lcd] FNB58 r119: kws flow\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -121,38 +140,15 @@ async fn main(spawner: Spawner) {
     say(b"[lcd] pattern drawn\r\n").await;
     Timer::after_millis(1500).await;
 
-    // --- r113: I2C1 goes to the PD task's shared bus ---
-    // PB6/PB7 as I2C1 mux open-drain, then the async master at 100 kHz.
-    // The bus lives in pd_task::BUS: the meter leases it per read, the
-    // vendored fusb302-pd session per transaction (each spun to
-    // completion inside its lease).
+    // --- the meter leases the shared I2C1 bus per read (r113) ---
     use embedded_hal_async::i2c::Operation;
     use embedded_hal_async::i2c::I2c as _;
-    use embassy_at32::gpio::{AlternatePin, Drive, Port};
-    use embassy_at32::i2c::{I2c, Speed};
 
-    let _scl = unsafe { AlternatePin::new_open_drain(Port::B, 6, Drive::Moderate) };
-    let _sda = unsafe { AlternatePin::new_open_drain(Port::B, 7, Drive::Moderate) };
-    let i2c = match unsafe { I2c::new_i2c1(clocks.pclk1_hz, Speed::Standard) } {
-        Ok(i2c) => i2c,
-        Err(_) => {
-            say(b"[meter] rust i2c config FAIL\r\n").await;
-            loop {
-                Timer::after_millis(1000).await;
-            }
-        }
-    };
-    {
-        let mut guard = pd_task::BUS.lock().await;
-        *guard = pd_task::BusCell(Some(i2c));
-    }
-    spawner.spawn(pd_task::run().expect("one pd task"));
-
-    async fn tpa_write(bus: &mut I2c, reg: u8, val: u16) -> Result<(), embassy_at32::i2c::Error> {
+    async fn tpa_write(bus: &mut embassy_at32::i2c::I2c, reg: u8, val: u16) -> Result<(), embassy_at32::i2c::Error> {
         let mut wr = [reg, (val >> 8) as u8, val as u8];
         bus.transaction(0x40, &mut [Operation::Write(&mut wr)]).await
     }
-    async fn tpa_read(bus: &mut I2c, reg: u8) -> Result<u16, embassy_at32::i2c::Error> {
+    async fn tpa_read(bus: &mut embassy_at32::i2c::I2c, reg: u8) -> Result<u16, embassy_at32::i2c::Error> {
         let mut reg_buf = [reg];
         let mut buf = [0u8; 2];
         bus.transaction(
@@ -166,27 +162,34 @@ async fn main(spawner: Spawner) {
     // Identify + configure the TPA626 (INA226 protocol).
     {
         let mut guard = pd_task::BUS.lock().await;
-        match tpa_read(guard.0.as_mut().expect("I2C1"), 0xFE).await {
-            Ok(0x5549) => say(b"[meter] rust i2c OK mfr=5549\r\n").await,
-            Ok(v) => {
-                let mut d = [0u8; 96];
-                let mut n = 0;
-                for &b in b"[meter] rust i2c mfr ODD=" {
-                    d[n] = b;
-                    n += 1;
-                }
-                n = push_hex8(&mut d, n, v as u32);
-                d[n] = 13;
-                d[n + 1] = 10;
-                unsafe { fnb58_usb_send(d.as_ptr(), (n + 2) as u16) };
-                Timer::after_millis(500).await;
-            }
-            Err(_) => say(b"[meter] rust i2c read FAIL\r\n").await,
+        if guard.0.as_mut().is_none() {
+            say(b"[meter] no i2c bus
+").await;
         }
-        let bus = guard.0.as_mut().expect("I2C1");
-        let _ = tpa_write(bus, 0x00, 0x4897).await; // AVG=64, cont
-        let cal: u16 = (5_120_000u32 / 500u32) as u16; // 10 mOhm shunt, 50 uA LSB
-        let _ = tpa_write(bus, 0x05, cal).await;
+        if let Some(bus) = guard.0.as_mut() {
+            match tpa_read(bus, 0xFE).await {
+                Ok(0x5549) => say(b"[meter] rust i2c OK mfr=5549
+").await,
+                Ok(v) => {
+                    let mut d = [0u8; 96];
+                    let mut n = 0;
+                    for &b in b"[meter] rust i2c mfr ODD=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = push_hex8(&mut d, n, v as u32);
+                    d[n] = 13;
+                    d[n + 1] = 10;
+                    unsafe { fnb58_usb_send(d.as_ptr(), (n + 2) as u16) };
+                    Timer::after_millis(500).await;
+                }
+                Err(_) => say(b"[meter] rust i2c read FAIL
+").await,
+            }
+            let _ = tpa_write(bus, 0x00, 0x4897).await; // AVG=64, cont
+            let cal: u16 = (5_120_000u32 / 500u32) as u16; // 10 mOhm shunt, 50 uA LSB
+            let _ = tpa_write(bus, 0x05, cal).await;
+        }
     }
     say(b"[meter] rust tpa configured\r\n").await;
 
@@ -394,7 +397,9 @@ async fn main(spawner: Spawner) {
         // Meter: 200 ms cadence (screen values; TPA conversion window).
         if tick % 20 == 0 {
             let mut guard = pd_task::BUS.lock().await;
-            let bus = guard.0.as_mut().expect("I2C1");
+            let Some(bus) = guard.0.as_mut() else {
+                continue;
+            };
             let ok = match (
                 tpa_read(bus, 0x02).await,
                 tpa_read(bus, 0x04).await,

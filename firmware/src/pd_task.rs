@@ -141,7 +141,7 @@ fn publish(observation: Observation) {
 }
 
 fn stop_requested() -> bool {
-    BTN.load(Ordering::Relaxed) & BACK_BIT != 0
+    BTN.load(Ordering::Relaxed) & BACK_BIT != 0 || restart_requested()
 }
 
 /// The engine's error mapped to a diagnostic code for the PD screen.
@@ -167,92 +167,6 @@ async fn restore_baseline(bus: &mut embassy_at32::i2c::I2c) -> Result<(), ()> {
     Ok(())
 }
 
-
-/// Send one raw Get_Source_Cap (control type 7) with MessageID 7 through
-/// the already-configured FUSB302 TX path. The charger acks this reliably
-/// (r93-r107) and answers with Source_Capabilities.
-async fn inject_get_source_cap(bus: &mut embassy_at32::i2c::I2c) -> Result<(), ()> {
-    use embedded_hal_async::i2c::I2c as _;
-    use embedded_hal_async::i2c::Operation;
-    const FUSB: u8 = 0x22;
-    const REG_CONTROL0: u8 = 0x06;
-    const REG_CONTROL1: u8 = 0x07;
-    const REG_STATUS0: u8 = 0x40;
-    const REG_INTERRUPTA: u8 = 0x3e;
-    const REG_FIFOS: u8 = 0x43;
-    const TX_FLUSH: u8 = 0x40;
-    const ENSOP1_RX_FLUSH: u8 = 0x05;
-    const ST0_ACTIVITY: u8 = 0x40;
-    const I_TXSENT: u8 = 0x04;
-
-    async fn wr(bus: &mut embassy_at32::i2c::I2c, reg: u8, val: u8) -> Result<(), ()> {
-        bus.transaction(FUSB, &mut [Operation::Write(&mut [reg, val])])
-            .await
-            .map_err(|_| ())
-    }
-    async fn rd(bus: &mut embassy_at32::i2c::I2c, reg: u8, out: &mut [u8]) -> Result<(), ()> {
-        bus.transaction(
-            FUSB,
-            &mut [Operation::Write(&mut [reg]), Operation::Read(out)],
-        )
-        .await
-        .map_err(|_| ())
-    }
-
-    // Never transmit into an incoming carrier.
-    for _ in 0..20 {
-        let mut st0 = [0u8; 1];
-        rd(bus, REG_STATUS0, &mut st0).await?;
-        if st0[0] & ST0_ACTIVITY == 0 {
-            break;
-        }
-        embassy_time::Timer::after_millis(1).await;
-    }
-    wr(bus, REG_CONTROL0, TX_FLUSH).await?;
-    // Clear stale INTERRUPTA flags.
-    let mut a = [0u8; 1];
-    rd(bus, REG_INTERRUPTA, &mut a).await?;
-
-    // Header: type 7 (Get_Source_Cap), MessageID 7, sink role, rev 2.0.
-    let header: u16 = 7 | (7 << 9) | (0b01 << 6);
-    let [h0, h1] = header.to_le_bytes();
-    let mut fifo = [0u8; 16];
-    let mut w = 0;
-    for &b in &[
-        0x12u8, 0x12, 0x12, 0x13, // SOP = Sync-1 x3 + Sync-2
-        0x80 | 2, // PACKSYM: 2 bytes (header only)
-        h0, h1,
-        0xFF, // JAM_CRC
-        0x14, // EOP
-        0xFE, // TXOFF
-        0xA1, // TXON
-    ] {
-        fifo[w] = b;
-        w += 1;
-    }
-    // FIFO write: register address + token sequence in one transaction.
-    let mut buf = [0u8; 17];
-    buf[0] = REG_FIFOS;
-    buf[1..1 + w].copy_from_slice(&fifo[..w]);
-    bus.transaction(FUSB, &mut [Operation::Write(&mut buf[..1 + w])])
-        .await
-        .map_err(|_| ())?;
-
-    // Wait for the GoodCRC (TXSENT) — the charger answers this reliably.
-    for _ in 0..50 {
-        let mut a = [0u8; 1];
-        rd(bus, REG_INTERRUPTA, &mut a).await?;
-        if a[0] & I_TXSENT != 0 {
-            break;
-        }
-        embassy_time::Timer::after_millis(5).await;
-    }
-    // The GoodCRC frame and the first caps response are in the RX FIFO:
-    // flush them (the charger re-announces within ~200 ms and the engine
-    // catches that). RX_FLUSH also requires ENSOP1 context per the DS.
-    wr(bus, REG_CONTROL1, ENSOP1_RX_FLUSH).await?;
-    Ok(())
-}
 
 fn error_code(error: &pd_phy::Error<embassy_at32::i2c::Error>) -> u16 {
     use pd_phy::Error as E;
@@ -328,10 +242,33 @@ impl pd_spr::Timer for PdClock {
     }
 }
 
+/// Restart requested by an OK press (the session stops, the charger is
+/// restarted with a Hard Reset, and the firmware reboots — kws-x1's exact
+/// restart sequence).
+static RESTART: AtomicBool = AtomicBool::new(false);
+
+pub fn request_restart() {
+    RESTART.store(true, Ordering::Relaxed);
+    START.signal(());
+}
+
+fn restart_requested() -> bool {
+    RESTART.load(Ordering::Relaxed)
+}
+
 #[embassy_executor::task]
 pub async fn run() {
+    // The BOOT session starts immediately: the charger is still announcing
+    // its capabilities (nCapsCount: up to ~50 announcements over ~10 s) and
+    // the engine's passive wait (~16 s budget) catches them — kws-x1's
+    // exact boot flow. Later sessions wait for an OK request.
+    let mut first = true;
     loop {
-        START.wait().await;
+        if !first {
+            START.wait().await;
+        }
+        first = false;
+        RESTART.store(false, Ordering::Relaxed);
 
         // One-shot CC diagnostic on the power-on configuration: measures
         // both CCs with Rd on both and listens for the source's traffic;
@@ -480,23 +417,6 @@ pub async fn run() {
             report,
         )
         .await;
-        // r118: the GSC injection — the charger acks Get_Source_Cap
-        // (r93-r107) and answers with caps; its GoodCRC plus the first
-        // caps response are flushed, the charger re-announces within
-        // ~200 ms, and the engine's WaitForCapabilities catches that.
-        // MessageID 7 keeps the engine's counter aligned (7+1 mod 8 = 0
-        // = the engine's first Request).
-        if started.is_ok() {
-            let mut guard = BUS.lock().await;
-            let Some(bus) = guard.0.as_mut() else {
-                continue;
-            };
-            if inject_get_source_cap(bus).await.is_err() {
-                VIEW.error.store(0x400, Ordering::Relaxed);
-                continue;
-            }
-        }
-
         let mut error = started.err();
         let mut engine_code = 0u16;
         if error.is_none() {
@@ -513,12 +433,25 @@ pub async fn run() {
                     engine_code = engine_error_code(&failure);
                     error = phy.take_error();
                     if error.is_none() && matches!(failure, pd_spr::Error::Stopped) {
-                        // The engine stopped itself: finish the contract
-                        // cleanly when it exists.
-                        let contract = trace.borrow().contract.clone();
-                        if let Some(contract) = contract {
-                            if let Err(f) = phy.finish(&contract).await {
-                                error = Some(f);
+                        // A requested stop: finish the contract cleanly
+                        // when one exists (BACK stop; a restart continues
+                        // below with the Hard Reset path instead).
+                        if restart_requested() {
+                            RESTART.store(false, Ordering::Relaxed);
+                            if phy.hard_reset_sent() {
+                                match phy.transition_to_default().await {
+                                    Ok(()) => {
+                                        cortex_m::peripheral::SCB::sys_reset();
+                                    }
+                                    Err(f) => error = Some(f),
+                                }
+                            }
+                        } else {
+                            let contract = trace.borrow().contract.clone();
+                            if let Some(contract) = contract {
+                                if let Err(f) = phy.finish(&contract).await {
+                                    error = Some(f);
+                                }
                             }
                         }
                     }
@@ -541,6 +474,20 @@ pub async fn run() {
         publish(phy.observation);
         if error.is_none() && engine_code != 0 {
             VIEW.error.store(engine_code, Ordering::Relaxed);
+        }
+
+        // kws-x1's restart: an OK-pressed stop restarts the charger with a
+        // Hard Reset, transitions to default, and reboots the firmware so
+        // the boot session starts against the fresh attach.
+        if restart_requested() && error.is_none() && engine_code == 32 && phy.hard_reset_sent() {
+            match phy.transition_to_default().await {
+                Ok(()) => {
+                    cortex_m::peripheral::SCB::sys_reset();
+                }
+                Err(failure) => {
+                    VIEW.error.store(error_code(&failure), Ordering::Relaxed);
+                }
+            }
         }
         if !phy.stopped() {
             phy.stop();
