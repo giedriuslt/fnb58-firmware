@@ -35,7 +35,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r111";
+const BUILD: &[u8] = b"r112";
 
 use crate::ui::Press;
 use crate::ui::push_pdo;
@@ -106,45 +106,10 @@ async fn main(_spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r111: rust lcd\r\n").await;
+    say(b"[lcd] FNB58 r112: rust i2c\r\n").await;
 
-    unsafe extern "C" {
-        fn fnb58_i2c_init();
-        fn fnb58_i2c_probe(addr: u16) -> u32;
-        fn fnb58_i2c_read(addr: u16, reg: u8, out: *mut u8, len: u16) -> u32;
-    }
-
-    // Hardware I2C health check: probe + a REAL hw register read of the
-    // TPA626 manufacturer id (expect 55 49).
-    {
-        unsafe { fnb58_i2c_init() };
-        let st = unsafe { fnb58_i2c_probe(0x40) };
-        let mut mfr = [0u8; 2];
-        let e = unsafe { fnb58_i2c_read(0x40, 0xFE, mfr.as_mut_ptr(), 2) };
-        let mut d = [0u8; 96];
-        let mut n = 0;
-        for &b in b"[i2c] hw FIXED st=" {
-            d[n] = b;
-            n += 1;
-        }
-        n = push_dec(&mut d, n, st);
-        for &b in b" rdE=" {
-            d[n] = b;
-            n += 1;
-        }
-        n = push_dec(&mut d, n, e);
-        for &b in b" mfr=" {
-            d[n] = b;
-            n += 1;
-        }
-        n = push_hex8(&mut d, n, mfr[0] as u32);
-        n = push_hex8(&mut d, n, mfr[1] as u32);
-        d[n] = 13;
-        d[n + 1] = 10;
-        n += 2;
-        unsafe { fnb58_usb_send(d.as_ptr(), n as u16) };
-        Timer::after_millis(500).await;
-    }
+    // (The C glue's I2C health check is gone with the vendor i2c code;
+    // the Rust meter's mfr read below proves the bus the same way.)
 
     // --- r111: LCD on the Rust embassy HAL (SPI2 + GPIO) ---
     // Lcd::new() performs the SWJTAG remap, so it must come before the

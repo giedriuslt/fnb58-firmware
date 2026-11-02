@@ -53,6 +53,10 @@ const SPECREV_3_0: u8 = 0x40;
 /// CONTROL3 (0x09): automatic retransmission while no GoodCRC arrives,
 /// N_RETRIES[1:0] = 3 retries.
 const AUTO_RETRY: u8 = 0x01;
+/// CONTROL0 (0x06): flush the TX FIFO (self-clearing) — the wedge
+/// cleaner from the reference drivers (Linux flushes both FIFOs on the
+/// PD-RX toggle, PD Buddy at reset).
+const TX_FLUSH: u8 = 0x40;
 /// STATUS1 (0x41): the TX FIFO is empty (kws-x1's pre-TX precondition).
 const TX_EMPTY: u8 = 0x08;
 /// INTERRUPTA (0x3E): a sent packet was GoodCRC'd / retries exhausted.
@@ -337,14 +341,21 @@ async fn request_first_fixed(
             | ((ma10 as u32) << 10)
             | (ma10 as u32);
         let bytes = rdo.to_le_bytes();
-        let mut acked = tx_message(i2c, lis, DATA_REQUEST, &bytes).await?;
-        if !acked && lis.last_tx == 2 {
-            // r108: the transmitter occasionally ignores the first TXON
-            // after the caps' auto-GoodCRC (r=2: neither TXSENT nor
-            // RETRYFAIL latches). One immediate retry — a same-MessageID
-            // retransmission is spec-legal either way.
-            acked = tx_message(i2c, lis, DATA_REQUEST, &bytes).await?;
-        }
+        // r110: pre-emptive PD_RESET before EVERY Request. The r109
+        // escalation proved the point: the transmitter wedges after the
+        // caps' auto-GoodCRC (r108: s1=20, tokens unconsumed), and the
+        // rescue only landed the Request 250-500 ms after the caps —
+        // outside tSenderResponse (24-30 ms), so the acked Request was
+        // silently ignored and the source re-announced forever. A fresh
+        // PD_RESET guarantees an unwedged transmitter, and reset +
+        // re-route + TX fits inside the response window (the source has
+        // no idea our internal reset happened, and the MessageIDs we
+        // track in software still match its expectation).
+        wr(i2c, REG_RESET, PD_RESET).await?;
+        Timer::after_millis(1).await;
+        wr(i2c, REG_POWER, POWER_FULL).await?;
+        let _ = route(i2c, lis.cc, lis.rev3).await;
+        let acked = tx_message(i2c, lis, DATA_REQUEST, &bytes).await?;
         return Ok(acked);
     }
     Ok(false)
