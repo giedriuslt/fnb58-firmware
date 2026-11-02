@@ -382,12 +382,12 @@ async fn main(spawner: Spawner) {
             match ui.on_press(i) {
                 Press::Switch(screen) => ui.enter(&mut lcd, screen).await,
                 Press::Discover => {
-                    // r113: the session task does everything — CC
-                    // diagnostic, engine startup, negotiation. BACK held
-                    // during the session stops it; the screen shows the
-                    // engine view.
-                    sender.push(b"[pd] session requested\r\n");
-                    pd_task::START.signal(());
+                    // r119: the kws-x1 restart - the running session stops
+                    // at its next idle point, the charger is restarted with
+                    // a Hard Reset, and the firmware reboots into a fresh
+                    // boot session against the fresh attach.
+                    sender.push(b"[pd] restart requested\r\n");
+                    pd_task::request_restart();
                 }
                 Press::None => {}
             }
