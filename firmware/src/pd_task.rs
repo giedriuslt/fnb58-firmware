@@ -167,6 +167,93 @@ async fn restore_baseline(bus: &mut embassy_at32::i2c::I2c) -> Result<(), ()> {
     Ok(())
 }
 
+
+/// Send one raw Get_Source_Cap (control type 7) with MessageID 7 through
+/// the already-configured FUSB302 TX path. The charger acks this reliably
+/// (r93-r107) and answers with Source_Capabilities.
+async fn inject_get_source_cap(bus: &mut embassy_at32::i2c::I2c) -> Result<(), ()> {
+    use embedded_hal_async::i2c::I2c as _;
+    use embedded_hal_async::i2c::Operation;
+    const FUSB: u8 = 0x22;
+    const REG_CONTROL0: u8 = 0x06;
+    const REG_CONTROL1: u8 = 0x07;
+    const REG_STATUS0: u8 = 0x40;
+    const REG_INTERRUPTA: u8 = 0x3e;
+    const REG_FIFOS: u8 = 0x43;
+    const TX_FLUSH: u8 = 0x40;
+    const ENSOP1_RX_FLUSH: u8 = 0x05;
+    const ST0_ACTIVITY: u8 = 0x40;
+    const I_TXSENT: u8 = 0x04;
+
+    async fn wr(bus: &mut embassy_at32::i2c::I2c, reg: u8, val: u8) -> Result<(), ()> {
+        bus.transaction(FUSB, &mut [Operation::Write(&mut [reg, val])])
+            .await
+            .map_err(|_| ())
+    }
+    async fn rd(bus: &mut embassy_at32::i2c::I2c, reg: u8, out: &mut [u8]) -> Result<(), ()> {
+        bus.transaction(
+            FUSB,
+            &mut [Operation::Write(&mut [reg]), Operation::Read(out)],
+        )
+        .await
+        .map_err(|_| ())
+    }
+
+    // Never transmit into an incoming carrier.
+    for _ in 0..20 {
+        let mut st0 = [0u8; 1];
+        rd(bus, REG_STATUS0, &mut st0).await?;
+        if st0[0] & ST0_ACTIVITY == 0 {
+            break;
+        }
+        embassy_time::Timer::after_millis(1).await;
+    }
+    wr(bus, REG_CONTROL0, TX_FLUSH).await?;
+    // Clear stale INTERRUPTA flags.
+    let mut a = [0u8; 1];
+    rd(bus, REG_INTERRUPTA, &mut a).await?;
+
+    // Header: type 7 (Get_Source_Cap), MessageID 7, sink role, rev 2.0.
+    let header: u16 = 7 | (7 << 9) | (0b01 << 6);
+    let [h0, h1] = header.to_le_bytes();
+    let mut fifo = [0u8; 16];
+    let mut w = 0;
+    for &b in &[
+        0x12u8, 0x12, 0x12, 0x13, // SOP = Sync-1 x3 + Sync-2
+        0x80 | 2, // PACKSYM: 2 bytes (header only)
+        h0, h1,
+        0xFF, // JAM_CRC
+        0x14, // EOP
+        0xFE, // TXOFF
+        0xA1, // TXON
+    ] {
+        fifo[w] = b;
+        w += 1;
+    }
+    // FIFO write: register address + token sequence in one transaction.
+    let mut buf = [0u8; 17];
+    buf[0] = REG_FIFOS;
+    buf[1..1 + w].copy_from_slice(&fifo[..w]);
+    bus.transaction(FUSB, &mut [Operation::Write(&mut buf[..1 + w])])
+        .await
+        .map_err(|_| ())?;
+
+    // Wait for the GoodCRC (TXSENT) — the charger answers this reliably.
+    for _ in 0..50 {
+        let mut a = [0u8; 1];
+        rd(bus, REG_INTERRUPTA, &mut a).await?;
+        if a[0] & I_TXSENT != 0 {
+            break;
+        }
+        embassy_time::Timer::after_millis(5).await;
+    }
+    // The GoodCRC frame and the first caps response are in the RX FIFO:
+    // flush them (the charger re-announces within ~200 ms and the engine
+    // catches that). RX_FLUSH also requires ENSOP1 context per the DS.
+    wr(bus, REG_CONTROL1, ENSOP1_RX_FLUSH).await?;
+    Ok(())
+}
+
 fn error_code(error: &pd_phy::Error<embassy_at32::i2c::Error>) -> u16 {
     use pd_phy::Error as E;
     match error {
@@ -309,65 +396,6 @@ pub async fn run() {
         };
         let Some(report) = report else { continue };
 
-        // --- Phase A: the kick (kws-x1's restart_unheard flow). The
-        // charger's policy engine has been asleep since attach (it
-        // announced caps, nothing requested, it gave up): the
-        // spec-sanctioned sink wake is Hard Reset Signaling —
-        // PE_SNK_Wait_For_Capabilities times out into Hard Reset. The
-        // ordered set consumes no MessageID, and the charger restarts
-        // into a FRESH attach whose policy engine is listening.
-        {
-            let config = pd_phy::Config {
-                persistent: false,
-                selection: None,
-                control: None,
-                identity_started: None,
-                publish: Some(&publish),
-                trace_steps: true,
-                trace_cable: false,
-                stop_requested: Some(stop_requested),
-                svids: None,
-                emarker: false,
-            };
-            let mut bus = SharedBus;
-            let clock = PdClock;
-            let mut delay = embassy_time::Delay;
-            let observation = Observation::new();
-            let (mut phy, started) =
-                pd_phy::Session::start(&mut bus, &mut delay, &clock, config, observation, report)
-                    .await;
-            let mut error = started.err();
-            if error.is_none() {
-                match phy.restart_unheard().await {
-                    Ok(()) if phy.hard_reset_sent() => {
-                        // The charger reset VBUS: wait out the cycle back
-                        // to vSafe5V, with the boot baseline restored.
-                        if let Err(failure) = phy.transition_to_default().await {
-                            error = Some(failure);
-                        }
-                    }
-                    Ok(()) => error = Some(pd_phy::Error::TxTimeout),
-                    Err(failure) => error = Some(failure),
-                }
-            }
-            if error.is_none() {
-                error = phy.take_error();
-            }
-            if let Some(failure) = &error {
-                let code = error_code(failure);
-                VIEW.error.store(code, Ordering::Relaxed);
-                if code == 3 {
-                    // VBUS outside the start window: settling, retryable.
-                    continue;
-                }
-                // Anything else: still run the main session — a refused
-                // kick costs nothing on a restored baseline.
-            }
-            if !phy.stopped() {
-                phy.stop();
-            }
-        }
-
         // --- Phase B: the persistent sink session on the fresh attach.
         // The engine selects the target and drives Requests; our Platform
         // supplies VBUS and policy.
@@ -452,6 +480,23 @@ pub async fn run() {
             report,
         )
         .await;
+        // r118: the GSC injection — the charger acks Get_Source_Cap
+        // (r93-r107) and answers with caps; its GoodCRC plus the first
+        // caps response are flushed, the charger re-announces within
+        // ~200 ms, and the engine's WaitForCapabilities catches that.
+        // MessageID 7 keeps the engine's counter aligned (7+1 mod 8 = 0
+        // = the engine's first Request).
+        if started.is_ok() {
+            let mut guard = BUS.lock().await;
+            let Some(bus) = guard.0.as_mut() else {
+                continue;
+            };
+            if inject_get_source_cap(bus).await.is_err() {
+                VIEW.error.store(0x400, Ordering::Relaxed);
+                continue;
+            }
+        }
+
         let mut error = started.err();
         let mut engine_code = 0u16;
         if error.is_none() {
