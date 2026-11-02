@@ -15,10 +15,11 @@ charger on demand.
 - **I²C1**: the vendor C `i2c_application` library (`c/fnb58_i2c.c`
   glue, PB6/PB7). The Rust embassy I2C driver also works and runs the
   TPA626 meter transactions.
-- **LCD**: also on the vendor C side — the ST7789V driver is C glue
-  (`c/fnb58_lcd.c`: init, text, fill, test pattern) called from Rust
-  through `fnb58_lcd_*` externs; the Rust `panel.rs` transport is
-  historical and unused.
+- **LCD**: **Rust on the embassy HAL** (r111, `src/lcd.rs`) — SPI2 +
+  GPIO pins driven by the HAL's `Spi`/`OutputPin`, a 1:1 port of the
+  proven C driver (same init sequence, 5x7 font, 12 MHz rate); bulk
+  pixel data uses the HAL's busy-polled bulk write. The C glue
+  (`c/fnb58_lcd.c`) stays compiled but is no longer called.
 - **Everything else is Rust** on `embassy-at32`: clocks (192 MHz PLL
   from the 8 MHz HEXT crystal + USB DIV_4), GPIO, EXINT, the UI, the
   PD driver (`pd.rs`, register-level FUSB302B), buttons, console queue.
