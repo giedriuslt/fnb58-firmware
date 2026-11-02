@@ -71,6 +71,12 @@ pub struct View {
     pub cc2: AtomicU8,
     /// The diagnostic's listen verdict (0 none, 1 traffic seen).
     pub listen: AtomicU8,
+    /// Furthest engine/PHY step (trace_steps).
+    pub boot_step: AtomicU8,
+    /// The session wrote TX bytes (the engine sent a Message).
+    pub tx_written: AtomicBool,
+    /// The engine's rx_error code (service-layer receive fault).
+    pub rx_error: AtomicU8,
 }
 
 pub static VIEW: View = View {
@@ -87,6 +93,9 @@ pub static VIEW: View = View {
     cc1: AtomicU8::new(0),
     cc2: AtomicU8::new(0),
     listen: AtomicU8::new(0),
+    boot_step: AtomicU8::new(0),
+    tx_written: AtomicBool::new(false),
+    rx_error: AtomicU8::new(0),
 };
 
 fn phase_code(phase: Phase) -> u8 {
@@ -125,6 +134,10 @@ fn publish(observation: Observation) {
         VIEW.vbus_mv
             .store(spr.vbus_live_mv.unwrap_or(0), Ordering::Relaxed);
     }
+    VIEW.boot_step.store(observation.boot_step, Ordering::Relaxed);
+    VIEW.tx_written
+        .store(observation.spr.is_some_and(|spr| spr.tx_written), Ordering::Relaxed);
+    VIEW.rx_error.store(observation.rx_error, Ordering::Relaxed);
 }
 
 fn stop_requested() -> bool {
@@ -305,7 +318,7 @@ pub async fn run() {
             control: None,
             identity_started: None,
             publish: Some(&publish),
-            trace_steps: false,
+            trace_steps: true,
             trace_cable: false,
             stop_requested: Some(stop_requested),
             svids: None,
