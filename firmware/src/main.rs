@@ -39,7 +39,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r129";
+const BUILD: &[u8] = b"r130";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -131,7 +131,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r129: pb14 idle\r\n").await;
+    say(b"[lcd] FNB58 r130: cmd buf\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -388,6 +388,11 @@ async fn main(spawner: Spawner) {
     // One-time ISR proof per EXINT line (the buttons double as the
     // interrupt canary; line 13 = the FUSB302 INT_N).
     let mut isr_seen = [false; 16];
+    // USB command line buffer (r129): PuTTY keys arrive one packet at a
+    // time; commands run on CR/LF or ~300 ms of input silence.
+    let mut cmd_buf = [0u8; 12];
+    let mut cmd_len = 0;
+    let mut last_cmd_byte: Option<embassy_time::Instant> = None;
     // USB command line buffer (r128): PuTTY keys arrive one packet at
     // a time; commands run on CR/LF or ~300 ms of input silence (r129).
     let mut cmd_buf = [0u8; 12];
@@ -550,50 +555,38 @@ async fn main(spawner: Spawner) {
             let _ = ok;
         }
 
-        // USB serial commands (r127): 'i' = JEDEC ID, 'f<sector>' =
+        // USB serial commands (r128/r129): 'i' = JEDEC ID, 'f<sector>' =
         // dump one 4 KiB flash sector as hex. READ-ONLY by design —
-        // the flash driver has no write/erase code at all.
+        // the flash driver has no write/erase code at all. PuTTY sends
+        // each keystroke as its own packet: commands accumulate in a
+        // line buffer and run on CR/LF or after ~300 ms of silence.
         {
             let mut rbuf = [0u8; 64];
             let rn = unsafe { fnb58_usb_recv(rbuf.as_mut_ptr()) };
-            if rn > 0 && rn <= 64 {
-                let chunk = &rbuf[..rn as usize];
-                if chunk[0] == b'i' {
-                    let mut d = [0u8; 32];
-                    let mut n = 0;
-                    for &b in b"[flash] jedec:" {
-                        d[n] = b;
-                        n += 1;
+            for &b in &rbuf[..rn.min(64) as usize] {
+                if b == b'\r' || b == b'\n' {
+                    if cmd_len > 0 {
+                        last_cmd_byte = None;
+                        run_flash_command(&mut flash, &cmd_buf[..cmd_len], &mut sender);
+                        cmd_len = 0;
                     }
-                    match flash.read_jedec_id() {
-                        Ok(id) => {
-                            for &b in &id {
-                                d[n] = b' ';
-                                n += 1;
-                                n = push_hex8(&mut d, n, u32::from(b));
-                            }
-                            d[n] = b'\r';
-                            d[n + 1] = b'\n';
-                            n += 2;
-                            unsafe { fnb58_usb_send(d.as_ptr(), n as u16) };
-                        }
-                        Err(_) => sender.push(b"[flash] jedec FAIL\r\n"),
-                    }
-                } else if chunk[0] == b'f' {
-                    // 'f' + decimal sector number (0..4095).
-                    let mut sector: u32 = 0;
-                    let mut any = false;
-                    for &b in &chunk[1..] {
-                        if b.is_ascii_digit() {
-                            sector = sector * 10 + u32::from(b - b'0');
-                            any = true;
-                        } else {
-                            break;
-                        }
-                    }
-                    if any && sector < 4096 {
-                        send_sector_dump(&mut flash, sector);
-                    }
+                } else if cmd_len < cmd_buf.len() {
+                    cmd_buf[cmd_len] = b;
+                    cmd_len += 1;
+                    last_cmd_byte = Some(embassy_time::Instant::now());
+                }
+                if cmd_len == cmd_buf.len() {
+                    run_flash_command(&mut flash, &cmd_buf[..cmd_len], &mut sender);
+                    cmd_len = 0;
+                    last_cmd_byte = None;
+                }
+            }
+            // Idle timeout: keystrokes run without pressing Enter.
+            if let Some(t) = last_cmd_byte {
+                if t.elapsed() >= embassy_time::Duration::from_millis(300) {
+                    run_flash_command(&mut flash, &cmd_buf[..cmd_len], &mut sender);
+                    cmd_len = 0;
+                    last_cmd_byte = None;
                 }
             }
         }
