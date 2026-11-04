@@ -38,7 +38,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r125";
+const BUILD: &[u8] = b"r126";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -127,7 +127,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r125: madctl fix\r\n").await;
+    say(b"[lcd] FNB58 r126: lext fix\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -313,10 +313,21 @@ async fn main(spawner: Spawner) {
     // fitted it never does.
     let lext_ok = {
         let crm = unsafe { embassy_at32::pac::at32f403a::CRM::steal() };
+        let pwc = unsafe { embassy_at32::pac::at32f403a::PWC::steal() };
+        // r126: BPDC sits in the battery-backed domain — writes are
+        // ignored until the PWC clock is on and PWC.CTRL.BPWEN is set
+        // (vendor pwc_battery_powered_domain_access). The r86 probe
+        // skipped this, so LEXTEN never actually set.
+        crm.apb1en().modify(|_, w| w.pwc().bit(true));
+        pwc.ctrl().modify(|_, w| w.bpwen().set_bit());
         crm.bpdc().modify(|_, w| w.lexten().set_bit());
         let mut ok = false;
         for _ in 0..2000 {
-            if crm.clkint().read().lextstblf().bit() {
+            // The stable flag lives in BPDC.LEXTSTBL (bit 1); the
+            // CLKINT.LEXTSTBLF polled before is the interrupt flag and
+            // only sets with its interrupt enable on — a false negative
+            // in every round since r86.
+            if crm.bpdc().read().lextstbl().bit() {
                 ok = true;
                 break;
             }
