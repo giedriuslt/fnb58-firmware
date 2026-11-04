@@ -20,6 +20,7 @@ mod board;
 mod pd_phy;
 mod pd_task;
 mod buttons;
+mod buzzer;
 mod lcd;
 mod pin_trace;
 mod ui;
@@ -36,7 +37,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r120";
+const BUILD: &[u8] = b"r121";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -125,10 +126,13 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r120: safe mode\r\n").await;
+    say(b"[lcd] FNB58 r121: buzzer\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
+
+    // --- r121: buzzer on PA8 (pin 29, user-identified) ---
+    let mut buzzer = unsafe { buzzer::Buzzer::new() };
 
     // --- r111: LCD on the Rust embassy HAL (SPI2 + GPIO) ---
     // Lcd::new() performs the SWJTAG remap, so it must come before the
@@ -373,6 +377,8 @@ async fn main(spawner: Spawner) {
 
             if down {
                 held |= 1 << i;
+                // Click feedback: 2 kHz for 200 ms (r121).
+                buzzer.buzz(2_000, 200);
             } else {
                 held &= !(1 << i);
             }
