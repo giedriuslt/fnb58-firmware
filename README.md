@@ -161,10 +161,12 @@ bytes 1–62, stored in byte 63) — `81` INIT1 / `82` INIT2 / `83` POLL.
 The device streams from enumeration (25 reports/s, `AA 04` + 4 ×
 15-byte samples): voltage u32/100 000 V, current u32/100 000 A,
 D+ u16/1000 V, D− u16/1000 V, unknown u8, temp u16/10 °C. **Voltage
-and current are measured; D+, D−, temperature and the unknown byte are
-0 sentinels** until this firmware measures them (the protocol
-heuristics then read "USB SDP"). Trigger commands (`85`/`86`) are
-accepted and ignored — the trigger circuit is not wired.
+and current are measured (TPA626); temperature (r136) is the internal
+die sensor — ADC1 CH16, VREFINT (CH17)-corrected, refreshed every
+report and shown on the status line and in the console heartbeat;
+D+ and D− remain 0 sentinels** until their ADC taps are traced (the
+protocol heuristics then read "USB SDP"). Trigger commands (`85`/`86`)
+are accepted and ignored — the trigger circuit is not wired.
 
 Verified on hardware (r135): full-rate stream through a stock hidapi
 client, live voltage on the open input, reports flowing before the
@@ -218,5 +220,5 @@ SWD debugging, which this project never uses.
 3. RTC driver on the confirmed 32 kHz crystal (PC14/15).
 4. KXTJ3 tap/wake features; W25Q128 logging; ADC (ripple/VBUS taps).
 5. PC-link sentinels: trace the D+/D− ADC taps (likely among the
-   unclaimed PA0–PA7) and pick a temperature source to replace the 0
-   sentinels in the OpenFNB58 stream.
+   unclaimed PA0–PA7) to replace the last 0 sentinels in the
+   OpenFNB58 stream (temperature is live since r136).

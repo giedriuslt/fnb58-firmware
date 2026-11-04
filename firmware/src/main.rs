@@ -17,6 +17,7 @@
 #![no_main]
 
 mod board;
+mod adc;
 mod pd_phy;
 mod pd_task;
 mod buttons;
@@ -39,7 +40,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r135";
+const BUILD: &[u8] = b"r137";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -85,6 +86,11 @@ async fn main(spawner: Spawner) {
     };
     unsafe { embassy_at32::init(clocks) };
     unsafe { cortex_m::interrupt::enable() };
+
+    // --- r136: internal temperature sensor (ADC1 CH16, VREFINT-corrected;
+    // see adc.rs). Mode-independent: the PC-link reports and the console
+    // heartbeat both read it. ---
+    adc::init();
 
     // --- r134: PC-link mode (OpenFNB58 protocol) ---
     // Hold OK while plugging in: the device enumerates as the stock
@@ -163,12 +169,16 @@ async fn main(spawner: Spawner) {
 
         // OpenFNB58 stream: 25 reports/s of AA 04 + 4 x 15-byte samples
         // (voltage u32/100000 V, current u32/100000 A, D+ u16/1000 V,
-        // D- u16/1000 V, unknown u8, temp u16/10 C). V/A are measured;
-        // D+/D-, the unknown byte and temperature are 0 sentinels until
+        // D- u16/1000 V, unknown u8, temp u16/10 C). V/A come from the
+        // TPA626, temperature from the internal sensor (refreshed every
+        // report); D+/D- and the unknown byte remain 0 sentinels until
         // this firmware measures them.
         let mut report = [0u8; 64];
         report[0] = 0xAA;
         report[1] = 0x04;
+        // Tenths of a degree C (the report field's own unit); None reads
+        // keep the previous value.
+        let mut temp_deci: u16 = 0;
         let mut slot = 0usize;
         let mut lcd_tick = 0u32;
         // Command tallies, shown on the LCD status line: whether the
@@ -177,7 +187,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r135 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r137 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -197,12 +207,21 @@ async fn main(spawner: Spawner) {
             report[off..off + 4].copy_from_slice(&(mv * 100).to_le_bytes()); // V * 100000
             let amps_100k = if ua > 0 { (ua / 10) as u32 } else { 0 };
             report[off + 4..off + 8].copy_from_slice(&amps_100k.to_le_bytes()); // A * 100000
-            // D+ / D- (off+8..off+12), unknown (off+12), temp
-            // (off+13..off+15): 0 sentinels; the buffer starts zeroed
-            // and only the first two fields are ever rewritten.
+            // D+ / D- (off+8..off+12) and the unknown byte (off+12):
+            // 0 sentinels; the buffer starts zeroed and only the first
+            // two fields are ever rewritten.
             slot += 1;
             if slot == 4 {
                 slot = 0;
+                // Temperature: one sensor read per report, stamped into
+                // all four samples (u16 LE, tenths of a degree C).
+                if let Some(t) = adc::read_temp_deci() {
+                    temp_deci = t.clamp(0, 6553) as u16;
+                }
+                for s in 0..4 {
+                    let off = 2 + s * 15;
+                    report[off + 13..off + 15].copy_from_slice(&temp_deci.to_le_bytes());
+                }
                 // Retry for one busy cycle, then drop: at 25 Hz a lost
                 // report costs 40 ms of the stream, stalling costs more.
                 for _ in 0..2 {
@@ -230,31 +249,49 @@ async fn main(spawner: Spawner) {
 
             // Live LCD values, ~4 Hz, from the latest sample (the
             // protocol field scales convert straight back to mV/uA),
-            // plus the PC-LINK status line. Fixed-width 31-char line
-            // (spaces then NUL at the end) at scale 1 so the ~27-char
-            // worst case fits the 320px screen and every overdraw
-            // erases ghosts, like ui.rs Line12::pad.
+            // plus the PC-LINK status line: die temperature (the same
+            // value the reports carry) and the host command tallies.
+            // Fixed-width 31-char line (spaces then NUL at the end) at
+            // scale 1 so the ~30-char worst case fits the 320px screen
+            // and every overdraw erases ghosts, like ui.rs Line12::pad.
             lcd_tick += 1;
             if lcd_tick % 25 == 0 {
                 let mw = (mv as i32 * ua) / 1000;
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r135 i1=" {
+                for &b in b"r137 " {
                     line[w] = b;
                     w += 1;
                 }
-                w = push_dec(&mut line, w, n_init1 % 10000);
+                let t = temp_deci as i32;
+                if t < 0 {
+                    line[w] = b'-';
+                    w += 1;
+                }
+                let ta = if t < 0 { -t } else { t };
+                w = push_dec(&mut line, w, (ta / 10) as u32);
+                line[w] = b'.';
+                w += 1;
+                line[w] = b'0' + (ta % 10) as u8;
+                w += 1;
+                line[w] = b'C';
+                w += 1;
+                for &b in b" i1=" {
+                    line[w] = b;
+                    w += 1;
+                }
+                w = push_dec(&mut line, w, n_init1 % 1000);
                 for &b in b" i2=" {
                     line[w] = b;
                     w += 1;
                 }
-                w = push_dec(&mut line, w, n_init2 % 10000);
+                w = push_dec(&mut line, w, n_init2 % 1000);
                 for &b in b" p=" {
                     line[w] = b;
                     w += 1;
                 }
-                w = push_dec(&mut line, w, n_poll % 10000);
+                w = push_dec(&mut line, w, n_poll % 1000);
                 line[31] = 0;
                 lcd.draw_text(8, 224, &line, 1, 0x7BEF, 0x0000).await;
             }
@@ -310,7 +347,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r135: infix\r\n").await;
+    say(b"[lcd] FNB58 r137: tempfix\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -846,6 +883,30 @@ async fn main(spawner: Spawner) {
                 n += 1;
             }
             n = push_dec(&mut d, n, u32::from(pd_task::VIEW.rx_error.load(Ordering::Relaxed)));
+            // r136: die temperature from the internal sensor (the same
+            // reading the PC-link reports carry).
+            for &b in b" T=" {
+                d[n] = b;
+                n += 1;
+            }
+            match adc::read_temp_deci() {
+                Some(t) => {
+                    if t < 0 {
+                        d[n] = b'-';
+                        n += 1;
+                    }
+                    let ta = if t < 0 { -t } else { t };
+                    n = push_dec(&mut d, n, (ta / 10) as u32);
+                    d[n] = b'.';
+                    d[n + 1] = b'0' + (ta % 10) as u8;
+                    n += 2;
+                }
+                None => {
+                    d[n] = b'-';
+                    d[n + 1] = b'-';
+                    n += 2;
+                }
+            }
             d[n] = b'\r';
             d[n + 1] = b'\n';
             n += 2;
