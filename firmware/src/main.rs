@@ -39,7 +39,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r132";
+const BUILD: &[u8] = b"r133";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -131,7 +131,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r132: enter only\r\n").await;
+    say(b"[lcd] FNB58 r133: buf fix\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -563,7 +563,7 @@ async fn main(spawner: Spawner) {
             for &b in &rbuf[..rn.min(64) as usize] {
                 if b == b'\r' || b == b'\n' {
                     if cmd_len > 0 {
-                        let mut d = [0u8; 20];
+                        let mut d = [0u8; 40];
                         let mut w = 0;
                         for &b in b"[flash] cmd:" {
                             d[w] = b;
@@ -740,11 +740,14 @@ fn send_direct(line: &[u8]) {
     }
 }
 
-/// Dump one 4 KiB flash sector as hex lines (24 bytes per line, direct
+/// Dump one 4 KiB flash sector as hex lines (16 bytes per line, direct
 /// sends). READ-ONLY: the flash driver has no write/erase code at all.
 fn send_sector_dump(flash: &mut flash::Flash, sector: u32) {
     static mut SECTOR: [u8; flash::SECTOR_SIZE] = [0; flash::SECTOR_SIZE];
-    let mut d = [0u8; 16];
+    // r133: the header buffer was 16 bytes while "[flash] sector 1\r\n"
+    // alone is 18 — a bounds panic that killed the device on every
+    // f-command before the queued echo could reach the wire.
+    let mut d = [0u8; 32];
     let mut n = 0;
     for &b in b"[flash] sector " {
         d[n] = b;
@@ -769,7 +772,7 @@ fn send_sector_dump(flash: &mut flash::Flash, sector: u32) {
     let mut line = [0u8; 64];
     for (li, chunk) in sector_buf.chunks(16).enumerate() {
         let mut n = 0;
-        let addr = (sector as usize * flash::SECTOR_SIZE) + li * 24;
+        let addr = (sector as usize * flash::SECTOR_SIZE) + li * 16;
         // 6-hex-digit address (no alloc: format! would need it).
         for shift in [20u8, 16, 12, 8, 4, 0] {
             line[n] = HEX[((addr as u32) >> shift & 0xF) as usize];
