@@ -38,7 +38,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r124";
+const BUILD: &[u8] = b"r125";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -127,7 +127,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r124: flip fix\r\n").await;
+    say(b"[lcd] FNB58 r125: madctl fix\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -364,8 +364,11 @@ async fn main(spawner: Spawner) {
     // One-time ISR proof per EXINT line (the buttons double as the
     // interrupt canary; line 13 = the FUSB302 INT_N).
     let mut isr_seen = [false; 16];
-    // Screen orientation (r122): the flip detector's state.
+    // Screen orientation (r122): the APPLIED state and the detector's
+    // settled state (r125: the hold tracks the detected state, so the
+    // un-flip can fire too — r124 only ever flipped once).
     let mut flipped = false;
+    let mut last_seen = false;
     let mut flip_hold: u32 = 0;
     // Held-button bitmask for the PD session's stop gate (persists across
     // loop iterations; r114 reset it every pass, breaking BACK-stop).
@@ -473,12 +476,16 @@ async fn main(spawner: Spawner) {
                         + i32::from(g.y) * i32::from(g.y)
                         + i32::from(g.z) * i32::from(g.z);
                     let now_flipped = 4 * dot < -norm0 && norm * 4 >= norm0;
-                    if now_flipped {
+                    // The hold counts consecutive polls agreeing with the
+                    // detected state; when it has settled for ~1 s and the
+                    // settled state differs from the APPLIED one, apply it
+                    // (works for the flip AND the un-flip).
+                    if now_flipped == last_seen {
                         flip_hold += 1;
                     } else {
                         flip_hold = 0;
+                        last_seen = now_flipped;
                     }
-                    // 5 polls = 1 s settled.
                     if flip_hold >= 5 && flipped != now_flipped {
                         flipped = now_flipped;
                         lcd.set_inverted(flipped).await;

@@ -186,11 +186,13 @@ impl Lcd {
         self.fill_window(0, 0, W - 1, H - 1, color).await;
     }
 
-    /// 180-degree orientation: MADCTL 0x60 (normal) vs 0xE0 (MX|MY set —
-    /// the controller mirrors the frame, so every window coordinate keeps
-    /// working unchanged).
+    /// 180-degree orientation: MADCTL 0x60 (normal: MX|MV) vs 0xA0
+    /// (inverted: MY|MV — MX cleared, MY set, so BOTH scan directions are
+    /// flipped relative to normal = a true 180-degree rotation; adding MY
+    /// alone r124-style only mirrored the screen). The controller does the
+    /// mirroring, so every window coordinate keeps working unchanged.
     pub async fn set_inverted(&mut self, inverted: bool) {
-        let madctl: u8 = if inverted { 0x60 | 0xC0 } else { 0x60 };
+        let madctl: u8 = if inverted { 0x60 ^ 0xC0 } else { 0x60 };
         self.cmd_data(0x36, &[madctl]).await;
     }
 
