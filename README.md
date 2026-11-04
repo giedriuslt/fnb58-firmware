@@ -42,33 +42,72 @@ is the one open hardware question).
   loop waits on the doorbell with a 10 ms fallback tick. PD RX reacts
   to INT edges instead of polling blind.
 
-## Verified hardware pin map (probed on the real board)
+## Hardware pin map (LQFP48, probed on the real board)
 
-| Function | Pins | Verified by |
-|---|---|---|
-| LCD ST7789V 320x240 | SPI2: SCK=PB13, MOSI=PB15, CS=PB12, DC=PB11, RST=PB10 | r40-r53: full driver + pattern on glass |
-| LCD backlight | PB3 (active high) | user trace, r42+ |
-| I2C1 bus | PB6=SCL, PB7=SDA | r18-r21 scans; devices below |
-| TPA626 power monitor | I2C 0x40 (mfr 0x5549, die 0x2260 = INA226-compatible), 10 mΩ shunt assumed | r20-r23 live VBUS, r62+ V/A/W |
-| FUSB302B PD PHY | I2C 0x22, **INT_N = PC13** (LQFP48 pin 2, open-drain, needs pull-up) | r20 id=91; PC13 traced by user, r102 EXTINT proven |
-| KXTJ3-1057 accelerometer | I2C 0x0E (whoami 0x35) | r20 |
-| "Mystery" 0x0C | **SMBus Alert Response Address of the TPA626** — its ALERT function shares the I2C bus; ACKs 0x0C and ignores all reads (that is what the ARA does) | r20-r22 dump behavior; identified later |
-| Buttons (to GND, internal pull-ups, active-low) | LEFT=PA15, OK=PB4, BACK=PB9, RIGHT=PB8 | r59-r61 tracer; r102 EXINT |
-| FUSB302 INT_N | PC13 → EXINT13 falling | r102: `isr line=13 ok` |
-| USB FS | PA11=D-, PA12=D+ | working CDC since r15 |
-| SWD | PA13=SWDIO, PA14=SWCLK | ICP flashing path |
-| Crystal | 8 MHz on PD0/PD1 (OSC_IN/OUT — NOT PC14/15) | vendor example + r15 |
-| 32 kHz crystal (LEXT) | PC14/PC15 — **CONFIRMED present and oscillating** (`lext=1`, r126). The r86-era `lext=0` was a false negative: the probe polled the wrong flag (CLKINT.LEXTSTBLF, the interrupt flag) and skipped the backup-domain unlock (PWC BPWEN). PC14/15 are RESERVED for the RTC; an RTC driver is now a real option. | r126 fixed probe |
-| Buzzer | PA8 (LQFP48 pin 29) — square wave 2 kHz/500 Hz via busy toggle | r121-r122: audible on hw |
-| RS2228 USB2 mux | present on the board — **pins and purpose unidentified** | board inspection |
-| W25Q128 flash | shares SPI2 (SCK=PB13, MISO=PB14, MOSI=PB15), CS unconfirmed | r33 probe |
-| PD power path | side slider isolates the CC load ("PD switch"); internal FUSB302 Rd (SWITCHES0 PDWN bits) also presents a sink | r84+ behavior |
+Physical pin table — `Side` = where the pin sits on the board (probing
+reference). Functions marked ✓ are verified on hardware; "unclaimed"
+pins have no known connection.
 
-LQFP48 leftovers (unclaimed, untraced): PA0-PA7, PA9, PA10,
-PB0/PB1/PB2/PB5, and the load-bank FET gates — **never drive them
-blindly** (r24/25 heated the board doing that). (PA8 = buzzer, PA15 =
-LEFT, PB4 = OK, PB9 = BACK, PB8 = RIGHT, PB6/PB7 = I2C1, PC13 =
-FUSB302 INT_N, PC14/15 = LEXT crystal are claimed.)
+| Pin | Name | Side | Function |
+|-----|------|------|----------|
+| 1 | VBAT | Left | battery-backup input (unconnected?) |
+| 2 | PC13 | Left | ✓ FUSB302 INT_N (open-drain, EXINT13 falling) |
+| 3 | PC14 / LEXT_IN | Left | ✓ 32 kHz crystal (confirmed present, `lext=1`) |
+| 4 | PC15 / LEXT_OUT | Left | ✓ 32 kHz crystal |
+| 5 | PD0 / HEXT_IN | Left | ✓ 8 MHz main crystal |
+| 6 | PD1 / HEXT_OUT | Left | ✓ 8 MHz main crystal |
+| 7 | NRST | Left | reset input |
+| 8 | VSSA / VREF− | Left | analog ground |
+| 9 | VDDA / VREF+ | Left | analog supply |
+| 10 | PA0 / WKUP | Left | unclaimed |
+| 11 | PA1 | Left | unclaimed |
+| 12 | PA2 | Left | unclaimed |
+| 13 | PA3 | Bottom | unclaimed |
+| 14 | PA4 | Bottom | unclaimed |
+| 15 | PA5 | Bottom | unclaimed |
+| 16 | PA6 | Bottom | unclaimed |
+| 17 | PA7 | Bottom | unclaimed |
+| 18 | PB0 | Bottom | unclaimed |
+| 19 | PB1 | Bottom | unclaimed |
+| 20 | PB2 | Bottom | unclaimed |
+| 21 | PB10 | Bottom | unclaimed |
+| 22 | PB11 | Bottom | ✓ LCD DC |
+| 23 | VSS_1 | Bottom | ground |
+| 24 | VDD_1 | Bottom | digital supply |
+| 25 | PB12 | Right | ✓ LCD CS (active low) |
+| 26 | PB13 | Right | ✓ SPI2 SCK (LCD + W25Q128 shared) |
+| 27 | PB14 | Right | ✓ SPI2 MISO (W25Q128 flash) |
+| 28 | PB15 | Right | ✓ SPI2 MOSI (LCD + W25Q128 shared) |
+| 29 | PA8 | Right | ✓ buzzer (2 kHz square wave) |
+| 30 | PA9 | Right | unclaimed |
+| 31 | PA10 | Right | unclaimed |
+| 32 | PA11 | Right | ✓ USB D− |
+| 33 | PA12 | Right | ✓ USB D+ |
+| 34 | PA13 | Right | ✓ W25Q128 flash CS (also SWDIO — see flashing note) |
+| 35 | VSS_2 | Right | ground |
+| 36 | VDD_2 | Right | digital supply |
+| 37 | PA14 | Top | SWCLK (debug only — keep free) |
+| 38 | PA15 | Top | ✓ LEFT button (to GND, internal pull-up) |
+| 39 | PB3 | Top | ✓ LCD backlight |
+| 40 | PB4 | Top | ✓ OK button (to GND, internal pull-up) |
+| 41 | PB5 | Top | unclaimed |
+| 42 | PB6 | Top | ✓ I2C1 SCL (TPA626, FUSB302, KXTJ3) |
+| 43 | PB7 | Top | ✓ I2C1 SDA |
+| 44 | BOOT0 | Top | boot selector: high at reset = USB DFU (flash via BOOT0-high) |
+| 45 | PB8 | Top | ✓ RIGHT button (to GND, internal pull-up) |
+| 46 | PB9 | Top | ✓ BACK button (to GND, internal pull-up) |
+| 47 | VSS_3 | Top | ground |
+| 48 | VDD_3 | Top | digital supply |
+
+Unclaimed: PA0–PA7, PA9, PA10, PB0/PB1/PB2/PB5 (pins 10–20, 30, 31, 41)
+plus the load-bank FET gates on some of them — **never drive unclaimed
+pins blindly** (r24/25 heated the board doing that).
+
+I2C1 bus device map (0x0E-verified r20): TPA626 power monitor @ 0x40
+(mfr 0x5549, die 0x2260), FUSB302B PD PHY @ 0x22 (INT_N = PC13),
+KXTJ3-1057 accelerometer @ 0x0E (whoami 0x35), 0x0C = the TPA626's
+SMBus Alert Response Address. The W25Q128 flash (JEDEC EF 40 18) shares
+SPI2 with the LCD via CS=PA13.
 
 ## PD sink flow (r104)
 
