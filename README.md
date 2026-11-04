@@ -3,9 +3,11 @@
 Open firmware for the **FNIRSI FNB58** USB tester (Artery AT32F403A),
 built on [`embassy-at32`](../at32f403a-embassy-rs) and ported from
 [kws-x1-standalone-rs](https://github.com/kralonur/kws-x1-standalone-rs).
-Status: **r104** — working USB CDC console, 320x240 UI, live V/A/W
-meter, and a PD sink scan flow that reads source capabilities from a
-charger on demand.
+Status: **r126** — working USB CDC console, 320x240 UI with
+accelerometer-driven 180° screen flip and click feedback (buzzer),
+live V/A/W meter, and a PD sink flow on the vendored `fusb302-pd`
+stack (PC-gated, one-shot per OK — the charger's Request acknowledgment
+is the one open hardware question).
 
 ## Architecture
 
@@ -32,8 +34,9 @@ charger on demand.
   pixel data uses the HAL's busy-polled bulk write. The C glue
   (`c/fnb58_lcd.c`) stays compiled but is no longer called.
 - **Everything else is Rust** on `embassy-at32`: clocks (192 MHz PLL
-  from the 8 MHz HEXT crystal + USB DIV_4), GPIO, EXINT, the UI, the
-  PD driver (`pd.rs`, register-level FUSB302B), buttons, console queue.
+  from the 8 MHz HEXT crystal + USB DIV_4), GPIO, EXINT, the UI,
+  buttons, console queue, the KXTJ3 accelerometer driver (`kxtj3.rs`,
+  screen-flip detection), and the buzzer (`buzzer.rs`, PA8).
 - **Interrupts**: buttons and the FUSB302 INT_N run on EXINT (ISR
   latches a line bit and wakes the main loop via a signal); the main
   loop waits on the doorbell with a 10 ms fallback tick. PD RX reacts
@@ -55,14 +58,17 @@ charger on demand.
 | USB FS | PA11=D-, PA12=D+ | working CDC since r15 |
 | SWD | PA13=SWDIO, PA14=SWCLK | ICP flashing path |
 | Crystal | 8 MHz on PD0/PD1 (OSC_IN/OUT — NOT PC14/15) | vendor example + r15 |
-| 32 kHz footprint | PC14/PC15 — **still suspected: something IS populated** there (visible component), but the r86 LEXT probe never saw it stabilize (`lext=0`); either not a crystal, a crystal the probe missed, or a different part. Do not treat PC14/15 as free GPIO. | r86 probe + user inspection |
+| 32 kHz crystal (LEXT) | PC14/PC15 — **CONFIRMED present and oscillating** (`lext=1`, r126). The r86-era `lext=0` was a false negative: the probe polled the wrong flag (CLKINT.LEXTSTBLF, the interrupt flag) and skipped the backup-domain unlock (PWC BPWEN). PC14/15 are RESERVED for the RTC; an RTC driver is now a real option. | r126 fixed probe |
+| Buzzer | PA8 (LQFP48 pin 29) — square wave 2 kHz/500 Hz via busy toggle | r121-r122: audible on hw |
 | RS2228 USB2 mux | present on the board — **pins and purpose unidentified** | board inspection |
 | W25Q128 flash | shares SPI2 (SCK=PB13, MISO=PB14, MOSI=PB15), CS unconfirmed | r33 probe |
 | PD power path | side slider isolates the CC load ("PD switch"); internal FUSB302 Rd (SWITCHES0 PDWN bits) also presents a sink | r84+ behavior |
 
-LQFP48 leftovers (unclaimed, untraced): PA0-PA10, PB0/PB1/PB2/PB5, and
-the load-bank FET gates — **never drive them blindly** (r24/25 heated
-the board doing that).
+LQFP48 leftovers (unclaimed, untraced): PA0-PA7, PA9, PA10,
+PB0/PB1/PB2/PB5, and the load-bank FET gates — **never drive them
+blindly** (r24/25 heated the board doing that). (PA8 = buzzer, PA15 =
+LEFT, PB4 = OK, PB9 = BACK, PB8 = RIGHT, PB6/PB7 = I2C1, PC13 =
+FUSB302 INT_N, PC14/15 = LEXT crystal are claimed.)
 
 ## PD sink flow (r104)
 
@@ -117,8 +123,10 @@ without the bootloader.
 
 ## Roadmap
 
-1. Fix the Request transmission (r=2) so the sink contract holds and
-   the charger stops power-cycling VBUS.
-2. PD profiles screen: request a chosen PDO (the RDO builder is in
-   place), PPS support.
-3. KXTJ3 accelerometer driver, W25Q128 logging, ADC (ripple/VBUS taps).
+1. PD: the charger acknowledges Get_Source_Cap but never the Request
+   (isolated — same with the hand-rolled driver and the vendored
+   engine). Needs a wire capture (USB-C breakout + analyzer) or a
+   board-level answer (parallel Rd, charger quirk).
+2. PD profiles screen: request a chosen PDO, PPS support.
+3. RTC driver on the confirmed 32 kHz crystal (PC14/15).
+4. KXTJ3 tap/wake features; W25Q128 logging; ADC (ripple/VBUS taps).
