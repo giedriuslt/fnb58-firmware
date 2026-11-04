@@ -37,7 +37,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r121";
+const BUILD: &[u8] = b"r122";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -126,7 +126,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r121: buzzer\r\n").await;
+    say(b"[lcd] FNB58 r122: click tune\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -143,7 +143,7 @@ async fn main(spawner: Spawner) {
     lcd.test_pattern().await;
     say(b"[lcd] pattern drawn\r\n").await;
     // r121: boot beep — audible confirmation of the PA8 buzzer (pin 29).
-    buzzer.buzz(2_000, 200);
+    buzzer.buzz(500, 30);
     Timer::after_millis(1500).await;
 
     // --- the meter leases the shared I2C1 bus per read (r113) ---
@@ -379,8 +379,8 @@ async fn main(spawner: Spawner) {
 
             if down {
                 held |= 1 << i;
-                // Click feedback: 2 kHz for 200 ms (r121).
-                buzzer.buzz(2_000, 200);
+                // Click feedback: 500 Hz for 30 ms (r122, user-tuned).
+                buzzer.buzz(500, 30);
             } else {
                 held &= !(1 << i);
             }
