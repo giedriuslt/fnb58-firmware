@@ -39,7 +39,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r128";
+const BUILD: &[u8] = b"r129";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -93,6 +93,9 @@ async fn main(spawner: Spawner) {
 
         let _scl = unsafe { AlternatePin::new_open_drain(Port::B, 6, Drive::Moderate) };
         let _sda = unsafe { AlternatePin::new_open_drain(Port::B, 7, Drive::Moderate) };
+        // r129: PB14 = SPI2_MISO for the W25Q128 flash reads (the LCD
+        // never needed MISO, so this pin was never muxed before).
+        let _miso = unsafe { AlternatePin::new_push_pull(Port::B, 14, Drive::Moderate) };
         let i2c = unsafe { I2c::new_i2c1(clocks.pclk1_hz, Speed::Standard) };
         {
             let mut guard = pd_task::BUS.lock().await;
@@ -128,7 +131,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r128: cmd lines\r\n").await;
+    say(b"[lcd] FNB58 r129: pb14 idle\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -386,9 +389,10 @@ async fn main(spawner: Spawner) {
     // interrupt canary; line 13 = the FUSB302 INT_N).
     let mut isr_seen = [false; 16];
     // USB command line buffer (r128): PuTTY keys arrive one packet at
-    // a time, so the command assembles here until Enter.
+    // a time; commands run on CR/LF or ~300 ms of input silence (r129).
     let mut cmd_buf = [0u8; 12];
     let mut cmd_len = 0;
+    let mut last_cmd_byte: Option<embassy_time::Instant> = None;
     // Screen orientation (r122): the APPLIED state and the detector's
     // settled state (r125: the hold tracks the detected state, so the
     // un-flip can fire too — r124 only ever flipped once).
