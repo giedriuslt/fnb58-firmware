@@ -38,7 +38,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r123";
+const BUILD: &[u8] = b"r124";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -127,7 +127,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r123: accel flip\r\n").await;
+    say(b"[lcd] FNB58 r124: flip fix\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -457,20 +457,22 @@ async fn main(spawner: Spawner) {
             let mut guard = pd_task::BUS.lock().await;
             if let Some(bus) = guard.0.as_mut() {
                 if let Ok(g) = kxtj3::read(bus).await {
-                    // "Flipped" = lying settled with every axis's sign
-                    // reversed against the boot calibration: the device
-                    // was turned over (180 degrees).
-                    let flips = (g.x.signum() != gravity0.x.signum()
-                        && g.x.abs() > 400
-                        && gravity0.x.abs() > 400)
-                        || (g.y.signum() != gravity0.y.signum()
-                            && g.y.abs() > 400
-                            && gravity0.y.abs() > 400)
-                        || (g.z.signum() != gravity0.z.signum()
-                            && g.z.abs() > 400
-                            && gravity0.z.abs() > 400);
-                    let quiet = g.x.abs() < 600 && g.y.abs() < 600;
-                    let now_flipped = flips && quiet;
+                    // r124: "flipped" = the current gravity points mostly
+                    // OPPOSITE the boot calibration (dot product strongly
+                    // negative): the device was turned over ~180 degrees,
+                    // independent of which axis the board mounts the
+                    // sensor along. Settled = the current vector is as
+                    // large as the calibration (not mid-tilt).
+                    let dot = i32::from(g.x) * i32::from(gravity0.x)
+                        + i32::from(g.y) * i32::from(gravity0.y)
+                        + i32::from(g.z) * i32::from(gravity0.z);
+                    let norm0 = i32::from(gravity0.x) * i32::from(gravity0.x)
+                        + i32::from(gravity0.y) * i32::from(gravity0.y)
+                        + i32::from(gravity0.z) * i32::from(gravity0.z);
+                    let norm = i32::from(g.x) * i32::from(g.x)
+                        + i32::from(g.y) * i32::from(g.y)
+                        + i32::from(g.z) * i32::from(g.z);
+                    let now_flipped = 4 * dot < -norm0 && norm * 4 >= norm0;
                     if now_flipped {
                         flip_hold += 1;
                     } else {

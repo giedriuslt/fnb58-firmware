@@ -78,7 +78,17 @@ pub async fn read(bus: &mut I2c) -> Result<Gravity, ()> {
     bus.transaction(ADDRESS, &mut [Operation::Write(&mut [XOUT_L]), Operation::Read(&mut buf)])
         .await
         .map_err(|_| ())?;
-    let axis = |l: u8, h: u8| -> i16 { (((h as u16) << 8 | l as u16) >> 4) as u16 as i16 };
+    // 12-bit two's complement, left-justified: the logical shift right
+    // must be followed by an explicit sign extension (r124: the missing
+    // extension turned every negative reading into a large positive).
+    let axis = |l: u8, h: u8| -> i16 {
+        let v = (((h as u16) << 8 | l as u16) >> 4) & 0x0FFF;
+        if v & 0x0800 != 0 {
+            (v | 0xF000) as u16 as i16
+        } else {
+            v as i16
+        }
+    };
     Ok(Gravity {
         x: axis(buf[0], buf[1]),
         y: axis(buf[2], buf[3]),
