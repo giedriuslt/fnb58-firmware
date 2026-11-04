@@ -142,6 +142,8 @@ async fn main(spawner: Spawner) {
     say(b"[lcd] init done, drawing bars\r\n").await;
     lcd.test_pattern().await;
     say(b"[lcd] pattern drawn\r\n").await;
+    // r121: boot beep — audible confirmation of the PA8 buzzer (pin 29).
+    buzzer.buzz(2_000, 200);
     Timer::after_millis(1500).await;
 
     // --- the meter leases the shared I2C1 bus per read (r113) ---
