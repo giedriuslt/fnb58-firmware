@@ -108,18 +108,23 @@ a slow host delays lines instead of losing them.
 ./make-bin.sh    # cargo build --release + rust-objcopy -> fnb58-firmware.bin
 ```
 
-Flash `fnb58-firmware.bin` at 0x08000000 with Artery ICP over SWD
-(AT-Link). Each round ships a uniquely named copy (`fnb58-rNNN-tag.bin`)
-plus the build tag in every heartbeat — three flashes silently failed
-to take before that protocol existed.
+Flashing: **BOOT0 (pin 44) strapped high at power-on → the AT32 mask-ROM
+boot ROM enumerates as a USB DFU device (2E3C:DF11) → flash
+`fnb58-firmware.bin` with Artery ICP (DFU mode) or `at32dfu.py`**
+(`../fnb58-research/`). The mask ROM is indestructible, so this path
+always works — it never touches PA13/PA14. Each round ships a uniquely
+named copy (`fnb58-rNNN-tag.bin`) plus the build tag in every heartbeat
+— three flashes silently failed to take before that protocol existed.
 
-**⚠ One-way door:** flashing this firmware requires a full flash erase,
-which destroys the stock FNIRSI firmware *and* its USB bootloader.
-After that the device cannot boot stock again — the bootloader only
-accepts encrypted `.ufn` files over its own USB interface, and it no
-longer exists once erased. There is no supported way back to stock;
-the archived `Fnb58V0.68.ufn` in `../fnb58-research/` is useless
-without the bootloader.
+**⚠ One-way door (for the STOCK firmware only):** the first full flash
+erase destroyed the stock FNIRSI firmware *and* its proprietary USB
+bootloader — there is no way back to stock (`Fnb58V0.68.ufn` in
+`../fnb58-research/` is useless without that bootloader). Re-flashing
+*this* firmware, however, is always possible via the BOOT0-high DFU.
+Consequence: the SWD pins (PA13/PA14, pins 34/37) are NOT needed for
+flashing — the firmware may repurpose them as GPIO by setting the
+SWJTAG remap to `100` (full SWJ disabled); the cost is only runtime
+SWD debugging, which this project never uses.
 
 ## Roadmap
 
