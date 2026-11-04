@@ -186,6 +186,14 @@ impl Lcd {
         self.fill_window(0, 0, W - 1, H - 1, color).await;
     }
 
+    /// 180-degree orientation: MADCTL 0x60 (normal) vs 0xE0 (MX|MY set —
+    /// the controller mirrors the frame, so every window coordinate keeps
+    /// working unchanged).
+    pub async fn set_inverted(&mut self, inverted: bool) {
+        let madctl: u8 = if inverted { 0x60 | 0xC0 } else { 0x60 };
+        self.cmd_data(0x36, &[madctl]).await;
+    }
+
     /// Eight 40px vertical color bars: W R G B C M Y K.
     pub async fn test_pattern(&mut self) {
         const BARS: [u16; 8] = [

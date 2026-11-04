@@ -21,6 +21,7 @@ mod pd_phy;
 mod pd_task;
 mod buttons;
 mod buzzer;
+mod kxtj3;
 mod lcd;
 mod pin_trace;
 mod ui;
@@ -37,7 +38,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r122";
+const BUILD: &[u8] = b"r123";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -126,7 +127,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r122: click tune\r\n").await;
+    say(b"[lcd] FNB58 r123: accel flip\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -198,6 +199,51 @@ async fn main(spawner: Spawner) {
         }
     }
     say(b"[meter] rust tpa configured\r\n").await;
+
+    // --- r123: KXTJ3 accelerometer for the screen-flip detection ---
+    let accel_ok = {
+        let mut guard = pd_task::BUS.lock().await;
+        match guard.0.as_mut() {
+            Some(bus) => kxtj3::init(bus).await,
+            None => false,
+        }
+    };
+    // Boot gravity calibration: the tester rests however it rests; a
+    // 180-degree flip reverses every axis's sign against this.
+    let mut gravity0 = kxtj3::Gravity { x: 0, y: 0, z: 0 };
+    if accel_ok {
+        let mut guard = pd_task::BUS.lock().await;
+        if let Some(bus) = guard.0.as_mut() {
+            for _ in 0..16 {
+                if let Ok(g) = kxtj3::read(bus).await {
+                    gravity0.x += g.x / 16;
+                    gravity0.y += g.y / 16;
+                    gravity0.z += g.z / 16;
+                }
+                Timer::after_millis(25).await;
+            }
+        }
+        let mut d = [0u8; 80];
+        let mut n = 0;
+        for &b in b"[accel] kxtj3 ok g0=" {
+            d[n] = b;
+            n += 1;
+        }
+        for v in [gravity0.x, gravity0.y, gravity0.z] {
+            let u = v as u16;
+            d[n] = b' ';
+            n += 1;
+            n = push_hex8(&mut d, n, u32::from(u >> 8));
+            n = push_hex8(&mut d, n, u32::from(u & 0xFF));
+        }
+        d[n] = b'\r';
+        d[n + 1] = b'\n';
+        n += 2;
+        unsafe { fnb58_usb_send(d.as_ptr(), n as u16) };
+        Timer::after_millis(50).await;
+    } else {
+        say(b"[accel] kxtj3 FAIL\r\n").await;
+    }
 
     // --- UI: POWER + PD screens; buttons navigate (r70) ---
     // Buttons: to-GND switches, internal pull-ups latched at init
@@ -318,6 +364,9 @@ async fn main(spawner: Spawner) {
     // One-time ISR proof per EXINT line (the buttons double as the
     // interrupt canary; line 13 = the FUSB302 INT_N).
     let mut isr_seen = [false; 16];
+    // Screen orientation (r122): the flip detector's state.
+    let mut flipped = false;
+    let mut flip_hold: u32 = 0;
     // Held-button bitmask for the PD session's stop gate (persists across
     // loop iterations; r114 reset it every pass, breaking BACK-stop).
     let mut held: u8 = 0;
@@ -401,6 +450,42 @@ async fn main(spawner: Spawner) {
             }
         }
         pd_task::BTN.store(held, Ordering::Relaxed);
+
+        // Orientation poll: 200 ms cadence; a flip must hold ~1 s before
+        // the screen rotates (kws-x1's settle approach).
+        if accel_ok && tick % 20 == 0 {
+            let mut guard = pd_task::BUS.lock().await;
+            if let Some(bus) = guard.0.as_mut() {
+                if let Ok(g) = kxtj3::read(bus).await {
+                    // "Flipped" = lying settled with every axis's sign
+                    // reversed against the boot calibration: the device
+                    // was turned over (180 degrees).
+                    let flips = (g.x.signum() != gravity0.x.signum()
+                        && g.x.abs() > 400
+                        && gravity0.x.abs() > 400)
+                        || (g.y.signum() != gravity0.y.signum()
+                            && g.y.abs() > 400
+                            && gravity0.y.abs() > 400)
+                        || (g.z.signum() != gravity0.z.signum()
+                            && g.z.abs() > 400
+                            && gravity0.z.abs() > 400);
+                    let quiet = g.x.abs() < 600 && g.y.abs() < 600;
+                    let now_flipped = flips && quiet;
+                    if now_flipped {
+                        flip_hold += 1;
+                    } else {
+                        flip_hold = 0;
+                    }
+                    // 5 polls = 1 s settled.
+                    if flip_hold >= 5 && flipped != now_flipped {
+                        flipped = now_flipped;
+                        lcd.set_inverted(flipped).await;
+                        // Force a full screen refresh (the chrome moved).
+                        ui.enter(&mut lcd, ui.screen).await;
+                    }
+                }
+            }
+        }
 
         // Meter: 200 ms cadence (screen values; TPA conversion window).
         if tick % 20 == 0 {
