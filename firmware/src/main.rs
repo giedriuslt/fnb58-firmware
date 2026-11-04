@@ -39,7 +39,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r127";
+const BUILD: &[u8] = b"r128";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -128,7 +128,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r127: flash read\r\n").await;
+    say(b"[lcd] FNB58 r128: cmd lines\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -385,6 +385,10 @@ async fn main(spawner: Spawner) {
     // One-time ISR proof per EXINT line (the buttons double as the
     // interrupt canary; line 13 = the FUSB302 INT_N).
     let mut isr_seen = [false; 16];
+    // USB command line buffer (r128): PuTTY keys arrive one packet at
+    // a time, so the command assembles here until Enter.
+    let mut cmd_buf = [0u8; 12];
+    let mut cmd_len = 0;
     // Screen orientation (r122): the APPLIED state and the detector's
     // settled state (r125: the hold tracks the detected state, so the
     // un-flip can fire too — r124 only ever flipped once).
@@ -675,6 +679,58 @@ async fn main(spawner: Spawner) {
         }
 
         sender.drain();
+    }
+}
+
+/// Run one assembled console command: 'i' = JEDEC ID, 'f<sect>' =
+/// one 4 KiB sector hex dump. Unknown commands are ignored.
+fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) {
+    if cmd.is_empty() {
+        return;
+    }
+    match cmd[0] {
+        b'i' => {
+            let mut d = [0u8; 32];
+            let mut n = 0;
+            for &b in b"[flash] jedec:" {
+                d[n] = b;
+                n += 1;
+            }
+            match flash.read_jedec_id() {
+                Ok(id) => {
+                    for &b in &id {
+                        d[n] = b' ';
+                        n += 1;
+                        n = push_hex8(&mut d, n, u32::from(b));
+                    }
+                    d[n] = b'\r';
+                    d[n + 1] = b'\n';
+                    n += 2;
+                    send_direct(&d[..n]);
+                }
+                Err(_) => sender.push(b"[flash] jedec FAIL
+"),
+            }
+        }
+        b'f' => {
+            let mut sector: u32 = 0;
+            let mut any = false;
+            for &b in &cmd[1..] {
+                if b.is_ascii_digit() {
+                    sector = sector * 10 + u32::from(b - b'0');
+                    any = true;
+                } else {
+                    break;
+                }
+            }
+            if any && sector < 4096 {
+                send_sector_dump(flash, sector);
+            } else {
+                sender.push(b"[flash] sector out of range (0..4095)
+");
+            }
+        }
+        _ => {}
     }
 }
 

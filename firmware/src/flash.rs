@@ -61,11 +61,13 @@ impl Flash {
         result.map_err(|_| ())
     }
 
-    /// JEDEC ID (3 bytes). W25Q128 answers EF 40 18.
+    /// JEDEC ID (3 bytes). W25Q128 answers EF 40 18. The byte received
+    /// during the command itself is garbage — the ID starts on the next
+    /// byte, so four bytes are collected and the first is dropped.
     pub fn read_jedec_id(&mut self) -> Result<[u8; 3], ()> {
-        let mut out = [0u8; 3];
+        let mut out = [0u8; 4];
         self.transfer(&[CMD_JEDEC_ID, 0, 0, 0], &mut out)?;
-        Ok(out)
+        Ok([out[1], out[2], out[3]])
     }
 
     /// Read one 4 KiB sector (0x03 READ at `sector` * 4096). Blocks for
