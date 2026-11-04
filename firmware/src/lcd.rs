@@ -40,13 +40,17 @@ impl Lcd {
     /// Exclusive-startup contract: claims SPI2, PB3/PB10-PB12/PB13/PB15 and
     /// the IOMUX remap register; call once, before anything touches those
     /// pins.
-    pub unsafe fn new() -> Self {
+    pub unsafe fn new(spi: Spi) -> Self {
         // SWJTAG remap = vendor gpio_pin_remap_config(SWJTAG_GMUX_010):
         // IOMUX_REMAP7.SWJTAG_GMUX = 010 (JTAG-DP disabled, SW-DP enabled).
         let crm = unsafe { embassy_at32::pac::at32f403a::CRM::steal() };
         crm.apb2en().modify(|_, w| w.iomux().bit(true));
         let iomux = unsafe { embassy_at32::pac::at32f403a::IOMUX::steal() };
-        iomux.remap7().modify(|_, w| unsafe { w.swjtag_gmux().bits(0x02) });
+        // Remap 100 = full SWJ disabled: PA13/PA14 join PA15/PB3/PB4 as
+        // GPIO (PA13 is the W25Q128 flash chip-select). Flashing is
+        // unaffected — it uses the BOOT0-high USB DFU (PA11/PA12), which
+        // never touches the SWD pins.
+        iomux.remap7().modify(|_, w| unsafe { w.swjtag_gmux().bits(0x04) });
 
         // Control pins: CS/DC/RST push-pull, idle high; backlight gate PB3.
         let cs = unsafe { OutputPin::new_push_pull(Port::B, 12, true, Drive::Moderate) }
@@ -63,8 +67,8 @@ impl Lcd {
             unsafe { AlternatePin::new_push_pull(Port::B, 15, Drive::Moderate) }.expect("PB15");
 
         // SPI2 master, mode 0, 8-bit MSB, software CS; APB1 48 MHz / 4 =
-        // 12 MHz (the C driver's exact rate).
-        let spi = unsafe { Spi::new_spi2(Mode::Mode0, Divider::Div4) };
+        // 12 MHz (the C driver's exact rate). The handle is passed in so
+        // the W25Q128 flash driver can share the bus.
         Self {
             spi,
             dc,

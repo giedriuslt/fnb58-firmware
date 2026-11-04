@@ -21,6 +21,7 @@ mod pd_phy;
 mod pd_task;
 mod buttons;
 mod buzzer;
+mod flash;
 mod kxtj3;
 mod lcd;
 mod pin_trace;
@@ -38,7 +39,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r126";
+const BUILD: &[u8] = b"r127";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -127,7 +128,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r126: lext fix\r\n").await;
+    say(b"[lcd] FNB58 r127: flash read\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -135,10 +136,19 @@ async fn main(spawner: Spawner) {
     // --- r121: buzzer on PA8 (pin 29, user-identified) ---
     let mut buzzer = unsafe { buzzer::Buzzer::new() };
 
-    // --- r111: LCD on the Rust embassy HAL (SPI2 + GPIO) ---
-    // Lcd::new() performs the SWJTAG remap, so it must come before the
-    // button pins (PB4/PA15) are configured.
-    let mut lcd = unsafe { lcd::Lcd::new() };
+    // --- r111/r126: LCD + W25Q128 flash share SPI2 (each has its own
+    // chip-select). Lcd::new() performs the SWJTAG remap (value 100: full
+    // SWJ disabled — PA13/PA14 join the GPIO set; flashing is unaffected,
+    // it uses the BOOT0-high USB DFU), so it must come before the flash
+    // CS claim (PA13) and the button pins.
+    let spi = unsafe {
+        embassy_at32::spi::Spi::new_spi2(
+            embassy_at32::spi::Mode::Mode0,
+            embassy_at32::spi::Divider::Div4,
+        )
+    };
+    let mut lcd = unsafe { lcd::Lcd::new(spi) };
+    let mut flash = unsafe { flash::Flash::new(spi) };
     lcd.init().await;
     say(b"[lcd] init done, drawing bars\r\n").await;
     lcd.test_pattern().await;
@@ -532,6 +542,54 @@ async fn main(spawner: Spawner) {
             let _ = ok;
         }
 
+        // USB serial commands (r127): 'i' = JEDEC ID, 'f<sector>' =
+        // dump one 4 KiB flash sector as hex. READ-ONLY by design —
+        // the flash driver has no write/erase code at all.
+        {
+            let mut rbuf = [0u8; 64];
+            let rn = unsafe { fnb58_usb_recv(rbuf.as_mut_ptr()) };
+            if rn > 0 && rn <= 64 {
+                let chunk = &rbuf[..rn as usize];
+                if chunk[0] == b'i' {
+                    let mut d = [0u8; 32];
+                    let mut n = 0;
+                    for &b in b"[flash] jedec:" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    match flash.read_jedec_id() {
+                        Ok(id) => {
+                            for &b in &id {
+                                d[n] = b' ';
+                                n += 1;
+                                n = push_hex8(&mut d, n, u32::from(b));
+                            }
+                            d[n] = b'\r';
+                            d[n + 1] = b'\n';
+                            n += 2;
+                            unsafe { fnb58_usb_send(d.as_ptr(), n as u16) };
+                        }
+                        Err(_) => sender.push(b"[flash] jedec FAIL\r\n"),
+                    }
+                } else if chunk[0] == b'f' {
+                    // 'f' + decimal sector number (0..4095).
+                    let mut sector: u32 = 0;
+                    let mut any = false;
+                    for &b in &chunk[1..] {
+                        if b.is_ascii_digit() {
+                            sector = sector * 10 + u32::from(b - b'0');
+                            any = true;
+                        } else {
+                            break;
+                        }
+                    }
+                    if any && sector < 4096 {
+                        send_sector_dump(&mut flash, sector);
+                    }
+                }
+            }
+        }
+
         // Periodic diag heartbeat with the build tag, queue depth, the
         // send-failure count (f>0 = the host is not collecting packets)
         // and the PD power state (pd=1 adds the per-CC receiver diag).
@@ -617,6 +675,63 @@ async fn main(spawner: Spawner) {
         }
 
         sender.drain();
+    }
+}
+
+/// Send one line directly, retrying while the previous USB packet is
+/// still in flight (bounded).
+fn send_direct(line: &[u8]) {
+    for _ in 0..50_000 {
+        if unsafe { fnb58_usb_send(line.as_ptr(), line.len() as u16) } == 0 {
+            return;
+        }
+        cortex_m::asm::delay(2000);
+    }
+}
+
+/// Dump one 4 KiB flash sector as hex lines (24 bytes per line, direct
+/// sends). READ-ONLY: the flash driver has no write/erase code at all.
+fn send_sector_dump(flash: &mut flash::Flash, sector: u32) {
+    static mut SECTOR: [u8; flash::SECTOR_SIZE] = [0; flash::SECTOR_SIZE];
+    let mut d = [0u8; 16];
+    let mut n = 0;
+    for &b in b"[flash] sector " {
+        d[n] = b;
+        n += 1;
+    }
+    n = push_dec(&mut d, n, sector);
+    d[n] = b'\r';
+    d[n + 1] = b'\n';
+    n += 2;
+    send_direct(&d[..n]);
+
+    // SAFETY: single task; only this command handler touches the buffer.
+    let sector_buf = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR) };
+    if flash.read_sector(sector, sector_buf).is_err() {
+        send_direct(b"[flash] read FAIL\r\n");
+        return;
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut line = [0u8; 64];
+    for (li, chunk) in sector_buf.chunks(24).enumerate() {
+        let mut n = 0;
+        let addr = (sector as usize * flash::SECTOR_SIZE) + li * 24;
+        // 6-hex-digit address (no alloc: format! would need it).
+        for shift in [20u8, 16, 12, 8, 4, 0] {
+            line[n] = HEX[((addr as u32) >> shift & 0xF) as usize];
+            n += 1;
+        }
+        line[n] = b':';
+        n += 1;
+        for &b in chunk {
+            line[n] = b' ';
+            n += 1;
+            n = push_hex8(&mut line, n, u32::from(b));
+        }
+        line[n] = b'\r';
+        line[n + 1] = b'\n';
+        n += 2;
+        send_direct(&line[..n]);
     }
 }
 
