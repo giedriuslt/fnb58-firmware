@@ -16,9 +16,16 @@
 
 usbd_core_type usb_core_dev;
 
-extern void fnb58_usbd_event_hook(void);
+/* r134: USB device mode. 0 = CDC console (default), 1 = FNB58 vendor
+   HID (the OpenFNB58 PC-link protocol; fnb58_hid.c). Chosen once at
+   boot from the OK button - OK held while plugging in selects HID. */
+static uint8_t g_usb_mode = 0;
 
-void fnb58_usb_init(void)
+extern void fnb58_usbd_event_hook(void);
+extern usbd_class_handler fnb58_hid_class_handler;
+extern usbd_desc_handler fnb58_hid_desc_handler;
+
+static void usb_common_init(usbd_class_handler *cls, usbd_desc_handler *desc)
 {
   /* The 48 MHz USB clock is already programmed by the Rust clock setup:
      192 MHz PLL from the 8 MHz crystal (vendor-proven on this board) with
@@ -27,13 +34,31 @@ void fnb58_usb_init(void)
      clock enable, usbd_core_init, connect (NVIC is unmasked by main). */
   crm_periph_clock_enable(CRM_USB_PERIPH_CLOCK, TRUE);
 
-  usbd_core_init(&usb_core_dev, USB, &cdc_class_handler, &cdc_desc_handler, 0);
+  usbd_core_init(&usb_core_dev, USB, cls, desc, 0);
 
   usbd_connect(&usb_core_dev);
 }
 
+void fnb58_usb_init(void)
+{
+  g_usb_mode = 0;
+  usb_common_init(&cdc_class_handler, &cdc_desc_handler);
+}
+
+/* Enumerate as the stock FNB58 measurement device (2E3C:5558, HID,
+   OpenFNB58 protocol). See fnb58_hid.c. */
+void fnb58_usb_init_hid(void)
+{
+  g_usb_mode = 1;
+  usb_common_init(&fnb58_hid_class_handler, &fnb58_hid_desc_handler);
+}
+
 uint16_t fnb58_usb_recv(uint8_t *buffer)
 {
+  if(g_usb_mode != 0)
+  {
+    return 0; /* no CDC in HID mode */
+  }
   return usb_vcp_get_rxdata(&usb_core_dev, buffer);
 }
 
@@ -43,6 +68,10 @@ uint16_t fnb58_usb_recv(uint8_t *buffer)
  * the Rust side can never mix them up again. */
 int32_t fnb58_usb_send(const uint8_t *data, uint16_t len)
 {
+  if(g_usb_mode != 0)
+  {
+    return 1; /* no CDC in HID mode */
+  }
   return (usb_vcp_send_data(&usb_core_dev, (uint8_t *)data, len) == SUCCESS) ? 0 : 1;
 }
 

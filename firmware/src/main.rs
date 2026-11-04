@@ -39,7 +39,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r133";
+const BUILD: &[u8] = b"r135";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -63,6 +63,10 @@ unsafe extern "C" {
     fn fnb58_usb_recv(buffer: *mut u8) -> u16;
     fn fnb58_usb_send(data: *const u8, len: u16) -> i32;
     fn fnb58_usb_configured() -> u32;
+    // r134: PC-link mode (fnb58_hid.c) — the stock FNB58 USB device.
+    fn fnb58_usb_init_hid();
+    fn fnb58_hid_tx(report: *const u8) -> i32;
+    fn fnb58_hid_rx(buffer: *mut u8) -> u16;
 }
 
 /// Called from the vendor IRQ handlers.
@@ -81,6 +85,181 @@ async fn main(spawner: Spawner) {
     };
     unsafe { embassy_at32::init(clocks) };
     unsafe { cortex_m::interrupt::enable() };
+
+    // --- r134: PC-link mode (OpenFNB58 protocol) ---
+    // Hold OK while plugging in: the device enumerates as the stock
+    // FNB58 USB HID measurement interface (2E3C:5558, endpoints
+    // 0x83/0x03, 64-byte reports) instead of the CDC console. The
+    // console stays the default — no button, no change. OK = PB4,
+    // to-GND switch with an internal pull-up.
+    let pc_link = {
+        use embassy_at32::gpio::{InputPin, Port};
+        let ok = unsafe { InputPin::new_pull_up(Port::B, 4).expect("PB4 claim") };
+        let mut held = true;
+        for _ in 0..8 {
+            if !ok.is_low() {
+                held = false;
+                break;
+            }
+            cortex_m::asm::delay(192 * 50); // ~50 us pull-up settle
+        }
+        held
+    };
+
+    if pc_link {
+        // I2C1 up for the TPA626 meter only — NO PD task: the OK press
+        // that selected this mode must not trigger a PD session, and
+        // the PC link is a data stream, not a trigger (r120 safe mode).
+        {
+            use embassy_at32::gpio::{AlternatePin, Drive, Port};
+            use embassy_at32::i2c::{I2c, Speed};
+            let _scl = unsafe { AlternatePin::new_open_drain(Port::B, 6, Drive::Moderate) };
+            let _sda = unsafe { AlternatePin::new_open_drain(Port::B, 7, Drive::Moderate) };
+            let i2c = unsafe { I2c::new_i2c1(clocks.pclk1_hz, Speed::Standard) };
+            let mut guard = pd_task::BUS.lock().await;
+            *guard = pd_task::BusCell(i2c.ok());
+        }
+
+        // USB as the FNB58 vendor HID device (fnb58_hid.c).
+        unsafe {
+            cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_L_CAN1_RX0);
+            cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_H_CAN1_TX);
+            fnb58_usb_init_hid();
+        }
+        for _ in 0..30 {
+            if unsafe { fnb58_usb_configured() } == 1 {
+                break;
+            }
+            Timer::after_millis(100).await;
+        }
+
+        // The mode is visible and audible on the device as well: the
+        // power screen with a PC-LINK status line, a higher boot beep
+        // than the console's 500 Hz.
+        let mut buzzer = unsafe { buzzer::Buzzer::new() };
+        let spi = unsafe {
+            embassy_at32::spi::Spi::new_spi2(
+                embassy_at32::spi::Mode::Mode0,
+                embassy_at32::spi::Divider::Div4,
+            )
+        };
+        let mut lcd = unsafe { lcd::Lcd::new(spi) };
+        lcd.init().await;
+        let mut ui = Ui::new();
+        ui.enter(&mut lcd, Screen::Power).await;
+        buzzer.buzz(700, 60);
+
+        // TPA626 streaming config: no averaging, 588 us conversions —
+        // every 10 ms sample is fresh (the console's power screen uses
+        // AVG=64, which refreshes only ~7x/s). Same calibration.
+        {
+            let mut guard = pd_task::BUS.lock().await;
+            if let Some(bus) = guard.0.as_mut() {
+                let _ = tpa_write(bus, 0x00, 0x0337).await; // AVG=1, 588us+588us, cont
+                let cal: u16 = (5_120_000u32 / 500u32) as u16; // 10 mOhm shunt, 50 uA LSB
+                let _ = tpa_write(bus, 0x05, cal).await;
+            }
+        }
+
+        // OpenFNB58 stream: 25 reports/s of AA 04 + 4 x 15-byte samples
+        // (voltage u32/100000 V, current u32/100000 A, D+ u16/1000 V,
+        // D- u16/1000 V, unknown u8, temp u16/10 C). V/A are measured;
+        // D+/D-, the unknown byte and temperature are 0 sentinels until
+        // this firmware measures them.
+        let mut report = [0u8; 64];
+        report[0] = 0xAA;
+        report[1] = 0x04;
+        let mut slot = 0usize;
+        let mut lcd_tick = 0u32;
+        // Command tallies, shown on the LCD status line: whether the
+        // host's INIT1/INIT2/POLL reports actually reach the device.
+        let (mut n_init1, mut n_init2, mut n_poll) = (0u32, 0u32, 0u32);
+        let mut cmd = [0u8; 64];
+        let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
+        // First paint: the mode is on screen before the host connects.
+        lcd.draw_text(8, 224, b"r135 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        loop {
+            ticker.next().await;
+            // One meter sample into the next report slot.
+            let (mv, ua) = {
+                let mut guard = pd_task::BUS.lock().await;
+                match guard.0.as_mut() {
+                    Some(bus) => {
+                        match (tpa_read(bus, 0x02).await, tpa_read(bus, 0x04).await) {
+                            (Ok(v), Ok(i)) => ((v as u32 * 5) / 4, (i as i16 as i32) * 50),
+                            _ => (0, 0),
+                        }
+                    }
+                    None => (0, 0),
+                }
+            };
+            let off = 2 + slot * 15;
+            report[off..off + 4].copy_from_slice(&(mv * 100).to_le_bytes()); // V * 100000
+            let amps_100k = if ua > 0 { (ua / 10) as u32 } else { 0 };
+            report[off + 4..off + 8].copy_from_slice(&amps_100k.to_le_bytes()); // A * 100000
+            // D+ / D- (off+8..off+12), unknown (off+12), temp
+            // (off+13..off+15): 0 sentinels; the buffer starts zeroed
+            // and only the first two fields are ever rewritten.
+            slot += 1;
+            if slot == 4 {
+                slot = 0;
+                // Retry for one busy cycle, then drop: at 25 Hz a lost
+                // report costs 40 ms of the stream, stalling costs more.
+                for _ in 0..2 {
+                    if unsafe { fnb58_hid_tx(report.as_ptr()) } == 0 {
+                        break;
+                    }
+                }
+            }
+
+            // Host commands (INIT1/INIT2/POLL/trigger). The stream runs
+            // from enumeration, so every one of them finds the device
+            // already doing what it asks — they are counted, not acted
+            // on. CRC-8: poly 0x39, init 0x42 over bytes 1..62 vs 63.
+            if unsafe { fnb58_hid_rx(cmd.as_mut_ptr()) } == 64
+                && cmd[0] == 0xAA
+                && crc8_fnb58(&cmd[1..63]) == cmd[63]
+            {
+                match cmd[1] {
+                    0x81 => n_init1 += 1,
+                    0x82 => n_init2 += 1,
+                    0x83 => n_poll += 1,
+                    _ => {}
+                }
+            }
+
+            // Live LCD values, ~4 Hz, from the latest sample (the
+            // protocol field scales convert straight back to mV/uA),
+            // plus the PC-LINK status line. Fixed-width 31-char line
+            // (spaces then NUL at the end) at scale 1 so the ~27-char
+            // worst case fits the 320px screen and every overdraw
+            // erases ghosts, like ui.rs Line12::pad.
+            lcd_tick += 1;
+            if lcd_tick % 25 == 0 {
+                let mw = (mv as i32 * ua) / 1000;
+                ui.draw_power(&mut lcd, mv, ua, mw).await;
+                let mut line = [b' '; 32];
+                let mut w = 0;
+                for &b in b"r135 i1=" {
+                    line[w] = b;
+                    w += 1;
+                }
+                w = push_dec(&mut line, w, n_init1 % 10000);
+                for &b in b" i2=" {
+                    line[w] = b;
+                    w += 1;
+                }
+                w = push_dec(&mut line, w, n_init2 % 10000);
+                for &b in b" p=" {
+                    line[w] = b;
+                    w += 1;
+                }
+                w = push_dec(&mut line, w, n_poll % 10000);
+                line[31] = 0;
+                lcd.draw_text(8, 224, &line, 1, 0x7BEF, 0x0000).await;
+            }
+        }
+    }
 
     // --- r119: the PD session starts AT BOOT (kws-x1 flow) ---
     // The charger is still announcing its capabilities for ~10 s after
@@ -131,7 +310,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r133: buf fix\r\n").await;
+    say(b"[lcd] FNB58 r135: infix\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -874,6 +1053,24 @@ fn push_dec(buf: &mut [u8], pos: usize, v: u32) -> usize {
         p += 1;
     }
     p
+}
+
+/// FNB58 command checksum: CRC-8, poly 0x39, init 0x42, no reflection,
+/// no xorout — over bytes 1..62 of a 64-byte HID report, compared to
+/// byte 63 (the OpenFNB58 tools build their commands the same way).
+fn crc8_fnb58(data: &[u8]) -> u8 {
+    let mut crc: u8 = 0x42;
+    for &b in data {
+        crc ^= b;
+        for _ in 0..8 {
+            crc = if crc & 0x80 != 0 {
+                (crc << 1) ^ 0x39
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
 }
 
 /// Append `v` as two lowercase hex digits.

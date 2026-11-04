@@ -141,6 +141,49 @@ interrupt line (buttons = the canary), `[diag rNNN] t= q= f= i= pd=…`
 heartbeats, and the PD lines above. The console queue is non-blocking;
 a slow host delays lines instead of losing them.
 
+## PC link (r134/r135) — OpenFNB58 protocol, hardware-verified
+
+**Hold OK while plugging in** and the device enumerates as the stock
+FNB58 measurement interface instead of the CDC console: VID `2E3C`,
+PID `5558`, one HID interface, interrupt endpoints `0x83`/`0x03`,
+64-byte un-numbered input/output reports. The console stays the
+default — no button, no change. In PC-link mode the buzzer beeps at
+700 Hz (console boots at 500 Hz), the LCD shows the live power screen
+plus an `r135 i1=… i2=… p=…` status line (host command tallies), no
+PD task runs (the OK press that selected the mode must not trigger a
+session), and the TPA626 is reconfigured for fresh samples at 100 Hz
+(AVG=1, 588 µs conversions) instead of the console's AVG=64.
+
+Wire protocol as implemented by [OpenFNB58](https://github.com/yeckel/OpenFNB58)
+(`fnb58.py` and the Qt app work unmodified): host commands are
+64-byte reports `AA <cmd> … CRC8` (CRC-8 poly 0x39 init 0x42 over
+bytes 1–62, stored in byte 63) — `81` INIT1 / `82` INIT2 / `83` POLL.
+The device streams from enumeration (25 reports/s, `AA 04` + 4 ×
+15-byte samples): voltage u32/100 000 V, current u32/100 000 A,
+D+ u16/1000 V, D− u16/1000 V, unknown u8, temp u16/10 °C. **Voltage
+and current are measured; D+, D−, temperature and the unknown byte are
+0 sentinels** until this firmware measures them (the protocol
+heuristics then read "USB SDP"). Trigger commands (`85`/`86`) are
+accepted and ignored — the trigger circuit is not wired.
+
+Verified on hardware (r135): full-rate stream through a stock hidapi
+client, live voltage on the open input, reports flowing before the
+INITs so the app's drain→init→read sequence behaves as it expects.
+
+Two bring-up findings worth keeping. Windows may bind WinUSB/libusb
+to `2E3C:5558` (leftover driver experiments) — then hidapi sees
+nothing while libusb tools still write; the tell in a USBPcap is no
+report-descriptor GET after SET CONFIG (fix: uninstall the device +
+driver, replug). And the vendor stack's `usbd_eptn_handler` passes
+class in/out handlers the endpoint **number** (3), not the address —
+compare like `usbd_core.c` does (`ept_num & 0x7F == ept_addr & 0x7F`);
+r134 compared against `0x83` and sent exactly one report, ever.
+
+Implementation: `c/fnb58_hid.c` (descriptors, endpoints, command
+mailbox — the vendor `custom_hid` class as a template), `fnb58_usb.c`
+picks the class at boot (`fnb58_usb_init_hid`), and the Rust
+main loop samples the meter and builds the reports.
+
 ## Build and flash
 
 ```sh
@@ -174,3 +217,6 @@ SWD debugging, which this project never uses.
 2. PD profiles screen: request a chosen PDO, PPS support.
 3. RTC driver on the confirmed 32 kHz crystal (PC14/15).
 4. KXTJ3 tap/wake features; W25Q128 logging; ADC (ripple/VBUS taps).
+5. PC-link sentinels: trace the D+/D− ADC taps (likely among the
+   unclaimed PA0–PA7) and pick a temperature source to replace the 0
+   sentinels in the OpenFNB58 stream.

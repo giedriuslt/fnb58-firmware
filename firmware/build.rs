@@ -40,6 +40,7 @@ fn main() {
 
     let sources = [
         c_dir.join("fnb58_usb.c"),
+        c_dir.join("fnb58_hid.c"),
         vendor.join("libraries/drivers/src/at32f403a_407_usb.c"),
         vendor.join("libraries/drivers/src/at32f403a_407_crm.c"),
         vendor.join("libraries/drivers/src/at32f403a_407_acc.c"),
