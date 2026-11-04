@@ -39,7 +39,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r131";
+const BUILD: &[u8] = b"r132";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -131,7 +131,7 @@ async fn main(spawner: Spawner) {
         unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
         Timer::after_millis(50).await;
     }
-    say(b"[lcd] FNB58 r131: dump fix\r\n").await;
+    say(b"[lcd] FNB58 r132: enter only\r\n").await;
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -388,16 +388,10 @@ async fn main(spawner: Spawner) {
     // One-time ISR proof per EXINT line (the buttons double as the
     // interrupt canary; line 13 = the FUSB302 INT_N).
     let mut isr_seen = [false; 16];
-    // USB command line buffer (r129): PuTTY keys arrive one packet at a
-    // time; commands run on CR/LF or ~300 ms of input silence.
+    // USB command line buffer (r130): PuTTY keys arrive one packet at a
+    // time; commands run on Enter (CR/LF).
     let mut cmd_buf = [0u8; 12];
     let mut cmd_len = 0;
-    let mut last_cmd_byte: Option<embassy_time::Instant> = None;
-    // USB command line buffer (r128): PuTTY keys arrive one packet at
-    // a time; commands run on CR/LF or ~300 ms of input silence (r129).
-    let mut cmd_buf = [0u8; 12];
-    let mut cmd_len = 0;
-    let mut last_cmd_byte: Option<embassy_time::Instant> = None;
     // Screen orientation (r122): the APPLIED state and the detector's
     // settled state (r125: the hold tracks the detected state, so the
     // un-flip can fire too — r124 only ever flipped once).
@@ -555,38 +549,42 @@ async fn main(spawner: Spawner) {
             let _ = ok;
         }
 
-        // USB serial commands (r128/r129): 'i' = JEDEC ID, 'f<sector>' =
-        // dump one 4 KiB flash sector as hex. READ-ONLY by design —
-        // the flash driver has no write/erase code at all. PuTTY sends
-        // each keystroke as its own packet: commands accumulate in a
-        // line buffer and run on CR/LF or after ~300 ms of silence.
+        // USB serial commands (r130): 'i' + Enter = JEDEC ID,
+        // 'f<sector>' + Enter = dump one 4 KiB flash sector as hex.
+        // READ-ONLY by design — the flash driver has no write/erase code
+        // at all. PuTTY sends each keystroke as its own packet: commands
+        // accumulate in a line buffer and run on Enter (CR/LF). Every
+        // completed command is ECHOED first, so a missing response is
+        // attributable: echo seen = the bytes arrived and parsed; no
+        // echo = they did not.
         {
             let mut rbuf = [0u8; 64];
             let rn = unsafe { fnb58_usb_recv(rbuf.as_mut_ptr()) };
             for &b in &rbuf[..rn.min(64) as usize] {
                 if b == b'\r' || b == b'\n' {
                     if cmd_len > 0 {
-                        last_cmd_byte = None;
+                        let mut d = [0u8; 20];
+                        let mut w = 0;
+                        for &b in b"[flash] cmd:" {
+                            d[w] = b;
+                            w += 1;
+                        }
+                        for &b2 in &cmd_buf[..cmd_len] {
+                            d[w] = b' ';
+                            w += 1;
+                            d[w] = b2;
+                            w += 1;
+                        }
+                        d[w] = b'\r';
+                        d[w + 1] = b'\n';
+                        w += 2;
+                        send_direct(&d[..w]);
                         run_flash_command(&mut flash, &cmd_buf[..cmd_len], &mut sender);
                         cmd_len = 0;
                     }
                 } else if cmd_len < cmd_buf.len() {
                     cmd_buf[cmd_len] = b;
                     cmd_len += 1;
-                    last_cmd_byte = Some(embassy_time::Instant::now());
-                }
-                if cmd_len == cmd_buf.len() {
-                    run_flash_command(&mut flash, &cmd_buf[..cmd_len], &mut sender);
-                    cmd_len = 0;
-                    last_cmd_byte = None;
-                }
-            }
-            // Idle timeout: keystrokes run without pressing Enter.
-            if let Some(t) = last_cmd_byte {
-                if t.elapsed() >= embassy_time::Duration::from_millis(300) {
-                    run_flash_command(&mut flash, &cmd_buf[..cmd_len], &mut sender);
-                    cmd_len = 0;
-                    last_cmd_byte = None;
                 }
             }
         }
