@@ -39,7 +39,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r130";
+const BUILD: &[u8] = b"r131";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -765,8 +765,11 @@ fn send_sector_dump(flash: &mut flash::Flash, sector: u32) {
         return;
     }
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    // 16 bytes per line: 8 (addr+colon) + 48 (hex) = 56, inside the
+    // 64-byte USB packet AND the line buffer (r126's 24-byte lines
+    // overflowed the 64-byte buffer at the 19th byte -> panic).
     let mut line = [0u8; 64];
-    for (li, chunk) in sector_buf.chunks(24).enumerate() {
+    for (li, chunk) in sector_buf.chunks(16).enumerate() {
         let mut n = 0;
         let addr = (sector as usize * flash::SECTOR_SIZE) + li * 24;
         // 6-hex-digit address (no alloc: format! would need it).
