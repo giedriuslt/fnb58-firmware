@@ -64,6 +64,13 @@ pub trait Platform {
 /// still handled within about 5 ms, inside the 15 ms tReceiverResponse and
 /// the source's SenderResponseTimer (at least 27 ms, USB PD Table 7.9).
 pub const IDLE_POLL_MS: u32 = 4;
+/// r154 diagnostic: which gate refused the last refused transmission.
+/// 1 = hard-reset-armed/BIST, 2 = length, 3 = reset step pending,
+/// 4 = request in flight, 5 = SOP gate, 6 = permission list (includes
+/// the RDO review), 7 = header type, 8 = peer revision, 9 = PPS revision,
+/// 10 = session stopped; 0 = no refusal recorded since the last clear.
+pub static LAST_TX_REFUSAL: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
 /// Existing user stop gesture, in ms: hold Back for one second. A navigation
 /// tap must not start an EPR exit or stop servicing an SPR contract.
 const STOP_HOLD_MS: u64 = 1_000;
@@ -1014,6 +1021,7 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
         // A due Hard Reset is the only permitted next step; BIST Test Data
         // Mode permits no Message but the hardware GoodCRC (section 6.4.3.1).
         if self.hard_reset_armed || self.bist_test_data {
+            LAST_TX_REFUSAL.store(1, core::sync::atomic::Ordering::Relaxed);
             return Err(Error::Request);
         }
         let rdo = first_data_object(bytes).filter(|_| matches!(bytes.len(), 6 | 10));
@@ -1036,6 +1044,7 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
                 && rdo.is_some_and(|rdo| self.request_is_reviewed(rdo));
         // The TX FIFO image below holds at most one 30-byte message.
         if bytes.len() < 2 || bytes.len() > 30 {
+            LAST_TX_REFUSAL.store(2, core::sync::atomic::Ordering::Relaxed);
             return Err(Error::Request);
         }
         let header = u16::from_le_bytes([bytes[0], bytes[1]]);
@@ -1136,11 +1145,13 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
         // While a reset step is due it is the only permitted transmission, and
         // nothing is sent while capabilities are awaited after a reset.
         if self.reset.is_some() && !(soft_reset || reset_accept) {
+            LAST_TX_REFUSAL.store(3, core::sync::atomic::Ordering::Relaxed);
             return Err(Error::Request);
         }
         // One Request at a time: none while its Accept/Reject/Wait is awaited
         // (PE_SNK_Select_Capability) or power transitions (PE_SNK_Transition_Sink).
         if is_request && self.request.is_some() {
+            LAST_TX_REFUSAL.store(4, core::sync::atomic::Ordering::Relaxed);
             return Err(Error::Request);
         }
         let cable_optional = sop == Sop::Cable
@@ -1215,6 +1226,7 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
         let emarker_reply =
             sop == Sop::Cable && self.emarker_due.is_some_and(|due| due[..] == *bytes);
         if sop != Sop::Partner && !cable_identity && !emarker_reply {
+            LAST_TX_REFUSAL.store(5, core::sync::atomic::Ordering::Relaxed);
             return Err(Error::Request);
         }
         // Get_PPS_Status (sections 6.3.20, 7.16): PD3 only, from Ready with an
@@ -1353,6 +1365,7 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
             && !emarker_reply
             && !soft_reset
         {
+            LAST_TX_REFUSAL.store(6, core::sync::atomic::Ordering::Relaxed);
             return Err(Error::Request);
         }
         let expected_type = if cable_identity {
@@ -1379,6 +1392,7 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
             header & header::WITHOUT_ID_REVISION
         };
         if header & header::WITHOUT_ID_REVISION != expected_type {
+            LAST_TX_REFUSAL.store(7, core::sync::atomic::Ordering::Relaxed);
             return Err(Error::Request);
         }
         let revision = ((header & header::SPEC_REVISION) >> 6) as u8;
@@ -1386,6 +1400,7 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
             && self.trace().peer_revision.is_some()
             && revision != self.tx_revision
         {
+            LAST_TX_REFUSAL.store(8, core::sync::atomic::Ordering::Relaxed);
             return Err(Error::Request);
         }
         if is_request
@@ -1395,6 +1410,7 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
                 .is_some_and(|s| s.target_supply() != Supply::Fixed)
             && revision != header::REVISION_3
         {
+            LAST_TX_REFUSAL.store(9, core::sync::atomic::Ordering::Relaxed);
             return Err(Error::Request);
         }
         // nRetryCount: 3 for PD 2.0 (revision 1), 2 for PD 3.x (revision 2).
@@ -3060,6 +3076,7 @@ impl<B: GatedBus, D: Waiter, C: Clock, P: Platform> Driver for Session<'_, B, D,
     }
     async fn transmit(&mut self, bytes: &[u8]) -> Result<(), DriverTxError> {
         if self.stopped() {
+            LAST_TX_REFUSAL.store(10, core::sync::atomic::Ordering::Relaxed);
             return Err(DriverTxError::Discarded);
         }
         self.lifecycle = Lifecycle::Halted;

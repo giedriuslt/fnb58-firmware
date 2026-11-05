@@ -1,17 +1,20 @@
-//! FNB58 r102: EXINT everywhere. The user traced the FUSB302 INT_N to
-//! PC13 (LQFP48 pin 2 - the last untraced pin of the PD path). Buttons
-//! (PA15/PB4/PB9/PB8) and PC13 now run on external interrupts: each line
-//! latches in the ISR and wakes the main loop through a signal - buttons
-//! double as the interrupt canary (one '[exti] isr line=N ok' line per
-//! line on its first ISR), the PD poll runs immediately on every INT
-//! edge instead of waiting the 10 ms tick, and an i=N counter in the
-//! heartbeat shows whether the FUSB302 ever asserts INT_N. PD RX (r100:
-//! spontaneous caps parsed correctly) was poll-only; the INT path is
-//! what a real sink needs to hit tSenderResponse reliably.
-//! (History r88-r101: PD-on-request bisect chain - boot-time init
-//! rebooted the board; kws-x1-init fixes; TX SOP fix; PING-vs-
-//! Get_Source_Cap (type 5 vs 7); RDO bit 25; carrier-idle RX gate;
-//! re-attach pulse. See git log for the full chain.)
+//! FNB58 r139: PD first, buffered boot log, stall watch. The FUSB302
+//! session starts at boot on PC power — USB configured within a BOUNDED
+//! 3 s (r138's ungated boot session reboot-looped charger-only power:
+//! the session's auto-GoodCRCs string the source along, ITS Hard Reset
+//! dips VBUS, brownout, repeat; the log itself never waits — the 4096-B
+//! BootLog ring below is flushed when the host connects). A failed
+//! session now restores the FUSB302 power-on baseline so the source is
+//! not left waiting for a Request. r138's PC symptom (console stops
+//! right after the ring flush, no heartbeat) is instrumented: pd_task
+//! logs its lifecycle through PD_LOG, both tasks stamp stage atomics,
+//! and the SysTick stall watch prints '[watch] main=N pd=M' from the
+//! exception if the main loop stops moving; panics dump their location.
+//! PC13 (FUSB302 INT_N) EXINT goes live before the PD task spawns and
+//! pd_task's duplicated second CC diagnostic is gone (~640 ms earlier).
+//! (History r88-r137: EXINT r102; kws flow r119; safe mode r120;
+//! buzzer/accel/flash-read/console-cmds r121-r133; PC link r134/r135;
+//! internal temp r136/r137; early-PD + BootLog r138. See git log.)
 
 #![no_std]
 #![no_main]
@@ -40,11 +43,13 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r137";
+const BUILD: &[u8] = b"r154";
 
 use crate::ui::Press;
 use crate::ui::Screen;
 use crate::ui::Ui;
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 use embassy_executor::Spawner;
@@ -187,7 +192,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r137 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r154 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -260,7 +265,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r137 " {
+                for &b in b"r154 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -298,11 +303,27 @@ async fn main(spawner: Spawner) {
         }
     }
 
-    // --- r119: the PD session starts AT BOOT (kws-x1 flow) ---
+    // --- r138: the PD session starts AT BOOT, before USB ---
     // The charger is still announcing its capabilities for ~10 s after
     // attach; the earlier the engine's passive wait begins, the more of
-    // that window it catches. The I2C1 bus goes into the shared cell and
-    // the task spawns before the (up to 3 s) USB wait.
+    // that window it catches. PC13 (FUSB302 INT_N) EXINT goes live FIRST
+    // so the whole boot session's edges are counted — kws-x1 creates its
+    // ExtiInput before spawning the PD task (the fusb302-pd stack polls
+    // I2C, the IRQ is evidence only). Line 13 sits in EXINT15_10; PA15
+    // (line 15) joins later with its own ExtiInput setup, so this early
+    // unmask cannot fire it.
+    let pc13 = unsafe {
+        embassy_at32::gpio::InputPin::new_pull_up(embassy_at32::gpio::Port::C, 13)
+    }
+    .expect("PC13 claim");
+    let _pd_int = unsafe {
+        embassy_at32::exti::ExtiInput::from_input(pc13, embassy_at32::exti::Trigger::Falling)
+    };
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(interrupt::EXINT15_10);
+    }
+    // The I2C1 bus goes into the shared cell and the task spawns before
+    // the USB bring-up (which no longer blocks: see the BootLog ring).
     {
         use embassy_at32::gpio::{AlternatePin, Drive, Port};
         use embassy_at32::i2c::{I2c, Speed};
@@ -312,6 +333,12 @@ async fn main(spawner: Spawner) {
         // r129: PB14 = SPI2_MISO for the W25Q128 flash reads (the LCD
         // never needed MISO, so this pin was never muxed before).
         let _miso = unsafe { AlternatePin::new_push_pull(Port::B, 14, Drive::Moderate) };
+        // r150: back to 100 kHz Standard — r148's 400 kHz made the FUSB302
+        // (0x22) fail its transactions outright (start err=4 Config,
+        // baseline restore FAIL, err=768 on every press; the TPA626
+        // limped along) — this board's pull-ups do not support Fast mode.
+        // The speed was never the issue: the real r115-era root cause was
+        // the never-armed selection (r149).
         let i2c = unsafe { I2c::new_i2c1(clocks.pclk1_hz, Speed::Standard) };
         {
             let mut guard = pd_task::BUS.lock().await;
@@ -332,22 +359,14 @@ async fn main(spawner: Spawner) {
         fnb58_usb_init();
     }
 
-    // Wait for USB CDC to be configured (max 3 seconds).
-    for _ in 0..30 {
-        unsafe {
-            if fnb58_usb_configured() == 1 {
-                break;
-            }
-        }
-        Timer::after_millis(100).await;
+    // r138: no USB wait. Enumeration proceeds in the USB interrupts while
+    // the LCD/meter/accel bring-up runs; every boot line lands in the
+    // 4096-byte boot-log ring (BootLog below) and is sent once the host
+    // connects (the main loop flushes it, oldest first).
+    fn say(msg: &[u8]) {
+        boot_log().push(msg);
     }
-
-    // LCD bring-up: ST7789V init + color-bar test pattern.
-    async fn say(msg: &'static [u8]) {
-        unsafe { fnb58_usb_send(msg.as_ptr(), msg.len() as u16) };
-        Timer::after_millis(50).await;
-    }
-    say(b"[lcd] FNB58 r137: tempfix\r\n").await;
+    say(b"[lcd] FNB58 r154: tx gate codes\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -369,12 +388,14 @@ async fn main(spawner: Spawner) {
     let mut lcd = unsafe { lcd::Lcd::new(spi) };
     let mut flash = unsafe { flash::Flash::new(spi) };
     lcd.init().await;
-    say(b"[lcd] init done, drawing bars\r\n").await;
+    say(b"[lcd] init done, drawing bars\r\n");
     lcd.test_pattern().await;
-    say(b"[lcd] pattern drawn\r\n").await;
+    say(b"[lcd] pattern drawn\r\n");
     // r121: boot beep — audible confirmation of the PA8 buzzer (pin 29).
+    // r138: dwell cut 1500 -> 300 ms; the loop (and so the boot-log flush)
+    // starts that much sooner, and ui.enter below redraws anyway.
     buzzer.buzz(500, 30);
-    Timer::after_millis(1500).await;
+    Timer::after_millis(300).await;
 
     // --- the meter leases the shared I2C1 bus per read (r113) ---
     use embedded_hal_async::i2c::Operation;
@@ -399,13 +420,11 @@ async fn main(spawner: Spawner) {
     {
         let mut guard = pd_task::BUS.lock().await;
         if guard.0.as_mut().is_none() {
-            say(b"[meter] no i2c bus
-").await;
+            say(b"[meter] no i2c bus\r\n");
         }
         if let Some(bus) = guard.0.as_mut() {
             match tpa_read(bus, 0xFE).await {
-                Ok(0x5549) => say(b"[meter] rust i2c OK mfr=5549
-").await,
+                Ok(0x5549) => say(b"[meter] rust i2c OK mfr=5549\r\n"),
                 Ok(v) => {
                     let mut d = [0u8; 96];
                     let mut n = 0;
@@ -416,18 +435,16 @@ async fn main(spawner: Spawner) {
                     n = push_hex8(&mut d, n, v as u32);
                     d[n] = 13;
                     d[n + 1] = 10;
-                    unsafe { fnb58_usb_send(d.as_ptr(), (n + 2) as u16) };
-                    Timer::after_millis(500).await;
+                    say(&d[..n + 2]);
                 }
-                Err(_) => say(b"[meter] rust i2c read FAIL
-").await,
+                Err(_) => say(b"[meter] rust i2c read FAIL\r\n"),
             }
             let _ = tpa_write(bus, 0x00, 0x4897).await; // AVG=64, cont
             let cal: u16 = (5_120_000u32 / 500u32) as u16; // 10 mOhm shunt, 50 uA LSB
             let _ = tpa_write(bus, 0x05, cal).await;
         }
     }
-    say(b"[meter] rust tpa configured\r\n").await;
+    say(b"[meter] rust tpa configured\r\n");
 
     // --- r123: KXTJ3 accelerometer for the screen-flip detection ---
     let accel_ok = {
@@ -468,10 +485,9 @@ async fn main(spawner: Spawner) {
         d[n] = b'\r';
         d[n + 1] = b'\n';
         n += 2;
-        unsafe { fnb58_usb_send(d.as_ptr(), n as u16) };
-        Timer::after_millis(50).await;
+        say(&d[..n]);
     } else {
-        say(b"[accel] kxtj3 FAIL\r\n").await;
+        say(b"[accel] kxtj3 FAIL\r\n");
     }
 
     // --- UI: POWER + PD screens; buttons navigate (r70) ---
@@ -518,16 +534,12 @@ async fn main(spawner: Spawner) {
         )
     }
     .expect("PB8 exti");
-    let pc13 =
-        unsafe { embassy_at32::gpio::InputPin::new_pull_up(embassy_at32::gpio::Port::C, 13) }
-            .expect("PC13 claim");
-    let _pd_int =
-        unsafe { embassy_at32::exti::ExtiInput::from_input(pc13, embassy_at32::exti::Trigger::Falling) };
+    // PC13 (FUSB302 INT_N) was claimed and EXINT15_10 unmasked before the
+    // PD task spawned (r138); here the button lines join their IRQs.
     unsafe {
         use embassy_at32::pac::at32f403a::interrupt;
         cortex_m::peripheral::NVIC::unmask(interrupt::EXINT4);
         cortex_m::peripheral::NVIC::unmask(interrupt::EXINT9_5);
-        cortex_m::peripheral::NVIC::unmask(interrupt::EXINT15_10);
     }
 
     // r113: PD runs in its own task on the vendored fusb302-pd stack.
@@ -622,8 +634,11 @@ async fn main(spawner: Spawner) {
         // Wake on ANY EXTI edge (buttons, FUSB302 INT_N) or every 10 ms
         // as the fallback cadence. The ISR latches line bits and rings
         // the doorbell; nothing is lost when several edges coalesce.
+        MAIN_STAGE.store(1, Ordering::Relaxed); // stall watch: doorbell
         let _ = with_timeout(Duration::from_millis(10), DOORBELL.wait()).await;
         let events = EXTI_LATCH.swap(0, Ordering::AcqRel);
+        MAIN_STAGE.store(2, Ordering::Relaxed); // loop body
+        MAIN_SEQ.fetch_add(1, Ordering::Relaxed);
         tick = tick.wrapping_add(1);
 
         for line in [4u8, 8, 9, 13, 15] {
@@ -701,6 +716,7 @@ async fn main(spawner: Spawner) {
         // Orientation poll: 200 ms cadence; a flip must hold ~1 s before
         // the screen rotates (kws-x1's settle approach).
         if accel_ok && tick % 20 == 0 {
+            MAIN_STAGE.store(3, Ordering::Relaxed); // accel BUS lock
             let mut guard = pd_task::BUS.lock().await;
             if let Some(bus) = guard.0.as_mut() {
                 if let Ok(g) = kxtj3::read(bus).await {
@@ -742,6 +758,7 @@ async fn main(spawner: Spawner) {
 
         // Meter: 200 ms cadence (screen values; TPA conversion window).
         if tick % 20 == 0 {
+            MAIN_STAGE.store(4, Ordering::Relaxed); // meter BUS lock
             let mut guard = pd_task::BUS.lock().await;
             let Some(bus) = guard.0.as_mut() else {
                 continue;
@@ -809,7 +826,9 @@ async fn main(spawner: Spawner) {
         // send-failure count (f>0 = the host is not collecting packets)
         // and the PD power state (pd=1 adds the per-CC receiver diag).
         if tick % 200 == 0 {
-            let mut d = [0u8; 96];
+            // r140: 128-wide so every field's worst case fits (the old 96
+            // could overflow at 5-digit rx_packets / negative temps).
+            let mut d = [0u8; 128];
             let mut n = 0;
             for &b in b"[diag " {
                 d[n] = b;
@@ -833,7 +852,7 @@ async fn main(spawner: Spawner) {
                 d[n] = b;
                 n += 1;
             }
-            n = push_dec(&mut d, n, sender.take_fails());
+            n = push_dec(&mut d, n, sender.take_fails() % 10_000);
             for &b in b" i=" {
                 d[n] = b;
                 n += 1;
@@ -913,7 +932,36 @@ async fn main(spawner: Spawner) {
             sender.push(&d[..n]);
         }
 
-        sender.drain();
+        // r139: pd_task console lines join the queue (behind the boot-ring
+        // flush gate, like everything else).
+        {
+            let mut line = [0u8; 64];
+            loop {
+                let taken = PD_LOG.lock(|cell| {
+                    let mut log = cell.borrow_mut();
+                    if log.count == 0 {
+                        return None;
+                    }
+                    let slot = log.head;
+                    let len = log.lens[slot] as usize;
+                    line.copy_from_slice(&log.lines[slot]);
+                    log.head = (log.head + 1) % log.lines.len();
+                    log.count -= 1;
+                    Some(len)
+                });
+                match taken {
+                    Some(len) => sender.push(&line[..len]),
+                    None => break,
+                }
+            }
+        }
+
+        // r138: once the host connects, the boot ring is flushed first
+        // (bounded chunks per tick; a busy endpoint retries next tick);
+        // live queue lines follow, so the console reads in boot order.
+        if boot_log().flush_step(unsafe { fnb58_usb_configured() } == 1) {
+            sender.drain();
+        }
     }
 }
 
@@ -1032,12 +1080,170 @@ fn send_sector_dump(flash: &mut flash::Flash, sector: u32) {
     }
 }
 
+/// r138: 4096-byte boot-log ring. USB CDC connects seconds after boot (or
+/// never, on charger-only power); every boot line is kept here and sent
+/// once the host connects. Overflow drops the OLDEST bytes: recent
+/// evidence wins over boot-start evidence.
+pub(crate) struct BootLog {
+    buf: [u8; 4096],
+    /// Index of the oldest buffered byte.
+    head: usize,
+    /// Bytes currently buffered.
+    len: usize,
+    /// The ring was fully sent after connection; later lines go direct.
+    flushed: bool,
+    /// Oldest bytes dropped to fit newer lines.
+    dropped: u32,
+}
+
+static mut BOOT_LOG: BootLog = BootLog::new();
+
+/// The boot log. SAFETY: single-task use only — `say` during bring-up and
+/// the flush step in the main loop, both on the main task.
+fn boot_log() -> &'static mut BootLog {
+    unsafe { &mut *core::ptr::addr_of_mut!(BOOT_LOG) }
+}
+
+impl BootLog {
+    const fn new() -> Self {
+        Self {
+            buf: [0; 4096],
+            head: 0,
+            len: 0,
+            flushed: false,
+            dropped: 0,
+        }
+    }
+
+    /// Buffer `data` (or send it directly once the ring was flushed).
+    fn push(&mut self, data: &[u8]) {
+        if self.flushed {
+            send_direct(data);
+            return;
+        }
+        let mut data = data;
+        if data.len() > self.buf.len() {
+            // Oversize line even with an empty ring: keep its tail.
+            self.dropped += (data.len() - self.buf.len()) as u32;
+            data = &data[data.len() - self.buf.len()..];
+        }
+        if self.len + data.len() > self.buf.len() {
+            let drop_n = self.len + data.len() - self.buf.len();
+            self.head = (self.head + drop_n) % self.buf.len();
+            self.len -= drop_n;
+            self.dropped += drop_n as u32;
+        }
+        for &b in data {
+            self.buf[(self.head + self.len) % self.buf.len()] = b;
+            self.len += 1;
+        }
+    }
+
+    /// One non-blocking drain step once the host may be connected: send up
+    /// to four 64-byte chunks, stopping to retry on a busy endpoint (the
+    /// next loop tick continues). Returns true once the ring is empty and
+    /// the completion note was sent; live Sender lines may then follow.
+    fn flush_step(&mut self, configured: bool) -> bool {
+        if self.flushed {
+            return true;
+        }
+        if !configured {
+            return false;
+        }
+        let mut chunk = [0u8; 64];
+        for _ in 0..4 {
+            if self.len == 0 {
+                let mut note = [0u8; 48];
+                let mut n = 0;
+                for &b in b"[log] boot ring sent drop=" {
+                    note[n] = b;
+                    n += 1;
+                }
+                n = push_dec(&mut note, n, self.dropped);
+                note[n] = b'\r';
+                note[n + 1] = b'\n';
+                n += 2;
+                send_direct(&note[..n]);
+                self.flushed = true;
+                return true;
+            }
+            let take = self.len.min(64);
+            let first = take.min(self.buf.len() - self.head);
+            chunk[..first].copy_from_slice(&self.buf[self.head..self.head + first]);
+            chunk[first..take].copy_from_slice(&self.buf[..take - first]);
+            // SAFETY: single-threaded; the send is an endpoint buffer copy.
+            if unsafe { fnb58_usb_send(chunk.as_ptr(), take as u16) } != 0 {
+                return false; // endpoint busy: retry on the next tick
+            }
+            self.head = (self.head + take) % self.buf.len();
+            self.len -= take;
+        }
+        false
+    }
+}
+
+/// r139: pd_task -> console lines. A tiny CS-mutex ring buffer written by
+/// the PD task (`pd_log`) and drained by the main loop into the Sender
+/// queue (behind the boot-ring flush, like everything else); the oldest
+/// line is dropped when full.
+struct PdLog {
+    lines: [[u8; 64]; 8],
+    lens: [u8; 8],
+    head: usize,
+    count: usize,
+}
+static PD_LOG: embassy_sync::blocking_mutex::Mutex<
+    CriticalSectionRawMutex,
+    core::cell::RefCell<PdLog>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(PdLog {
+    lines: [[0; 64]; 8],
+    lens: [0; 8],
+    head: 0,
+    count: 0,
+}));
+
+/// Log one PD lifecycle line (called from pd_task).
+pub(crate) fn pd_log(line: &[u8]) {
+    if line.is_empty() || line.len() > 64 {
+        return;
+    }
+    PD_LOG.lock(|cell| {
+        let mut log = cell.borrow_mut();
+        if log.count == log.lines.len() {
+            log.head = (log.head + 1) % log.lines.len();
+            log.count -= 1;
+        }
+        let slot = (log.head + log.count) % log.lines.len();
+        log.lines[slot] = [0; 64];
+        log.lines[slot][..line.len()].copy_from_slice(line);
+        log.lens[slot] = line.len() as u8;
+        log.count += 1;
+    });
+}
+
+/// r139 stall watch: the main loop stamps MAIN_STAGE/MAIN_SEQ every pass;
+/// SysTick probes periodically and, if the stamp did not move across two
+/// probes, dumps both tasks' stages once over USB (best-effort raw send —
+/// the loop that normally owns the console is the thing that is stuck).
+/// MAIN_STAGE: 1 = doorbell wait, 2 = loop body, 3 = accel BUS lock,
+/// 4 = meter BUS lock. pd_task::STAGE: see pd_task.rs.
+static MAIN_STAGE: AtomicU8 = AtomicU8::new(0);
+static MAIN_SEQ: AtomicU32 = AtomicU32::new(0);
+static WATCH_FIRED: AtomicBool = AtomicBool::new(false);
+static WATCH_LAST: AtomicU32 = AtomicU32::new(u32::MAX);
+static SYSTICKS: AtomicU32 = AtomicU32::new(0);
+
 /// CDC line queue. The vendor send rejects a second call while one is in
 /// flight, so every console line the main loop produces (meter status,
-/// button events, PD capabilities) is queued here and drained with 500 ms
-/// gaps — one drain point guarantees the sends never collide.
+/// button events, PD capabilities) is queued here and drained one line
+/// per tick — one drain point guarantees the sends never collide.
+/// r140: slots are 128 bytes. The old 64-byte limit silently dropped the
+/// ~95-byte diag heartbeat (line.len() > 64) — since r119-ish NO heartbeat
+/// ever reached the host, which masqueraded as "PC: no log" and a phantom
+/// console stall. usbd_ept_send splits >64-byte lines into maxpacket
+/// chunks itself (usbd_int.c continues the remainder on IN-complete).
 pub(crate) struct Sender {
-    queue: [[u8; 64]; 20],
+    queue: [[u8; 128]; 20],
     qhead: usize,
     qlen: usize,
     /// Send attempts rejected by the busy endpoint since last take_fails().
@@ -1047,7 +1253,7 @@ pub(crate) struct Sender {
 impl Sender {
     fn new() -> Self {
         Self {
-            queue: [[0; 64]; 20],
+            queue: [[0; 128]; 20],
             qhead: 0,
             qlen: 0,
             fails: 0,
@@ -1055,11 +1261,11 @@ impl Sender {
     }
 
     pub(crate) fn push(&mut self, line: &[u8]) {
-        if self.qlen == self.queue.len() || line.len() > 64 {
+        if self.qlen == self.queue.len() || line.len() > 128 {
             return; // backlog or oversize: drop, the next report suffices
         }
         let slot = (self.qhead + self.qlen) % self.queue.len();
-        self.queue[slot] = [0; 64];
+        self.queue[slot] = [0; 128];
         self.queue[slot][..line.len()].copy_from_slice(line);
         self.qlen += 1;
     }
@@ -1094,7 +1300,7 @@ impl Sender {
 
 /// Append decimal representation of `v` to `buf` at `pos`, returning the
 /// new position (uncapped by design; callers size buffers generously).
-fn push_dec(buf: &mut [u8], pos: usize, v: u32) -> usize {
+pub(crate) fn push_dec(buf: &mut [u8], pos: usize, v: u32) -> usize {
     let mut tmp = [0u8; 10];
     let mut n = 0;
     let mut x = v;
@@ -1135,7 +1341,7 @@ fn crc8_fnb58(data: &[u8]) -> u8 {
 }
 
 /// Append `v` as two lowercase hex digits.
-fn push_hex8(buf: &mut [u8], pos: usize, v: u32) -> usize {
+pub(crate) fn push_hex8(buf: &mut [u8], pos: usize, v: u32) -> usize {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     buf[pos] = HEX[((v >> 4) & 0xF) as usize];
     buf[pos + 1] = HEX[(v & 0xF) as usize];
@@ -1176,6 +1382,35 @@ unsafe fn EXINT15_10() {
 #[cortex_m_rt::exception]
 fn SysTick() {
     embassy_at32::time_driver::systick_tick();
+    // r139 stall watch: probe MAIN_SEQ periodically; if it did not move
+    // across two probes (and the loop had started), name the blocking
+    // stage of BOTH tasks once, straight from the exception. The raw send
+    // is best-effort: the loop that owns the console is the stuck one.
+    let n = SYSTICKS.fetch_add(1, Ordering::Relaxed);
+    if n % 2048 == 0 {
+        let seq = MAIN_SEQ.load(Ordering::Relaxed);
+        let last = WATCH_LAST.swap(seq, Ordering::Relaxed);
+        if seq != 0 && seq == last && !WATCH_FIRED.swap(true, Ordering::Relaxed) {
+            let mut d = [0u8; 40];
+            let mut w = 0;
+            for &b in b"[watch] main=" {
+                d[w] = b;
+                w += 1;
+            }
+            w = push_dec(&mut d, w, u32::from(MAIN_STAGE.load(Ordering::Relaxed)));
+            for &b in b" pd=" {
+                d[w] = b;
+                w += 1;
+            }
+            w = push_dec(&mut d, w, u32::from(pd_task::STAGE.load(Ordering::Relaxed)));
+            d[w] = b'\r';
+            d[w + 1] = b'\n';
+            w += 2;
+            unsafe {
+                fnb58_usb_send(d.as_ptr(), w as u16);
+            }
+        }
+    }
 }
 
 /// Drop the D+ pull-up on fault. The device VANISHES from the host.
@@ -1192,7 +1427,46 @@ fn fault_halt() -> ! {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // r139: best-effort panic evidence before the halt — the location as
+    // one raw console line (the boot ring dies with the board, USB may
+    // still be up; a failed send costs nothing, we halt anyway).
+    if let Some(location) = info.location() {
+        let mut d = [0u8; 96];
+        let mut w = 0;
+        for &b in b"[panic] " {
+            d[w] = b;
+            w += 1;
+        }
+        // Keep the tail of long workspace paths.
+        let file = location.file().as_bytes();
+        let file = &file[file.len().saturating_sub(70)..];
+        for &b in file {
+            d[w] = b;
+            w += 1;
+        }
+        d[w] = b':';
+        w += 1;
+        let mut digits = [0u8; 6];
+        let mut t = 0;
+        let mut line_no = location.line();
+        while line_no > 0 && t < digits.len() {
+            digits[t] = b'0' + (line_no % 10) as u8;
+            line_no /= 10;
+            t += 1;
+        }
+        while t > 0 {
+            t -= 1;
+            d[w] = digits[t];
+            w += 1;
+        }
+        d[w] = b'\r';
+        d[w + 1] = b'\n';
+        w += 2;
+        unsafe {
+            fnb58_usb_send(d.as_ptr(), w as u16);
+        }
+    }
     fault_halt()
 }
 

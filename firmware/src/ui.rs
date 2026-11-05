@@ -187,16 +187,19 @@ impl Ui {
             l.push(&[b]);
         }
         if mv >= 1000 {
-            l.num_u32(u32::from(mv), 1);
+            // r142: mv is MILLIVOLTS - scale to volts first (5000 mV
+            // printed as "500.0V" before). Line12 caps at 12 chars, so
+            // whole volts + one-decimal amps fit: "SEL 5V 3.0A".
+            l.num_u32(u32::from(mv) / 1000, 0);
             l.push(b"V ");
         } else {
             l.push(b"- ");
         }
         if ma >= 1000 {
-            l.num_u32(u32::from(ma), 0);
-            l.push(b"MA");
+            l.num_u32(u32::from(ma) / 100, 1);
+            l.push(b"A");
         } else {
-            l.push(b"-MA");
+            l.push(b"-A");
         }
         l.pad();
         lcd.draw_text(8, 90, l.bytes(), 2, GREEN, BLACK).await;

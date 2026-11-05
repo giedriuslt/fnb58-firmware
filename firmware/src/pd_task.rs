@@ -1,5 +1,6 @@
-//! The PD sink session task: waits for the OK request on the PD screen,
-//! runs the one-shot CC diagnostic and the persistent sink session from the
+//! The PD sink session task: starts the CC diagnostic and the sink session
+//! at boot (kws-x1's order — the charger's caps window opens at attach),
+//! then serves OK presses with further one-shot sessions, all from the
 //! vendored `fusb302-pd` + `pd-protocol` stack, and publishes a Copy view
 //! for the UI.
 //!
@@ -17,9 +18,7 @@ use fusb302_pd::observation::{Observation, Phase};
 use fusb302_pd::startup::Report;
 use pd_protocol::pd_spr;
 
-use crate::pd_phy::{
-    self, Clock, FnbLimits, MEASURE, SharedBus, spin, wait_for_rx_idle,
-};
+use crate::pd_phy::{self, FnbLimits, MEASURE, SharedBus, wait_for_rx_idle};
 
 /// The HAL I2c handle, boxed for the shared bus. `I2c` is `!Send`/`!Sync`
 /// (svd2rust register blocks contain UnsafeCell); single-core firmware
@@ -48,12 +47,16 @@ pub static BUS: Bus = Bus::new();
 pub static START: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Pressed-button bitmask from the main loop (bit 0 = BACK held).
 pub static BTN: AtomicU8 = AtomicU8::new(0);
+/// r139 stall-watch breadcrumb: 1 = USB gate, 2 = CC diagnostic,
+/// 3 = session start, 4 = engine, 5 = finish/restore, 6 = parked on OK.
+pub static STAGE: AtomicU8 = AtomicU8::new(0);
 const BACK_BIT: u8 = 0x01;
 
 /// What the UI renders on the PD screen. Atomics: the task writes, the main
 /// loop reads, no locks.
 pub struct View {
-    /// `Phase` code (Waiting 0, Negotiating 2, Contracted 3, Failed 4, ...).
+    /// `phase_code` value (Waiting 0, Failed 2, Negotiating 10,
+    /// Contracted 11, Hold 12, ...).
     pub phase: AtomicU8,
     pub selected_mv: AtomicU16,
     pub selected_ma: AtomicU16,
@@ -144,12 +147,15 @@ fn stop_requested() -> bool {
     BTN.load(Ordering::Relaxed) & BACK_BIT != 0 || restart_requested()
 }
 
-/// The engine's error mapped to a diagnostic code for the PD screen.
 /// Write the power-on configuration back: a session that dies mid-startup
 /// (Hard Reset received, bus error) leaves SWITCHES0/1 and POWER in session
 /// state, and every later attempt would fail the crate's Baseline gate
 /// (the r113 first-run err=0x102 = register 0x02). DEVICE_ID is read-only
-/// and skipped.
+/// and skipped. r145: also DRAIN the read-clear INTERRUPT/A/B latches
+/// (0x3e/0x3f/0x42) — a session that ends without its own final poll
+/// leaves flags latched there, and the next Session::begin boundary gate
+/// refuses on them (the r144 'start err=99' = TransmissionFault). Reading
+/// clears; a real fault re-latches and the next begin still catches it.
 async fn restore_baseline(bus: &mut embassy_at32::i2c::I2c) -> Result<(), ()> {
     use fusb302_pd::phy::Platform as _;
     let baseline = <crate::pd_phy::FnbPlatform as fusb302_pd::phy::Platform>::BASELINE;
@@ -162,12 +168,20 @@ async fn restore_baseline(bus: &mut embassy_at32::i2c::I2c) -> Result<(), ()> {
         .take(10)
         .zip(baseline.iter().skip(1))
     {
-        let _ = bus.write(0x22, &[*reg, *value]).await.map_err(|_| ())?;
+        bus.write(0x22, &[*reg, *value]).await.map_err(|_| ())?;
+    }
+    // Drain the latched interrupt flags (read-clear registers).
+    for reg in fusb302_pd::register::INTERRUPTS {
+        let mut flag = [0u8];
+        bus.write_read(fusb302_pd::snapshot::ADDRESS, &[reg], &mut flag)
+            .await
+            .map_err(|_| ())?;
     }
     Ok(())
 }
 
 
+/// The session/PHY error mapped to a diagnostic code for the PD screen.
 fn error_code(error: &pd_phy::Error<embassy_at32::i2c::Error>) -> u16 {
     use pd_phy::Error as E;
     match error {
@@ -192,6 +206,12 @@ fn error_code(error: &pd_phy::Error<embassy_at32::i2c::Error>) -> u16 {
         E::HardResetNeeded => 20,
         E::NotAcknowledged => 21,
         E::Peer => 22,
+        // r144: name these instead of the anonymous 99 - HardResetVbus is
+        // the expected restart outcome with the micro-B PC attached (its
+        // 5 V holds the shared VBUS rail through the charger's dip).
+        E::HardResetVbus => 23,
+        E::BistCarrierVbus => 24,
+        E::Deferred => 25,
         _ => 99,
     }
 }
@@ -258,28 +278,80 @@ fn restart_requested() -> bool {
 
 #[embassy_executor::task]
 pub async fn run() {
-    // The BOOT session starts immediately ONLY on PC power (r119's
-    // lesson: the charger Hard-Reset loops VBUS when its caps are acked
-    // but the Request is never accepted, and charger-only power browns
-    // out on every dip). Charger-only waits for an explicit OK.
+    // r139: the boot session runs on PC power — USB configured within a
+    // BOUNDED 3 s (hosts finish enumeration in ~1 s, still well inside
+    // the source's ~10 s caps window). r138 started it unconditionally
+    // and charger-only power reboot-looped: the session's automatic
+    // GoodCRCs string the source along, its Hard Reset dips VBUS, the
+    // board browns out and the next boot acks fresh caps again (the r119
+    // wall; the HR is the charger's, so one-shot mode cannot prevent it).
+    // The boot LOG waits for nothing either way: the 4096-byte ring
+    // (main.rs BootLog) captures everything and flushes on connection.
+    // STAGE breadcrumbs feed the SysTick stall watch in main.rs.
     unsafe extern "C" {
         fn fnb58_usb_configured() -> u32;
     }
+    let boot_ms = embassy_time::Instant::now().as_millis();
+    STAGE.store(1, Ordering::Relaxed); // 1 = USB gate
     let mut powered = false;
-    for _ in 0..40 {
+    for _ in 0..30 {
         if unsafe { fnb58_usb_configured() } == 1 {
             powered = true;
             break;
         }
         embassy_time::Timer::after_millis(100).await;
     }
+    // r142: charger-only OK presses INSIDE the source's post-attach caps
+    // window (~15 s: nCapsCount + NoResponse HR + one re-announce) string
+    // the source along with our auto-GoodCRC, and its Hard Reset dips
+    // VBUS - the r119 brownout, once per press (r141 hw result). A session
+    // that starts AFTER the window is harmless: the idle source never
+    // transmits, nothing is acked, no HR. Defer charger-only sessions
+    // until 20 s past boot; the LCD shows FAIL 45 meanwhile.
+    let charger_only = !powered;
+    crate::pd_log(if powered {
+        b"[pd] pc power: boot session\r\n"
+    } else {
+        b"[pd] no usb 3s: OK-only\r\n"
+    });
     let mut first = powered;
     loop {
         if !first {
+            STAGE.store(6, Ordering::Relaxed); // parked, waiting for OK
             START.wait().await;
         }
         first = false;
-        RESTART.store(false, Ordering::Relaxed);
+        // r145: RESTART is NO LONGER wiped here. request_restart() is the
+        // only START signaler, so wiping it turned every OK press into a
+        // plain session (the r144 log: no HR, no rerun). The flag is
+        // consumed below once the restart has been performed; every OK
+        // press is a restart now.
+        // r142 source-window deferral (charger-only): see `charger_only`.
+        // Error 45 = "source announce window, wait and press again".
+        // r147: a PC arriving LATE (past the 3 s gate — the cause of a
+        // confusing 'no usb 3s' boot with a working console) still counts:
+        // its 5 V backs the board through HR dips, so from that moment
+        // the deferral is unnecessary.
+        if charger_only && unsafe { fnb58_usb_configured() } != 1 {
+            const SRC_WINDOW_MS: u64 = 20_000;
+            let elapsed = embassy_time::Instant::now().as_millis() - boot_ms;
+            if elapsed < SRC_WINDOW_MS {
+                VIEW.error.store(45, Ordering::Relaxed);
+                VIEW.phase.store(phase_code(Phase::Failed), Ordering::Relaxed);
+                crate::pd_log(b"[pd] src window, wait\r\n");
+                continue;
+            }
+        }
+        STAGE.store(2, Ordering::Relaxed); // CC diagnostic
+        // r145: fresh view per attempt — a stale err=45/40/st= from the
+        // previous attempt mislabeled the next one on the LCD.
+        VIEW.error.store(0, Ordering::Relaxed);
+        VIEW.phase.store(phase_code(Phase::Waiting), Ordering::Relaxed);
+        VIEW.boot_step.store(0, Ordering::Relaxed);
+        VIEW.tx_written.store(false, Ordering::Relaxed);
+        VIEW.rx_packets.store(0, Ordering::Relaxed);
+        VIEW.rx_error.store(0, Ordering::Relaxed);
+        VIEW.listen.store(0, Ordering::Relaxed);
 
         // One-shot CC diagnostic on the power-on configuration: measures
         // both CCs with Rd on both and listens for the source's traffic;
@@ -287,6 +359,10 @@ pub async fn run() {
         let report: Option<Report> = {
             let mut guard = BUS.lock().await;
             let Some(bus) = guard.0.as_mut() else {
+                // r145: loud, not silent (a skipped boot session used to
+                // leave no trace at all).
+                VIEW.error.store(26, Ordering::Relaxed);
+                crate::pd_log(b"[pd] no bus\r\n");
                 continue;
             };
             // Restore the power-on configuration FIRST: a previous session
@@ -343,11 +419,76 @@ pub async fn run() {
             }
         };
         let Some(report) = report else { continue };
+        {
+            // r139: the diagnostic's verdict into the console (PD_LOG).
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut d = [0u8; 40];
+            let mut n = 0;
+            for &b in b"[pd] diag cc=" {
+                d[n] = b;
+                n += 1;
+            }
+            for &status in &report.status {
+                d[n] = HEX[(status >> 4) as usize];
+                d[n + 1] = HEX[(status & 0xF) as usize];
+                d[n + 2] = b',';
+                n += 3;
+            }
+            d[n - 1] = b' ';
+            for &b in b"li=" {
+                d[n] = b;
+                n += 1;
+            }
+            // r145: same meaning as VIEW.listen (traffic seen), not
+            // merely "the listen ran".
+            d[n] = b'0'
+                + u8::from(report.listen.is_some_and(|l| l.traffic.is_some()));
+            n += 1;
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            crate::pd_log(&d[..n + 2]);
+        }
 
-        // --- Phase B: the persistent sink session on the fresh attach.
-        // The engine selects the target and drives Requests; our Platform
-        // supplies VBUS and policy.
+        // --- The sink session on the fresh attach: the engine selects the
+        // target and drives Requests; our Platform supplies VBUS and
+        // policy. The diagnostic above ran ONCE (kws-x1's flow; before
+        // r138 a second run repeated it, delaying the session start by up
+        // to ~640 ms of listen windows).
         let selection = pd_spr::Selection::<FnbLimits>::new();
+        // r149: ARM the first Request ourselves. The shared engine NEVER
+        // auto-requests — kws-x1's product sends PdCommand::Confirm from
+        // its selector UI ("nothing is transmitted before Confirm",
+        // firmware-core buttons.rs), and our config had control: None, so
+        // the selection's pending stayed None forever: caps arrived and
+        // were auto-GoodCRC'd, no Request followed, and the source
+        // Hard-Reset us (the r147/r148 st=5/0/1 code 37/40 wall — the
+        // same shape as r115's mystery). Once caps are advertised, request
+        // the highest offered fixed target.
+        let control =
+            |_observation: &mut Observation, _store: Option<&dyn pd_protocol::pd_svids::Store>| {
+                use pd_protocol::pd_spr::Supply;
+                if selection.established_target().is_none()
+                    && !selection.has_pending()
+                    && !selection.request_in_flight()
+                {
+                    let mut best = None;
+                    for index in 0..selection.option_count() {
+                        if let Some(target) = selection.option(index)
+                            && matches!(target.supply, Supply::Fixed)
+                            && best.is_none_or(|current: pd_protocol::pd_spr::Target| {
+                                target.mv > current.mv
+                            })
+                        {
+                            best = Some(target);
+                        }
+                    }
+                    if let Some(target) = best
+                        && selection.preview(target)
+                    {
+                        selection.confirm();
+                    }
+                }
+            };
         // r120: ONE-SHOT sessions. A persistent engine loops Hard Resets
         // when the charger refuses to acknowledge the Request, and every
         // Hard Reset dips VBUS - a brownout on charger-only power. One
@@ -355,7 +496,9 @@ pub async fn run() {
         let config = pd_phy::Config {
             persistent: false,
             selection: Some(&selection),
-            control: None,
+            // r149: the arming callback above (was None — the engine
+            // never transmitted without it).
+            control: Some(&control),
             identity_started: None,
             publish: Some(&publish),
             trace_steps: true,
@@ -364,65 +507,12 @@ pub async fn run() {
             svids: None,
             emarker: false,
         };
-        let report = {
-            let mut guard = BUS.lock().await;
-            let Some(bus) = guard.0.as_mut() else {
-                continue;
-            };
-            if restore_baseline(bus).await.is_err() {
-                VIEW.error.store(0x300, Ordering::Relaxed);
-                continue;
-            }
-            let snapshot = match fusb302_pd::snapshot::snapshot(bus).await {
-                Ok(snapshot) => snapshot,
-                Err(failure) => {
-                    VIEW.error.store(u16::from(failure.register) | 0x100, Ordering::Relaxed);
-                    continue;
-                }
-            };
-            VIEW.phase.store(phase_code(Phase::Measuring), Ordering::Relaxed);
-            let mut delay = embassy_time::Delay;
-            match fusb302_pd::startup::Diagnostic::once(
-                <crate::pd_phy::FnbPlatform as fusb302_pd::phy::Platform>::BASELINE,
-                MEASURE,
-            )
-            .run(bus, &mut delay, snapshot)
-            .await
-            {
-                Ok(report) => {
-                    VIEW.cc1.store(report.status[0], Ordering::Relaxed);
-                    VIEW.cc2.store(report.status[1], Ordering::Relaxed);
-                    VIEW.listen.store(
-                        u8::from(report.listen.is_some_and(|l| l.traffic.is_some())),
-                        Ordering::Relaxed,
-                    );
-                    Some(report)
-                }
-                Err(failure) => {
-                    VIEW.error.store(
-                        match failure.error {
-                            fusb302_pd::config::Error::Baseline { register, .. }
-                            | fusb302_pd::config::Error::Verify { register, .. } => {
-                                u16::from(register) | 0x100
-                            }
-                            fusb302_pd::config::Error::Bus { register, .. } => {
-                                u16::from(register) | 0x200
-                            }
-                        },
-                        Ordering::Relaxed,
-                    );
-                    None
-                }
-            }
-        };
-        let Some(report) = report else { continue };
-
-        let selection = pd_spr::Selection::<FnbLimits>::new();
         let mut bus = SharedBus;
         let clock = PdClock;
         let mut delay = embassy_time::Delay;
         let mut observation = Observation::new();
         observation.phase = Phase::Negotiating;
+        STAGE.store(3, Ordering::Relaxed); // session start
         let (mut phy, started) = pd_phy::Session::start(
             &mut bus,
             &mut delay,
@@ -433,10 +523,65 @@ pub async fn run() {
         )
         .await;
         let mut error = started.err();
+        let mut rerun = false; // r144: fresh-attach re-run after our HR
+        let mut clean_stop = false; // r145: BACK stop finished the contract
+        {
+            let code = error.as_ref().map_or(0, error_code);
+            let mut d = [0u8; 32];
+            let mut n = 0;
+            for &b in b"[pd] start err=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(&mut d, n, u32::from(code));
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            crate::pd_log(&d[..n + 2]);
+        }
         let mut engine_code = 0u16;
-        if error.is_none() {
+        // r154: fresh refusal code per attempt.
+        fusb302_pd::phy::LAST_TX_REFUSAL.store(0, Ordering::Relaxed);
+        if restart_requested() && error.is_none() {
+            // r147: a restart press never runs the engine — kws-x1's
+            // restart_unheard shape (Session::start, then the Hard Reset
+            // at once, against a source never heard). The r143-r146
+            // post-engine phy.restart() was refused silently three rounds
+            // in a row (the engine's failure leaves the session unusable
+            // for it; the old no-chain guard swallowed the error without
+            // a log line), so the HR never went out.
+            crate::pd_log(b"[pd] restart: HR now\r\n");
+            STAGE.store(4, Ordering::Relaxed); // busy in session
+            error = phy.restart_unheard().await.err();
+            if phy.hard_reset_sent() {
+                RESTART.store(false, Ordering::Relaxed); // performed
+                match phy.transition_to_default().await {
+                    Ok(()) => {
+                        cortex_m::peripheral::SCB::sys_reset();
+                    }
+                    // r144: with the micro-B PC attached its 5 V holds the
+                    // shared VBUS rail up through the charger's HR dip, so
+                    // the spec's vSafe0V -> vSafe5V ceremony can never pass
+                    // (HardResetVbus = 23). The HR WAS sent and honored -
+                    // which is the point: re-run a session at once, inside
+                    // the source's fresh announce window, no reboot needed.
+                    Err(failure) => {
+                        VIEW.error.store(error_code(&failure), Ordering::Relaxed);
+                        rerun = true;
+                        crate::pd_log(b"[pd] restart: vbus held, rerun\r\n");
+                    }
+                }
+            } else {
+                crate::pd_log(b"[pd] restart: HR NOT sent\r\n");
+                if error.is_none() {
+                    // nothing happened; drop the request so it cannot loop
+                    RESTART.store(false, Ordering::Relaxed);
+                    START.reset();
+                }
+            }
+        } else if error.is_none() {
             let trace = RefCell::new(pd_spr::MaintainedTrace::default());
             let mut trial = pd_spr::Trial::maintained();
+            STAGE.store(4, Ordering::Relaxed); // engine running
             match trial
                 .run_selectable::<_, PdClock>(&mut phy, &trace, &selection)
                 .await
@@ -448,33 +593,175 @@ pub async fn run() {
                     engine_code = engine_error_code(&failure);
                     error = phy.take_error();
                     if error.is_none() && matches!(failure, pd_spr::Error::Stopped) {
-                        // A requested stop: finish the contract cleanly
-                        // when one exists (BACK stop; a restart continues
-                        // below with the Hard Reset path instead).
-                        if restart_requested() {
-                            RESTART.store(false, Ordering::Relaxed);
-                            if phy.hard_reset_sent() {
-                                match phy.transition_to_default().await {
-                                    Ok(()) => {
-                                        cortex_m::peripheral::SCB::sys_reset();
-                                    }
-                                    Err(f) => error = Some(f),
-                                }
-                            }
-                        } else {
+                        // A requested stop: BACK finishes the contract
+                        // cleanly; an OK restart continues below with the
+                        // Hard Reset path.
+                        if !restart_requested() {
                             let contract = trace.borrow().contract.clone();
                             if let Some(contract) = contract {
                                 if let Err(f) = phy.finish(&contract).await {
                                     error = Some(f);
+                                } else {
+                                    // r145: a clean BACK stop is not a
+                                    // failure (it used to report err 32).
+                                    clean_stop = true;
                                 }
                             }
                         }
                     }
                 }
             }
+            // r153: what the engine actually asked for — the reviewed RDO
+            // from the maintained trace (offer vs request, finally both
+            // visible in one log).
+            if let Some(contract) = trace.borrow().contract.clone() {
+                let mut d = [0u8; 32];
+                let mut n = 0;
+                for &b in b"[pd] rdo=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                for shift in [24u32, 16, 8, 0] {
+                    n = crate::push_hex8(&mut d, n, (contract.request.0 >> shift) & 0xFF);
+                }
+                d[n] = b'\r';
+                d[n + 1] = b'\n';
+                n += 2;
+                crate::pd_log(&d[..n]);
+            }
         }
         if error.is_none() {
             error = phy.take_error();
+        }
+        {
+            let code = if engine_code != 0 {
+                engine_code
+            } else {
+                error.as_ref().map_or(0, error_code)
+            };
+            // r148: the SprObservation trace — WHY nothing was sent.
+            // w = tx_written, g = tx GoodCRC seen, c = sink_tx_cause (the
+            // phy's refusal char: G SinkTxOK gate, C source message won,
+            // Q quiet override, V cable-safe-5V, '-' none), r = request
+            // MessageID, and on a TX timeout its STATUS1 + INTERRUPTA.
+            let mut d = [0u8; 64];
+            let mut n = 0;
+            for &b in b"[pd] engine code=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(&mut d, n, u32::from(code));
+            if let Some(spr) = phy.observation.spr {
+                for &b in b" w=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                d[n] = b'0' + u8::from(spr.tx_written);
+                n += 1;
+                for &b in b" g=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                d[n] = b'0' + u8::from(spr.tx_goodcrc);
+                n += 1;
+                for &b in b" c=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                d[n] = if spr.sink_tx_cause.is_ascii_alphabetic() {
+                    spr.sink_tx_cause
+                } else {
+                    b'-'
+                };
+                n += 1;
+                for &b in b" r=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                match spr.request_id {
+                    Some(id) => d[n] = b'0' + (id & 7),
+                    None => d[n] = b'-',
+                }
+                n += 1;
+                // r154: the phy's last refused-transmission gate
+                // (see fusb302-pd phy.rs LAST_TX_REFUSAL).
+                for &b in b" x=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                d[n] = b'0' + fusb302_pd::phy::LAST_TX_REFUSAL.load(Ordering::Relaxed);
+                n += 1;
+                if let Some(timeout) = spr.tx_timeout {
+                    for &b in b" t=1 s1=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = crate::push_hex8(&mut d, n, u32::from(timeout.status1));
+                    for &b in b" ia=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = crate::push_hex8(&mut d, n, u32::from(timeout.flags));
+                }
+            }
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            crate::pd_log(&d[..n + 2]);
+        }
+        // r151/r152: the offer, finally visible — the charger's PDOs were
+        // never decoded off-device in any round. r151's print showed only
+        // two bytes per PDO (push_hex8 is 2 digits); print the FULL
+        // 32-bit words, one line per object, first four.
+        if let Some(caps) = phy.observation.capabilities {
+            let mut d = [0u8; 24];
+            let mut n = 0;
+            for &b in b"[pd] caps n=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(&mut d, n, u32::from(caps.count));
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            n += 2;
+            crate::pd_log(&d[..n]);
+            for (i, object) in caps.objects.iter().take(4).enumerate() {
+                if i >= usize::from(caps.count) {
+                    break;
+                }
+                // r153: the PARSED fixed values too — raw alone left the
+                // offer ambiguous by hand.
+                let mut d = [0u8; 48];
+                let mut n = 0;
+                for &b in b"[pd] p" {
+                    d[n] = b;
+                    n += 1;
+                }
+                d[n] = b'1' + i as u8;
+                n += 1;
+                d[n] = b'=';
+                n += 1;
+                for shift in [24u32, 16, 8, 0] {
+                    n = crate::push_hex8(&mut d, n, (object.raw >> shift) & 0xFF);
+                }
+                if let Some((mv, ma)) = object.fixed {
+                    d[n] = b' ';
+                    n += 1;
+                    n = crate::push_dec(&mut d, n, u32::from(mv));
+                    for &b in b"mV" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = crate::push_dec(&mut d, n, u32::from(ma));
+                    for &b in b"mA" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                }
+                d[n] = b'\r';
+                d[n + 1] = b'\n';
+                n += 2;
+                crate::pd_log(&d[..n]);
+            }
         }
         if let Some(failure) = &error {
             let code = error_code(failure);
@@ -486,26 +773,52 @@ pub async fn run() {
                 embassy_time::Timer::after_millis(1_600).await;
             }
         }
+        // r141: a finished-with-failure session reports Failed, not a
+        // stale Negotiating (kws-x1's wrapper does the same) — on
+        // charger-only power the LCD is the only readout, and a dead
+        // session showing NEGOTIATING forever misled it. r145: a clean
+        // BACK stop is exempt (not a failure).
+        if (error.is_some() || engine_code != 0) && !clean_stop {
+            phy.observation.phase = Phase::Failed;
+        }
         publish(phy.observation);
-        if error.is_none() && engine_code != 0 {
+        if error.is_none() && engine_code != 0 && !clean_stop {
             VIEW.error.store(engine_code, Ordering::Relaxed);
         }
 
-        // kws-x1's restart: an OK-pressed stop restarts the charger with a
-        // Hard Reset, transitions to default, and reboots the firmware so
-        // the boot session starts against the fresh attach.
-        if restart_requested() && error.is_none() && engine_code == 32 && phy.hard_reset_sent() {
-            match phy.transition_to_default().await {
-                Ok(()) => {
-                    cortex_m::peripheral::SCB::sys_reset();
-                }
-                Err(failure) => {
-                    VIEW.error.store(error_code(&failure), Ordering::Relaxed);
-                }
-            }
+        // r145/r147: a failed restart must not chain (a still-set RESTART
+        // plus any pending START signal would loop Hard Reset attempts) —
+        // and unlike r146 it is never silent.
+        if restart_requested() && error.is_some() {
+            crate::pd_log(b"[pd] restart FAIL\r\n");
+            RESTART.store(false, Ordering::Relaxed);
+            START.reset();
         }
         if !phy.stopped() {
             phy.stop();
+        }
+        STAGE.store(5, Ordering::Relaxed); // finish / restore
+        // r139: a failed session must not leave the FUSB302 acking caps —
+        // the r138 charger-only reboot loop: the auto-GoodCRC keeps the
+        // source waiting for a Request that never comes, its Hard Reset
+        // dips VBUS. Blind-restore the power-on baseline exactly like the
+        // session-start path (r114); the next attempt re-verifies anyway.
+        if error.is_some() || engine_code != 0 {
+            let mut guard = BUS.lock().await;
+            if let Some(bus) = guard.0.as_mut() {
+                let ok = restore_baseline(bus).await.is_ok();
+                crate::pd_log(if ok {
+                    b"[pd] baseline restored\r\n"
+                } else {
+                    b"[pd] baseline restore FAIL\r\n"
+                });
+            }
+        }
+        if rerun {
+            // r144: our Hard Reset was sent and honored; run the next
+            // session immediately (the engine's caps wait catches the
+            // source's fresh announce whenever it comes).
+            START.signal(());
         }
     }
 }
