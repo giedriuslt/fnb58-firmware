@@ -76,6 +76,9 @@ impl fusb302_pd::phy::Platform for FnbPlatform {
     fn set_rx_idle(idle: bool) {
         RX_IDLE.store(idle, Ordering::Relaxed);
     }
+    fn dbg_mark(mark: u16) {
+        crate::dbg_stage(mark);
+    }
     async fn vbus_raw<B: I2c>(bus: &mut B) -> Result<u16, Error<B::Error>> {
         let mut raw = [0; 2];
         bus.write_read(Self::VBUS_ADDRESS, &[Self::VBUS_REGISTER], &mut raw)

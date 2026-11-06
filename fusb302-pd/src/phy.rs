@@ -53,6 +53,14 @@ pub trait Platform {
     const VBUS_REGISTER: u8;
     fn voltage_mv(raw: u16) -> u32;
     fn set_rx_idle(idle: bool);
+    /// r165: battery-domain cookie hook. The board runs from the charger's
+    /// VBUS and the charger's own Hard Reset CUTS it (the user's board has
+    /// no battery; the backup domain dies with VDD - r164's cookie wiped
+    /// on every caps-ack HR). A session that power-cycles mid-engine can
+    /// never print its own engine line, so the transmit chain stamps the
+    /// cookie directly: the next boot prints where the vanished session
+    /// was. Default: no-op.
+    fn dbg_mark(_mark: u16) {}
     fn vbus_raw<B: I2c>(
         bus: &mut B,
     ) -> impl core::future::Future<Output = Result<u16, Error<B::Error>>>;
@@ -1454,6 +1462,7 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
         // Account fresh flags before TX; never consume stale success as ours.
         PRE_TX_MS.store(self.clock.now_ms().min(u64::from(u32::MAX)) as u32,
             core::sync::atomic::Ordering::Relaxed);
+        P::dbg_mark(21);
         if let Some(packet) = self.poll().await? {
             let header = packet.frame().header();
             // Section 7.3, Table 7.3: a received SOP Message discards it.
@@ -1549,6 +1558,7 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
             self.step(6);
         }
         self.pending_tx = Some(PendingTx::new(sop, header));
+        P::dbg_mark(22); // the FIFO write is next; the Request goes on the wire
         self.trace().tx_written = true;
         self.trace().tx_sent_irq = false;
         self.trace().tx_goodcrc = false;
@@ -3086,6 +3096,7 @@ impl<B: GatedBus, D: Waiter, C: Clock, P: Platform> Driver for Session<'_, B, D,
     async fn transmit(&mut self, bytes: &[u8]) -> Result<(), DriverTxError> {
         TX_ENTER_MS.store(self.clock.now_ms().min(u64::from(u32::MAX)) as u32,
             core::sync::atomic::Ordering::Relaxed);
+        P::dbg_mark(20);
         if self.stopped() {
             LAST_TX_REFUSAL.store(10, core::sync::atomic::Ordering::Relaxed);
             return Err(DriverTxError::Discarded);

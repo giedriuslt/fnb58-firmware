@@ -592,6 +592,7 @@ pub async fn run() {
                     Err(failure) => {
                         VIEW.error.store(error_code(&failure), Ordering::Relaxed);
                         rerun = true;
+                        crate::dbg_stage(16);
                         crate::pd_log(b"[pd] restart: vbus held, rerun\r\n");
                     }
                 }
