@@ -43,7 +43,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r159";
+const BUILD: &[u8] = b"r160";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -192,7 +192,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r159 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r160 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -265,7 +265,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r159 " {
+                for &b in b"r160 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -366,7 +366,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r159: dpm markers\r\n");
+    say(b"[lcd] FNB58 r160: quiet bus in session\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -663,8 +663,10 @@ async fn main(spawner: Spawner) {
         }
 
         // r113: the PD screen renders the engine view; the session runs
-        // in its own task on the shared bus.
-        if ui.screen == Screen::Pd {
+        // in its own task on the shared bus. r160: NOT during a session —
+        // the blocking SPI draw starves the executor (the engine's
+        // transmit chain) past the charger's caps->HR window.
+        if ui.screen == Screen::Pd && !pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) {
             ui.draw_pd(&mut lcd, &pd_task::VIEW).await;
         }
 
@@ -714,8 +716,9 @@ async fn main(spawner: Spawner) {
         pd_task::BTN.store(held, Ordering::Relaxed);
 
         // Orientation poll: 200 ms cadence; a flip must hold ~1 s before
-        // the screen rotates (kws-x1's settle approach).
-        if accel_ok && tick % 20 == 0 {
+        // the screen rotates (kws-x1's settle approach). r160: not during
+        // a PD session (I2C bus contention with the engine's chain).
+        if accel_ok && !pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) && tick % 20 == 0 {
             MAIN_STAGE.store(3, Ordering::Relaxed); // accel BUS lock
             let mut guard = pd_task::BUS.lock().await;
             if let Some(bus) = guard.0.as_mut() {
@@ -757,7 +760,8 @@ async fn main(spawner: Spawner) {
         }
 
         // Meter: 200 ms cadence (screen values; TPA conversion window).
-        if tick % 20 == 0 {
+        // r160: not during a PD session (bus contention + the draw).
+        if !pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) && tick % 20 == 0 {
             MAIN_STAGE.store(4, Ordering::Relaxed); // meter BUS lock
             let mut guard = pd_task::BUS.lock().await;
             let Some(bus) = guard.0.as_mut() else {

@@ -50,6 +50,15 @@ pub static BTN: AtomicU8 = AtomicU8::new(0);
 /// r139 stall-watch breadcrumb: 1 = USB gate, 2 = CC diagnostic,
 /// 3 = session start, 4 = engine, 5 = finish/restore, 6 = parked on OK.
 pub static STAGE: AtomicU8 = AtomicU8::new(0);
+/// r160: true for the whole diagnostic+session+restore span. The main
+/// loop freezes ALL screen draws, meter/accel reads and other SPI/I2C
+/// side-work while this is set: Spi::write_busy is a SYNCHRONOUS loop
+/// that blocks the cooperative executor for the whole transfer (a
+/// draw_pd fill ~230 ms at 4 MHz SPI), and a mid-session blackout
+/// starves the engine's transmit chain past the charger's ~77 ms
+/// caps->Hard-Reset window (r159: f=6, the HR caught at the pre-TX
+/// poll, Request built but never written - q=1 v=5000).
+pub static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 const BACK_BIT: u8 = 0x01;
 
 /// What the UI renders on the PD screen. Atomics: the task writes, the main
@@ -343,6 +352,7 @@ pub async fn run() {
             }
         }
         STAGE.store(2, Ordering::Relaxed); // CC diagnostic
+        SESSION_ACTIVE.store(true, Ordering::Relaxed);
         // r145: fresh view per attempt — a stale err=45/40/st= from the
         // previous attempt mislabeled the next one on the LCD.
         VIEW.error.store(0, Ordering::Relaxed);
@@ -924,8 +934,11 @@ pub async fn run() {
         if rerun {
             // r144: our Hard Reset was sent and honored; run the next
             // session immediately (the engine's caps wait catches the
-            // source's fresh announce whenever it comes).
+            // source's fresh announce whenever it comes). The flag stays
+            // set: the rerun starts at once.
             START.signal(());
+        } else {
+            SESSION_ACTIVE.store(false, Ordering::Relaxed);
         }
     }
 }
