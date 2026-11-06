@@ -71,6 +71,13 @@ pub const IDLE_POLL_MS: u32 = 4;
 /// 10 = session stopped; 0 = no refusal recorded since the last clear.
 pub static LAST_TX_REFUSAL: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
+/// r161 race probes: wall-clock (clock ms) when Session::transmit was
+/// entered and when send_sop_once reached its pre-TX poll. The caller
+/// diffs against its session start; both are the PdClock's base.
+pub static TX_ENTER_MS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static PRE_TX_MS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 /// Existing user stop gesture, in ms: hold Back for one second. A navigation
 /// tap must not start an EPR exit or stop servicing an SPR contract.
 const STOP_HOLD_MS: u64 = 1_000;
@@ -1445,6 +1452,8 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
                 });
         }
         // Account fresh flags before TX; never consume stale success as ours.
+        PRE_TX_MS.store(self.clock.now_ms().min(u64::from(u32::MAX)) as u32,
+            core::sync::atomic::Ordering::Relaxed);
         if let Some(packet) = self.poll().await? {
             let header = packet.frame().header();
             // Section 7.3, Table 7.3: a received SOP Message discards it.
@@ -3075,6 +3084,8 @@ impl<B: GatedBus, D: Waiter, C: Clock, P: Platform> Driver for Session<'_, B, D,
         }
     }
     async fn transmit(&mut self, bytes: &[u8]) -> Result<(), DriverTxError> {
+        TX_ENTER_MS.store(self.clock.now_ms().min(u64::from(u32::MAX)) as u32,
+            core::sync::atomic::Ordering::Relaxed);
         if self.stopped() {
             LAST_TX_REFUSAL.store(10, core::sync::atomic::Ordering::Relaxed);
             return Err(DriverTxError::Discarded);

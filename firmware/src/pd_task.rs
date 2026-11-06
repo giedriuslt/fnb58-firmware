@@ -526,6 +526,9 @@ pub async fn run() {
         // death = the SinkWaitCap timer, ~1 s+ = the engine's Hard Reset
         // spiral; instant = a begin/boundary failure).
         let session_t0 = embassy_time::Instant::now();
+        let session_t0_ms = session_t0.as_millis() as u32;
+        fusb302_pd::phy::TX_ENTER_MS.store(0, Ordering::Relaxed);
+        fusb302_pd::phy::PRE_TX_MS.store(0, Ordering::Relaxed);
         STAGE.store(3, Ordering::Relaxed); // session start
         let (mut phy, started) = pd_phy::Session::start(
             &mut bus,
@@ -864,6 +867,46 @@ pub async fn run() {
                 n,
                 pd_protocol::pd_spr::DEBUG_REQ_MV.load(Ordering::Relaxed),
             );
+            // r161: where the 77 ms went. st= the vendored crate's stage
+            // (1 DPM::request entered, 2 Borrowed::transmit entered,
+            // 3 request done); e= Session::transmit entry, p= the pre-TX
+            // poll - both as ms after session start (0xffffffff/0 = the
+            // step never ran).
+            for &b in b" st=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(
+                &mut d,
+                n,
+                u32::from(pd_protocol::pd_spr::DEBUG_STAGE.load(Ordering::Relaxed)),
+            );
+            for &b in b" e=" {
+                d[n] = b;
+                n += 1;
+            }
+            {
+                let at = fusb302_pd::phy::TX_ENTER_MS.load(Ordering::Relaxed);
+                if at == 0 {
+                    d[n] = b'-';
+                    n += 1;
+                } else {
+                    n = crate::push_dec(&mut d, n, at.wrapping_sub(session_t0_ms));
+                }
+            }
+            for &b in b" p=" {
+                d[n] = b;
+                n += 1;
+            }
+            {
+                let at = fusb302_pd::phy::PRE_TX_MS.load(Ordering::Relaxed);
+                if at == 0 {
+                    d[n] = b'-';
+                    n += 1;
+                } else {
+                    n = crate::push_dec(&mut d, n, at.wrapping_sub(session_t0_ms));
+                }
+            }
             for &b in b" d=" {
                 d[n] = b;
                 n += 1;
