@@ -543,8 +543,13 @@ pub async fn run() {
             crate::pd_log(&d[..n + 2]);
         }
         let mut engine_code = 0u16;
-        // r154: fresh refusal code per attempt.
+        // r154/r159: fresh refusal + DPM debug markers per attempt.
         fusb302_pd::phy::LAST_TX_REFUSAL.store(0, Ordering::Relaxed);
+        pd_protocol::pd_spr::DEBUG_LAST_FAIL.store(0, Ordering::Relaxed);
+        pd_protocol::pd_spr::DEBUG_REQ_GATE.store(0, Ordering::Relaxed);
+        pd_protocol::pd_spr::DEBUG_REQ_OK.store(0, Ordering::Relaxed);
+        pd_protocol::pd_spr::DEBUG_REQ_MV.store(0, Ordering::Relaxed);
+        pd_protocol::pd_spr::DEBUG_STAGE.store(0, Ordering::Relaxed);
         if restart_requested() && error.is_none() {
             // r147: a restart press never runs the engine — kws-x1's
             // restart_unheard shape (Session::start, then the Hard Reset
@@ -806,6 +811,49 @@ pub async fn run() {
                 n += 1;
             }
             n = crate::push_dec(&mut d, n, u32::from(phy.observation.boot_step_ms));
+            // r159: the vendored crate's debug markers, straight from the
+            // [patch]ed pd-protocol-debug build: f=last fail code (3
+            // UnsafeCapabilities, 10 RecoveryBlocked, 11 TransmissionBlocked,
+            // 4 Peer, 12 Engine), g=request_fixed gate (60..=64), q=the DPM's
+            // target.request ok flag, v=the requested target mV. On the host
+            // repro f=0 q=1 g=0 with caps delivered; hardware divergence
+            // names the exact predicate.
+            for &b in b" f=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(
+                &mut d,
+                n,
+                u32::from(pd_protocol::pd_spr::DEBUG_LAST_FAIL.load(Ordering::Relaxed)),
+            );
+            for &b in b" g=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(
+                &mut d,
+                n,
+                u32::from(pd_protocol::pd_spr::DEBUG_REQ_GATE.load(Ordering::Relaxed)),
+            );
+            for &b in b" q=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(
+                &mut d,
+                n,
+                u32::from(pd_protocol::pd_spr::DEBUG_REQ_OK.load(Ordering::Relaxed)),
+            );
+            for &b in b" v=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(
+                &mut d,
+                n,
+                pd_protocol::pd_spr::DEBUG_REQ_MV.load(Ordering::Relaxed),
+            );
             for &b in b" d=" {
                 d[n] = b;
                 n += 1;
