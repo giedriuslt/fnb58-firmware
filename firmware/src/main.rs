@@ -43,7 +43,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r162";
+const BUILD: &[u8] = b"r163";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -192,7 +192,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r162 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r163 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -265,7 +265,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r162 " {
+                for &b in b"r163 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -366,7 +366,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r162: log 128\r\n");
+    say(b"[lcd] FNB58 r163: log 64 split\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -937,11 +937,10 @@ async fn main(spawner: Spawner) {
         }
 
         // r139: pd_task console lines join the queue (behind the boot-ring
-        // flush gate, like everything else). r157: 96-wide to match the
-        // widened PD_LOG (the engine-end line with TX-timeout evidence is
-        // ~78 bytes; at 64 it was silently dropped at push).
+        // flush gate, like everything else). r163: entries are 64 bytes
+        // again (long lines are split at push, see pd_log).
         {
-            let mut line = [0u8; 96];
+            let mut line = [0u8; 64];
             loop {
                 let taken = PD_LOG.lock(|cell| {
                     let mut log = cell.borrow_mut();
@@ -1195,7 +1194,7 @@ impl BootLog {
 /// (diag + start + engine + 6 caps lines) overflowed 8 and silently
 /// dropped the engine-end line, the one that carries the diagnosis.
 struct PdLog {
-    lines: [[u8; 128]; 24],
+    lines: [[u8; 64]; 24],
     lens: [u8; 24],
     head: usize,
     count: usize,
@@ -1204,32 +1203,49 @@ static PD_LOG: embassy_sync::blocking_mutex::Mutex<
     CriticalSectionRawMutex,
     core::cell::RefCell<PdLog>,
 > = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(PdLog {
-    lines: [[0; 128]; 24],
+    lines: [[0; 64]; 24],
     lens: [0; 24],
     head: 0,
     count: 0,
 }));
 
-/// Log one PD lifecycle line (called from pd_task). r157: the 64-byte
-/// limit silently dropped the engine-end line whenever it carried the
-/// TX-timeout evidence fields (~78 bytes) — the exact sessions that
-/// needed diagnosing. 96 covers the worst case.
+/// Log one PD lifecycle line (called from pd_task). r163 (user
+/// directive): entries are 64 bytes again and LONGER input is split
+/// into multiple complete lines instead of being silently dropped —
+/// the 64- and 96-byte limits each hid the engine-end line once as
+/// its evidence fields grew. Every fragment keeps the CRLF so it
+/// prints as its own console line.
 pub(crate) fn pd_log(line: &[u8]) {
-    if line.is_empty() || line.len() > 96 {
+    if line.is_empty() {
         return;
     }
-    PD_LOG.lock(|cell| {
-        let mut log = cell.borrow_mut();
-        if log.count == log.lines.len() {
-            log.head = (log.head + 1) % log.lines.len();
-            log.count -= 1;
-        }
-        let slot = (log.head + log.count) % log.lines.len();
-        log.lines[slot] = [0; 128];
-        log.lines[slot][..line.len()].copy_from_slice(line);
-        log.lens[slot] = line.len() as u8;
-        log.count += 1;
-    });
+    // Trim the caller's trailing CRLF; fragments get their own.
+    let mut rest = if line.ends_with(b"\r\n") {
+        &line[..line.len() - 2]
+    } else {
+        line
+    };
+    while !rest.is_empty() {
+        let take = rest.len().min(61);
+        let (chunk, tail) = rest.split_at(take);
+        let mut entry = [0u8; 64];
+        entry[..chunk.len()].copy_from_slice(chunk);
+        entry[chunk.len()] = b'\r';
+        entry[chunk.len() + 1] = b'\n';
+        let n = chunk.len() + 2;
+        rest = tail;
+        PD_LOG.lock(|cell| {
+            let mut log = cell.borrow_mut();
+            if log.count == log.lines.len() {
+                log.head = (log.head + 1) % log.lines.len();
+                log.count -= 1;
+            }
+            let slot = (log.head + log.count) % log.lines.len();
+            log.lines[slot] = entry;
+            log.lens[slot] = n as u8;
+            log.count += 1;
+        });
+    }
 }
 
 /// r139 stall watch: the main loop stamps MAIN_STAGE/MAIN_SEQ every pass;
@@ -1474,8 +1490,14 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         d[w] = b'\r';
         d[w + 1] = b'\n';
         w += 2;
-        unsafe {
-            fnb58_usb_send(d.as_ptr(), w as u16);
+        // r163: retry like send_direct — a boot-time panic fires before
+        // the host opens the port, and the single send was silently
+        // lost, leaving every halt unexplained.
+        for _ in 0..50_000 {
+            if unsafe { fnb58_usb_send(d.as_ptr(), w as u16) } == 0 {
+                break;
+            }
+            cortex_m::asm::delay(2000);
         }
     }
     fault_halt()
