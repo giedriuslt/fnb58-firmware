@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["firmware", "fusb302-pd"]
+exclude = ["pd-protocol-debug"]
 
 [workspace.dependencies]
 cortex-m = "0.7.10"
@@ -15,6 +16,10 @@ fusb302-pd = { path = "fusb302-pd" }
 # the revisions kws-x1 ships against.
 pd-protocol = { git = "https://github.com/kralonur/embedded-charging-protocols-rs", rev = "2c3d511cb7214f1db9f5e3528900e1fd9d1bc323" }
 usbpd-traits = { git = "https://github.com/kralonur/usbpd", rev = "16b13a23dafad6c5dd0c18801ee978b785730f83" }
+
+# r158 debug: vendored pd-protocol with dtrace instrumentation (host tests)
+[patch."https://github.com/kralonur/embedded-charging-protocols-rs"]
+pd-protocol = { path = "pd-protocol-debug/pd-protocol" }
 
 [profile.release]
 opt-level = "z"

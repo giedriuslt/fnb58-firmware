@@ -512,6 +512,10 @@ pub async fn run() {
         let mut delay = embassy_time::Delay;
         let mut observation = Observation::new();
         observation.phase = Phase::Negotiating;
+        // r155: session wall-clock, for the engine-end d= field (a ~465 ms
+        // death = the SinkWaitCap timer, ~1 s+ = the engine's Hard Reset
+        // spiral; instant = a begin/boundary failure).
+        let session_t0 = embassy_time::Instant::now();
         STAGE.store(3, Ordering::Relaxed); // session start
         let (mut phy, started) = pd_phy::Session::start(
             &mut bus,
@@ -633,6 +637,60 @@ pub async fn run() {
         if error.is_none() {
             error = phy.take_error();
         }
+        // r156: the offer FIRST, the engine line LAST — the engine line
+        // carries the diagnosis, so it must be the newest ring entry, not
+        // the one a following burst pushes out. All six objects now.
+        if let Some(caps) = phy.observation.capabilities {
+            let mut d = [0u8; 24];
+            let mut n = 0;
+            for &b in b"[pd] caps n=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(&mut d, n, u32::from(caps.count));
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            n += 2;
+            crate::pd_log(&d[..n]);
+            for (i, object) in caps.objects.iter().take(6).enumerate() {
+                if i >= usize::from(caps.count) {
+                    break;
+                }
+                // r153: the PARSED fixed values too — raw alone left the
+                // offer ambiguous by hand.
+                let mut d = [0u8; 48];
+                let mut n = 0;
+                for &b in b"[pd] p" {
+                    d[n] = b;
+                    n += 1;
+                }
+                d[n] = b'1' + i as u8;
+                n += 1;
+                d[n] = b'=';
+                n += 1;
+                for shift in [24u32, 16, 8, 0] {
+                    n = crate::push_hex8(&mut d, n, (object.raw >> shift) & 0xFF);
+                }
+                if let Some((mv, ma)) = object.fixed {
+                    d[n] = b' ';
+                    n += 1;
+                    n = crate::push_dec(&mut d, n, u32::from(mv));
+                    for &b in b"mV" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = crate::push_dec(&mut d, n, u32::from(ma));
+                    for &b in b"mA" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                }
+                d[n] = b'\r';
+                d[n + 1] = b'\n';
+                n += 2;
+                crate::pd_log(&d[..n]);
+            }
+        }
         {
             let code = if engine_code != 0 {
                 engine_code
@@ -644,7 +702,8 @@ pub async fn run() {
             // phy's refusal char: G SinkTxOK gate, C source message won,
             // Q quiet override, V cable-safe-5V, '-' none), r = request
             // MessageID, and on a TX timeout its STATUS1 + INTERRUPTA.
-            let mut d = [0u8; 64];
+            // r155: h/n/s/d appended - the worst-case line is ~64 chars.
+            let mut d = [0u8; 96];
             let mut n = 0;
             for &b in b"[pd] engine code=" {
                 d[n] = b;
@@ -704,64 +763,64 @@ pub async fn run() {
                     n = crate::push_hex8(&mut d, n, u32::from(timeout.flags));
                 }
             }
-            d[n] = b'\r';
-            d[n + 1] = b'\n';
-            crate::pd_log(&d[..n + 2]);
-        }
-        // r151/r152: the offer, finally visible — the charger's PDOs were
-        // never decoded off-device in any round. r151's print showed only
-        // two bytes per PDO (push_hex8 is 2 digits); print the FULL
-        // 32-bit words, one line per object, first four.
-        if let Some(caps) = phy.observation.capabilities {
-            let mut d = [0u8; 24];
-            let mut n = 0;
-            for &b in b"[pd] caps n=" {
+            // r155: the four facts the x=0 sessions left unanswered.
+            // h = last received header (the PHY's decode vs what the
+            // ENGINE got), n = packets, s = an HR was SENT (the engine's
+            // own SinkWaitCap-timeout Hard Reset is invisible to x=),
+            // d = session wall-clock ms (465 = SinkWaitCap death,
+            // 1000+ = the engine HR spiral, instant = begin failure).
+            for &b in b" h=" {
                 d[n] = b;
                 n += 1;
             }
-            n = crate::push_dec(&mut d, n, u32::from(caps.count));
+            match phy.observation.rx_last_header {
+                Some(h) => {
+                    for shift in [12u16, 8, 4, 0] {
+                        n = crate::push_hex8(&mut d, n, u32::from((h >> shift) & 0xF));
+                    }
+                }
+                None => {
+                    for &b in b"----" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                }
+            }
+            for &b in b" n=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(&mut d, n, u32::from(phy.observation.rx_packets));
+            for &b in b" s=" {
+                d[n] = b;
+                n += 1;
+            }
+            d[n] = b'0' + u8::from(phy.hard_reset_sent());
+            n += 1;
+            // r158: the caps-arrival timestamp (boot_step_ms = the step-5
+            // ms from session start) - the hardware race decider: caps
+            // late in a ~130 ms session means the charger's announce->HR
+            // window beat us; caps early means the engine stalled.
+            for &b in b" m=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(&mut d, n, u32::from(phy.observation.boot_step_ms));
+            for &b in b" d=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(
+                &mut d,
+                n,
+                embassy_time::Instant::now()
+                    .saturating_duration_since(session_t0)
+                    .as_millis()
+                    .min(99_999) as u32,
+            );
             d[n] = b'\r';
             d[n + 1] = b'\n';
-            n += 2;
-            crate::pd_log(&d[..n]);
-            for (i, object) in caps.objects.iter().take(4).enumerate() {
-                if i >= usize::from(caps.count) {
-                    break;
-                }
-                // r153: the PARSED fixed values too — raw alone left the
-                // offer ambiguous by hand.
-                let mut d = [0u8; 48];
-                let mut n = 0;
-                for &b in b"[pd] p" {
-                    d[n] = b;
-                    n += 1;
-                }
-                d[n] = b'1' + i as u8;
-                n += 1;
-                d[n] = b'=';
-                n += 1;
-                for shift in [24u32, 16, 8, 0] {
-                    n = crate::push_hex8(&mut d, n, (object.raw >> shift) & 0xFF);
-                }
-                if let Some((mv, ma)) = object.fixed {
-                    d[n] = b' ';
-                    n += 1;
-                    n = crate::push_dec(&mut d, n, u32::from(mv));
-                    for &b in b"mV" {
-                        d[n] = b;
-                        n += 1;
-                    }
-                    n = crate::push_dec(&mut d, n, u32::from(ma));
-                    for &b in b"mA" {
-                        d[n] = b;
-                        n += 1;
-                    }
-                }
-                d[n] = b'\r';
-                d[n + 1] = b'\n';
-                n += 2;
-                crate::pd_log(&d[..n]);
-            }
+            crate::pd_log(&d[..n + 2]);
         }
         if let Some(failure) = &error {
             let code = error_code(failure);

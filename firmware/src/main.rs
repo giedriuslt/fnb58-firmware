@@ -43,7 +43,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r154";
+const BUILD: &[u8] = b"r158";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -192,7 +192,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r154 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r158 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -265,7 +265,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r154 " {
+                for &b in b"r158 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -366,7 +366,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r154: tx gate codes\r\n");
+    say(b"[lcd] FNB58 r158: caps arrival ms\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -933,9 +933,11 @@ async fn main(spawner: Spawner) {
         }
 
         // r139: pd_task console lines join the queue (behind the boot-ring
-        // flush gate, like everything else).
+        // flush gate, like everything else). r157: 96-wide to match the
+        // widened PD_LOG (the engine-end line with TX-timeout evidence is
+        // ~78 bytes; at 64 it was silently dropped at push).
         {
-            let mut line = [0u8; 64];
+            let mut line = [0u8; 96];
             loop {
                 let taken = PD_LOG.lock(|cell| {
                     let mut log = cell.borrow_mut();
@@ -1185,10 +1187,12 @@ impl BootLog {
 /// r139: pd_task -> console lines. A tiny CS-mutex ring buffer written by
 /// the PD task (`pd_log`) and drained by the main loop into the Sender
 /// queue (behind the boot-ring flush, like everything else); the oldest
-/// line is dropped when full.
+/// line is dropped when full. r156: 8 -> 24 slots — a session's burst
+/// (diag + start + engine + 6 caps lines) overflowed 8 and silently
+/// dropped the engine-end line, the one that carries the diagnosis.
 struct PdLog {
-    lines: [[u8; 64]; 8],
-    lens: [u8; 8],
+    lines: [[u8; 96]; 24],
+    lens: [u8; 24],
     head: usize,
     count: usize,
 }
@@ -1196,15 +1200,18 @@ static PD_LOG: embassy_sync::blocking_mutex::Mutex<
     CriticalSectionRawMutex,
     core::cell::RefCell<PdLog>,
 > = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(PdLog {
-    lines: [[0; 64]; 8],
-    lens: [0; 8],
+    lines: [[0; 96]; 24],
+    lens: [0; 24],
     head: 0,
     count: 0,
 }));
 
-/// Log one PD lifecycle line (called from pd_task).
+/// Log one PD lifecycle line (called from pd_task). r157: the 64-byte
+/// limit silently dropped the engine-end line whenever it carried the
+/// TX-timeout evidence fields (~78 bytes) — the exact sessions that
+/// needed diagnosing. 96 covers the worst case.
 pub(crate) fn pd_log(line: &[u8]) {
-    if line.is_empty() || line.len() > 64 {
+    if line.is_empty() || line.len() > 96 {
         return;
     }
     PD_LOG.lock(|cell| {
@@ -1214,7 +1221,7 @@ pub(crate) fn pd_log(line: &[u8]) {
             log.count -= 1;
         }
         let slot = (log.head + log.count) % log.lines.len();
-        log.lines[slot] = [0; 64];
+        log.lines[slot] = [0; 96];
         log.lines[slot][..line.len()].copy_from_slice(line);
         log.lens[slot] = line.len() as u8;
         log.count += 1;
