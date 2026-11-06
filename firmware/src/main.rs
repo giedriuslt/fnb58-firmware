@@ -43,7 +43,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r165";
+const BUILD: &[u8] = b"r166";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -192,7 +192,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r165 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r166 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -265,7 +265,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r165 " {
+                for &b in b"r166 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -366,7 +366,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r165: tx cookie marks\r\n");
+    say(b"[lcd] FNB58 r166: fault evidence\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -1462,12 +1462,9 @@ fn SysTick() {
 
 /// Drop the D+ pull-up on fault. The device VANISHES from the host.
 fn fault_halt() -> ! {
-    unsafe {
-        let ctrl = (0x4000_5c00usize + 0x40) as *mut u32;
-        core::ptr::write_volatile(ctrl, core::ptr::read_volatile(ctrl) | 0b10);
-        let cfg = (0x4000_5c00usize + 0x60) as *mut u32;
-        core::ptr::write_volatile(cfg, core::ptr::read_volatile(cfg) | 0b10);
-    }
+    // r166: do NOT drop the D+ pull-up. The old drop made the port
+    // vanish (forcing a cookie-wiping re-plug) and hid every fault.
+    // Halted but enumerated: the console stays available.
     loop {
         cortex_m::asm::nop();
     }
@@ -1567,6 +1564,53 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 #[cortex_m_rt::exception]
-unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
-    fault_halt()
+unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
+    // r166: the faulting PC/LR + CFSR, RETRIED, and USB left alive. The
+    // old silent fault_halt dropped D+ (the port vanishes, the user must
+    // re-plug, the cookie wipes) - every engine-stage crash looked like a
+    // power cycle and the faulting code stayed anonymous.
+    let pc = frame.pc();
+    let lr = frame.lr();
+    let cfsr = core::ptr::read_volatile(0xE000ED28u32 as *const u32);
+    let mut d = [0u8; 64];
+    let mut w = 0;
+    for &b in b"[fault] pc=" {
+        d[w] = b;
+        w += 1;
+    }
+    for shift in [24u32, 16, 8, 0] {
+        w = push_hex8(&mut d, w, (pc >> shift) & 0xFF);
+    }
+    for &b in b" lr=" {
+        d[w] = b;
+        w += 1;
+    }
+    for shift in [24u32, 16, 8, 0] {
+        w = push_hex8(&mut d, w, (lr >> shift) & 0xFF);
+    }
+    for &b in b" cfsr=" {
+        d[w] = b;
+        w += 1;
+    }
+    for shift in [24u32, 16, 8, 0] {
+        w = push_hex8(&mut d, w, (cfsr >> shift) & 0xFF);
+    }
+    for &b in b" stage=" {
+        d[w] = b;
+        w += 1;
+    }
+    w = push_dec(&mut d, w, u32::from(dbg_last_stage()));
+    d[w] = b'\r';
+    d[w + 1] = b'\n';
+    w += 2;
+    for _ in 0..50_000 {
+        if unsafe { fnb58_usb_send(d.as_ptr(), w as u16) } == 0 {
+            break;
+        }
+        cortex_m::asm::delay(2000);
+    }
+    // Halted but ENUMERATED: the console stays, no re-plug needed.
+    loop {
+        cortex_m::asm::nop();
+    }
 }
