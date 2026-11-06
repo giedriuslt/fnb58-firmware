@@ -43,7 +43,7 @@ static DOORBELL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r163";
+const BUILD: &[u8] = b"r164";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -192,7 +192,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r163 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r164 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -265,7 +265,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r163 " {
+                for &b in b"r164 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -366,7 +366,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r163: log 64 split\r\n");
+    say(b"[lcd] FNB58 r164: reset cookie\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -611,6 +611,26 @@ async fn main(spawner: Spawner) {
         d[n] = b'\r';
         d[n + 1] = b'\n';
         sender.push(&d[..n + 2]);
+        // r164: what the PREVIOUS boot was doing when it vanished (the
+        // battery-domain stage cookie; see dbg_stage for the IDs).
+        let last = dbg_last_stage();
+        let boots = dbg_boot_count();
+        let mut d = [0u8; 64];
+        let mut n = 0;
+        for &b in b"[boot] last stage=" {
+            d[n] = b;
+            n += 1;
+        }
+        n = push_dec(&mut d, n, u32::from(last));
+        for &b in b" boots=" {
+            d[n] = b;
+            n += 1;
+        }
+        n = push_dec(&mut d, n, u32::from(boots));
+        d[n] = b'\r';
+        d[n + 1] = b'\n';
+        sender.push(&d[..n + 2]);
+        dbg_stage(1);
     }
 
     // One-time ISR proof per EXINT line (the buttons double as the
@@ -1450,6 +1470,49 @@ fn fault_halt() -> ! {
     }
     loop {
         cortex_m::asm::nop();
+    }
+}
+
+/// r164: battery-domain stage cookie. The device RESET mid-engine twice
+/// (r161, r163) with no panic line and no code path that resets there -
+/// the only explanations left are a hardware reset (brownout/LVR) or a
+/// fault the console never saw. These two registers survive every reset
+/// (except full power removal), so each risky step stamps its ID and the
+/// next boot prints what the previous boot was doing when it vanished.
+/// Stage IDs: 1 boot, 10 pd gate, 11 diagnostic, 12 session start,
+/// 13 engine running, 14 finish/restore, 15 restart HR now,
+/// 16 vbus-held rerun, 20 transmit chain entered.
+pub(crate) fn dbg_stage(stage: u16) {
+    unsafe {
+        use embassy_at32::pac::at32f403a::{BPR, PWC};
+        let pwc = PWC::steal();
+        let bpr = BPR::steal();
+        pwc.ctrl().modify(|_, w| w.bpwen().set_bit());
+        bpr.dt(0).write(|w| unsafe { w.dt().bits(u16::from(stage)) });
+    }
+}
+
+/// Boot counter in dt1: +1 every boot (wraps at 65535).
+fn dbg_boot_count() -> u16 {
+    unsafe {
+        use embassy_at32::pac::at32f403a::{BPR, PWC};
+        let pwc = PWC::steal();
+        let bpr = BPR::steal();
+        pwc.ctrl().modify(|_, w| w.bpwen().set_bit());
+        let n = bpr.dt(1).read().dt().bits().wrapping_add(1);
+        bpr.dt(1).write(|w| unsafe { w.dt().bits(n) });
+        n
+    }
+}
+
+/// Read dt0 without modifying it (boot log).
+fn dbg_last_stage() -> u16 {
+    unsafe {
+        use embassy_at32::pac::at32f403a::{BPR, PWC};
+        let pwc = PWC::steal();
+        let bpr = BPR::steal();
+        pwc.ctrl().modify(|_, w| w.bpwen().set_bit());
+        bpr.dt(0).read().dt().bits()
     }
 }
 

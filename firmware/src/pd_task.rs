@@ -352,6 +352,7 @@ pub async fn run() {
             }
         }
         STAGE.store(2, Ordering::Relaxed); // CC diagnostic
+        crate::dbg_stage(11);
         SESSION_ACTIVE.store(true, Ordering::Relaxed);
         // r145: fresh view per attempt — a stale err=45/40/st= from the
         // previous attempt mislabeled the next one on the LCD.
@@ -530,6 +531,7 @@ pub async fn run() {
         fusb302_pd::phy::TX_ENTER_MS.store(0, Ordering::Relaxed);
         fusb302_pd::phy::PRE_TX_MS.store(0, Ordering::Relaxed);
         STAGE.store(3, Ordering::Relaxed); // session start
+        crate::dbg_stage(12);
         let (mut phy, started) = pd_phy::Session::start(
             &mut bus,
             &mut delay,
@@ -573,6 +575,7 @@ pub async fn run() {
             // a log line), so the HR never went out.
             crate::pd_log(b"[pd] restart: HR now\r\n");
             STAGE.store(4, Ordering::Relaxed); // busy in session
+            crate::dbg_stage(15);
             error = phy.restart_unheard().await.err();
             if phy.hard_reset_sent() {
                 RESTART.store(false, Ordering::Relaxed); // performed
@@ -604,6 +607,7 @@ pub async fn run() {
             let trace = RefCell::new(pd_spr::MaintainedTrace::default());
             let mut trial = pd_spr::Trial::maintained();
             STAGE.store(4, Ordering::Relaxed); // engine running
+            crate::dbg_stage(13);
             match trial
                 .run_selectable::<_, PdClock>(&mut phy, &trace, &selection)
                 .await
@@ -958,6 +962,7 @@ pub async fn run() {
             phy.stop();
         }
         STAGE.store(5, Ordering::Relaxed); // finish / restore
+        crate::dbg_stage(14);
         // r139: a failed session must not leave the FUSB302 acking caps —
         // the r138 charger-only reboot loop: the auto-GoodCRC keeps the
         // source waiting for a Request that never comes, its Hard Reset
