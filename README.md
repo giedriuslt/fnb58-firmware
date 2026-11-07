@@ -69,7 +69,7 @@ pins have no known connection.
 | 17 | PA7 | Bottom | unclaimed |
 | 18 | PB0 | Bottom | unclaimed |
 | 19 | PB1 | Bottom | unclaimed |
-| 20 | PB2 | Bottom | unclaimed |
+| 20 | PB2 | Bottom | ✓ RS2228 USB-mux SELECT — DUT data lines: passthrough ↔ MCU measure path (polarity + landing pins unknown) |
 | 21 | PB10 | Bottom | unclaimed |
 | 22 | PB11 | Bottom | ✓ LCD DC |
 | 23 | VSS_1 | Bottom | ground |
@@ -90,7 +90,7 @@ pins have no known connection.
 | 38 | PA15 | Top | ✓ LEFT button (to GND, internal pull-up) |
 | 39 | PB3 | Top | ✓ LCD backlight |
 | 40 | PB4 | Top | ✓ OK button (to GND, internal pull-up) |
-| 41 | PB5 | Top | unclaimed |
+| 41 | PB5 | Top | ✓ load-bank MOSFET gate (FET SMD-marked 3400): HIGH = bank ON |
 | 42 | PB6 | Top | ✓ I2C1 SCL (TPA626, FUSB302, KXTJ3) |
 | 43 | PB7 | Top | ✓ I2C1 SDA |
 | 44 | BOOT0 | Top | boot selector: high at reset = USB DFU (flash via BOOT0-high) |
@@ -99,9 +99,19 @@ pins have no known connection.
 | 47 | VSS_3 | Top | ground |
 | 48 | VDD_3 | Top | digital supply |
 
-Unclaimed: PA0–PA7, PA9, PA10, PB0/PB1/PB2/PB5 (pins 10–20, 30, 31, 41)
-plus the load-bank FET gates on some of them — **never drive unclaimed
-pins blindly** (r24/25 heated the board doing that).
+Unclaimed: PA0–PA7, PA9, PA10, PB0/PB1 (pins 10–20, 30, 31) —
+two more pins are now traced: **PB5 (pin 41), load-bank FET gate
+(SMD-marked 3400), active-high** — driving PB5 high (or enabling a
+pull-up) turns the whole 4×20Ω bank ON (~1 A at 5 V, ~5 W); and
+**PB2 (pin 20), RS2228 USB-mux SELECT** — it switches the DUT-side
+USB data lines between passthrough (the stock FNB58 behavior) and a
+measurement path into the MCU (measuring/trigger functions — NOT a
+USB-device connection; the MCU-side landing pins are unknown). The
+CDC console is permanently wired to its own connector (micro-B →
+PA11/PA12) and never goes through the mux. Select polarity is UNKNOWN
+yet — never drive PB2 blindly. **Never drive unclaimed pins blindly,
+and never pull PB5 up outside deliberate load-bank tests** (r24/25
+heated the board doing exactly that).
 
 I2C1 bus device map (0x0E-verified r20): TPA626 power monitor @ 0x40
 (mfr 0x5549, die 0x2260), FUSB302B PD PHY @ 0x22 (INT_N = PC13),

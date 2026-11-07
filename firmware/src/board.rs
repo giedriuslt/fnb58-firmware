@@ -104,10 +104,24 @@ pub const PANEL_DMA: (embassy_at32::dma::Unit, u8) = (embassy_at32::dma::Unit::D
 /// working theory: a switchable current-pulse load bank for MediaTek
 /// Pump Express detection/triggering (PE works by the device drawing
 /// current pulses; 20 ohm across 5 V = 250 mA per leg, 1.25 W - hot!),
-/// with MOSFET gates driven by (unidentified) GPIOs. DANGER: enabling a
-/// pull-up on a gate pin turns a leg on continuously. The round-24/25
+/// with MOSFET gates driven by GPIOs. USER TRACE 2026-11-08: the
+/// load-bank FET is SMD-marked 3400 and its gate is PB5 (LQFP48 pin
+/// 41), active-high — PB5 driven high OR pulled up turns the whole
+/// bank ON (~1 A at 5 V across the four legs, ~5 W). DANGER: enabling
+/// a pull-up on a gate pin turns a leg on continuously. The round-24/25
 /// button monitor did exactly that (chip heated, vbus drooped to 4.6 V).
-/// Rule: never pull or drive any untraced pin on this board.
+/// Rule: never pull or drive any untraced pin on this board; PB5 is now
+/// traced and IS the load switch — treat it as armed at all times.
+///
+/// USB data routing (user board trace + correction, 2026-11-08): an
+/// RS2228 USB mux sits on the DUT-side USB data lines; its SELECT is PB2
+/// (LQFP48 pin 20). The CDC console is PERMANENTLY wired to its own
+/// connector (micro-B straight to PA11/PA12) and never goes through the
+/// mux. The mux switches the DUT-side lines between passthrough (the
+/// stock FNB58 behavior) and a measurement path into the MCU —
+/// measuring/trigger functions, NOT a USB-device connection. Which MCU
+/// pins land on the mux's measure side, and the SELECT polarity, are
+/// UNKNOWN yet: do not drive PB2 blindly.
 ///
 /// The 192 MHz PLL profile (kept for later stages; the smoke test runs
 /// on `configure_hick48` instead).
