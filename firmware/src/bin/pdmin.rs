@@ -126,6 +126,48 @@ async fn main(spawner: Spawner) {
         }
     }
 
+    // r169: per-transaction I2C timing — the receive-cadence suspect. The
+    // r168 log's 62 ms begin() (13 transactions) and the one-to-two poll
+    // cycle caps delivery both fit ~5 ms per transaction; this measures it
+    // directly. Healthy at 100 kHz: ~3-5 ms for all ten reads.
+    {
+        use embedded_hal_async::i2c::I2c as _;
+        let mut guard = pd_task::BUS.lock().await;
+        if let Some(bus) = guard.0.as_mut() {
+            let t = embassy_time::Instant::now();
+            let mut ok = 0u32;
+            let mut id0 = 0u8;
+            for _ in 0..10 {
+                let mut id = [0u8; 1];
+                if bus.write_read(0x22, &[0x01], &mut id).await.is_ok() {
+                    ok += 1;
+                    id0 = id[0];
+                }
+            }
+            let ms = embassy_time::Instant::now().as_millis() - t.as_millis();
+            let mut d = [0u8; 40];
+            let mut n = 0;
+            for &b in b"[pdmin] i2c 10rd=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, ms as u32);
+            for &b in b"ms ok=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, ok);
+            for &b in b" id=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_hex8(&mut d, n, u32::from(id0));
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            console::boot_log().push(&d[..n + 2]);
+        }
+    }
+
     spawner.spawn(probe().expect("one probe task"));
 
     // Unmask USB interrupt lines and bring the CDC console up.
@@ -204,8 +246,19 @@ async fn probe() {
     let mut wake_due = false;
     let mut contracted_9v = false;
 
-    while attempt < MAX_ATTEMPTS && !contracted_9v {
+    // r169: NEVER park. The r167/r168 probe stopped after MAX_ATTEMPTS and
+    // the user's switch toggles then did nothing ("nothing more is logged
+    // even if I disable and enable pd switch") — the task had exited. Each
+    // exhausted cycle now rests 3 s and restarts the counter, so a fresh
+    // attach (charger re-plug, PD switch toggle) is always caught.
+    loop {
         attempt += 1;
+        if attempt > MAX_ATTEMPTS {
+            pd_log(b"[pdmin] cycle done, restart\r\n");
+            attempt = 1;
+            console::PD_STAGE.store(6, Ordering::Relaxed);
+            Timer::after_millis(3000).await;
+        }
         let mut d = [0u8; 32];
         let mut n = 0;
         for &b in b"[pdmin] attempt=" {
