@@ -236,7 +236,7 @@ Update flow after the one-time install:
 ```sh
 # one-time install of both images via the BOOT0 DFU (trailer embedded —
 # the device boots the app on the FIRST power-up):
-python ../fnb58-research/at32dfu.py fnb58-full-r183.bin   # at 0x08000000
+python ../fnb58-research/at32dfu.py fnb58-full-r188.bin   # at 0x08000000
 # later app-only updates (hold OK while pressing reset):
 python tools/fnb58-flash.py COM7 fnb58-app-rNNN.bin       # pip install pyserial
 # adopt an app installed by other means (no upload; device CRCs its own
@@ -244,6 +244,16 @@ python tools/fnb58-flash.py COM7 fnb58-app-rNNN.bin       # pip install pyserial
 python tools/fnb58-flash.py COM7 --adopt fnb58-app-rNNN.bin
 ```
 
+The app console also accepts `run-bootloader` + Enter (r184): it sets
+the battery-domain request cookie (BPR DT2 = 0xB007) and soft-resets;
+the bootloader consumes the cookie and enters update mode — no
+OK-held + reset dance needed. The cookie is cleared when consumed and
+does not survive power removal (a power cycle just boots normally).
+r188 note: the BPR peripheral needs BOTH APB1 clocks (PWC bit 28 and
+BPR bit 27) enabled before its DT registers respond — the missing BPR
+clock gate was why every battery-domain cookie read 0 since the r16x
+crash-diagnosis rounds; the boot counter (`boots=`) now actually
+increments across soft resets.
 `tools/fnb58-flash.py` refuses to write anything until the device
 answers `INFO` with a `[bl]` line — talking to the app console by
 mistake fails loudly, never silently. PC-link (OpenFNB58 HID) moved

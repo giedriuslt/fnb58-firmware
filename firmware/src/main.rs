@@ -41,7 +41,7 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r180";
+const BUILD: &[u8] = b"r188";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -181,7 +181,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r180 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r188 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -254,7 +254,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r180 " {
+                for &b in b"r188 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -355,7 +355,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r180: contract reporting\r\n");
+    say(b"[lcd] FNB58 r188: contract reporting\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -602,8 +602,13 @@ async fn main(spawner: Spawner) {
         sender.push(&d[..n + 2]);
         // r164: what the PREVIOUS boot was doing when it vanished (the
         // battery-domain stage cookie; see dbg_stage for the IDs).
+        // r187: the whole BPR picture in one line — stage (DT0), the
+        // counter as written AND as read back (DT1), and the raw
+        // bootloader-request cookie (DT2). Which link of the handshake
+        // fails is visible here in a single boot.
         let last = dbg_last_stage();
-        let boots = dbg_boot_count();
+        let (boots, dt1_rb) = dbg_boot_count();
+        let dt2 = dbg_dt(2);
         let mut d = [0u8; 64];
         let mut n = 0;
         for &b in b"[boot] last stage=" {
@@ -616,6 +621,24 @@ async fn main(spawner: Spawner) {
             n += 1;
         }
         n = push_dec(&mut d, n, u32::from(boots));
+        for &b in b" dt1rb=" {
+            d[n] = b;
+            n += 1;
+        }
+        d[n] = HEX[((dt1_rb >> 12) & 0xF) as usize];
+        d[n + 1] = HEX[((dt1_rb >> 8) & 0xF) as usize];
+        d[n + 2] = HEX[((dt1_rb >> 4) & 0xF) as usize];
+        d[n + 3] = HEX[(dt1_rb & 0xF) as usize];
+        n += 4;
+        for &b in b" dt2=" {
+            d[n] = b;
+            n += 1;
+        }
+        d[n] = HEX[((dt2 >> 12) & 0xF) as usize];
+        d[n + 1] = HEX[((dt2 >> 8) & 0xF) as usize];
+        d[n + 2] = HEX[((dt2 >> 4) & 0xF) as usize];
+        d[n + 3] = HEX[(dt2 & 0xF) as usize];
+        n += 4;
         d[n] = b'\r';
         d[n + 1] = b'\n';
         sender.push(&d[..n + 2]);
@@ -626,8 +649,11 @@ async fn main(spawner: Spawner) {
     // interrupt canary; line 13 = the FUSB302 INT_N).
     let mut isr_seen = [false; 16];
     // USB command line buffer (r130): PuTTY keys arrive one packet at a
-    // time; commands run on Enter (CR/LF).
-    let mut cmd_buf = [0u8; 12];
+    // time; commands run on Enter (CR/LF). r185: 12 bytes fit only the
+    // old one-letter commands — 'run-bootloader' is 14 and its tail was
+    // silently dropped (the echo showed 'run-bootload' and the match
+    // failed), so the buffer grows with it.
+    let mut cmd_buf = [0u8; 24];
     let mut cmd_len = 0;
     // Screen orientation (r122): the APPLIED state and the detector's
     // settled state (r125: the hold tracks the detected state, so the
@@ -844,7 +870,10 @@ async fn main(spawner: Spawner) {
             for &b in &rbuf[..rn.min(64) as usize] {
                 if b == b'\r' || b == b'\n' {
                     if cmd_len > 0 {
-                        let mut d = [0u8; 40];
+                        // r185: echo buffer grows with cmd_buf — it writes
+                        // "[flash] cmd:" + 2 bytes per command byte (space
+                        // separated) + CRLF; at 24 command bytes that is 62.
+                        let mut d = [0u8; 64];
                         let mut w = 0;
                         for &b in b"[flash] cmd:" {
                             d[w] = b;
@@ -1041,6 +1070,31 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
                 sender.push(b"[flash] sector out of range (0..4095)
 ");
             }
+        }
+        // r184: soft-reset into the bootloader's update mode via the
+        // battery-domain cookie (BPR DT2 = 0xB007, consumed + cleared by
+        // bootloader/src/main.rs). The ack goes out through send_direct
+        // (bounded busy retry) and a short drain delay; the USB IRQs die
+        // at the reset right after it. r187: the ack carries the DT2
+        // read-back — if the backup domain dropped the write, this line
+        // says so instead of promising a bootloader handoff that will
+        // never happen.
+        b'r' if cmd == b"run-bootloader" => {
+            let rb = request_bootloader();
+            let mut d = [0u8; 64];
+            let mut n = 0;
+            for &b in b"[app] bootloader requested rb=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_hex8(&mut d, n, u32::from(rb));
+            for &b in b", rebooting\r\n" {
+                d[n] = b;
+                n += 1;
+            }
+            send_direct(&d[..n]);
+            cortex_m::asm::delay(192_000 * 100); // ~100 ms CDC drain
+            cortex_m::peripheral::SCB::sys_reset();
         }
         _ => {}
     }

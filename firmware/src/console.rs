@@ -453,8 +453,23 @@ fn fault_halt() -> ! {
 fn bpr_access() {
     unsafe {
         use embassy_at32::pac::at32f403a::{CRM, PWC};
-        CRM::steal().apb1en().modify(|_, w| w.pwc().bit(true));
-        PWC::steal().ctrl().modify(|_, w| w.bpwen().set_bit());
+        let crm = CRM::steal();
+        // r188 (user's external review): BOTH APB1 clocks are required —
+        // PWC (bit 28) for BPWEN to matter AND BPR (bit 27) for the DT
+        // registers to respond at all. Only PWC was ever enabled, so every
+        // DT read returned 0 and every write was dropped ('boots=1' on
+        // every boot, 'last stage=0', the run-bootloader cookie lost).
+        // BPDC is a different story: it lives in the CRM block and needs
+        // only BPWEN — which is why the LEXT probe always worked while
+        // the DT cookies never did.
+        crm.apb1en().modify(|_, w| w.pwc().bit(true));
+        crm.apb1en().modify(|_, w| w.bpr().bit(true));
+        // APB writes are POSTED — read the enable register back so both
+        // enable writes land before the BPR access; drain BPWEN likewise.
+        let _ = crm.apb1en().read();
+        let pwc = PWC::steal();
+        pwc.ctrl().modify(|_, w| w.bpwen().set_bit());
+        let _ = pwc.ctrl().read();
     }
 }
 
@@ -474,15 +489,17 @@ pub(crate) fn dbg_stage(stage: u16) {
     }
 }
 
-/// Boot counter in dt1: +1 every boot (wraps at 65535).
-pub(crate) fn dbg_boot_count() -> u16 {
+/// Boot counter in dt1: +1 every boot (wraps at 65535). r187: returns
+/// (written, read-back) — the read-back is the write path's own witness;
+/// if the backup domain drops the write, the same breath reports it.
+pub(crate) fn dbg_boot_count() -> (u16, u16) {
     bpr_access();
     unsafe {
         use embassy_at32::pac::at32f403a::BPR;
         let bpr = BPR::steal();
         let n = bpr.dt(1).read().dt().bits().wrapping_add(1);
         bpr.dt(1).write(|w| unsafe { w.dt().bits(n) });
-        n
+        (n, bpr.dt(1).read().dt().bits())
     }
 }
 
@@ -492,6 +509,34 @@ pub(crate) fn dbg_last_stage() -> u16 {
     unsafe {
         use embassy_at32::pac::at32f403a::BPR;
         BPR::steal().dt(0).read().dt().bits()
+    }
+}
+
+/// r187: raw read of DTn — the boot line prints DT0/DT1/DT2 so a broken
+/// cookie handshake names its failing link in one boot.
+pub(crate) fn dbg_dt(n: usize) -> u16 {
+    bpr_access();
+    unsafe {
+        use embassy_at32::pac::at32f403a::BPR;
+        BPR::steal().dt(n).read().dt().bits()
+    }
+}
+
+/// r184: battery-domain bootloader-request cookie (BPR DT2). The app
+/// writes 0xB007 and soft-resets; the bootloader
+/// (bootloader/src/main.rs `consume_bootloader_request`) reads it, clears
+/// it, and enters update mode — no OK-held + reset dance needed. The
+/// cookie survives soft resets only: power removal loses the request,
+/// which is the safe failure mode (the device just boots normally).
+/// r187: returns the read-back of DT2 right after the write — the
+/// write path's own witness.
+pub(crate) fn request_bootloader() -> u16 {
+    bpr_access();
+    unsafe {
+        use embassy_at32::pac::at32f403a::BPR;
+        let bpr = BPR::steal();
+        bpr.dt(2).write(|w| unsafe { w.dt().bits(0xB007) });
+        bpr.dt(2).read().dt().bits()
     }
 }
 

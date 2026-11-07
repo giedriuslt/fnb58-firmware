@@ -55,13 +55,16 @@ use embassy_at32::spi::{Divider, Mode};
 const HEXT_HZ: u32 = 8_000_000;
 
 /// Build tag, carried in the LCD banner, the ready line and every INFO —
-/// a paste can never be mistaken for another build. bl4: claim the PB3
-/// backlight gate high in the LCD constructor (bl3 never claimed it, so
-/// the update-mode screen was dark). bl3: the trailer sector guard
-/// covers the whole 2 KiB (bl2 refused word programs at META_BASE+4/8/12,
-/// leaving COMMIT's trailer half-written). bl2: blocks stay in the Block
+/// a paste can never be mistaken for another build. bl6: the BPR access
+/// path drains its posted APB enable writes (read-backs in bpr_access) —
+/// without them the run-bootloader cookie never survived the reset to
+/// this side. bl5: consume the app's battery-domain boot-to-bootloader
+/// request (BPR DT2 = 0xB007, set by the app's `run-bootloader` console
+/// command) and enter update mode without the OK button. bl4: claim the
+/// PB3 backlight gate high in the LCD constructor. bl3: the trailer
+/// sector guard covers the whole 2 KiB. bl2: blocks stay in the Block
 /// phase (countdown on ACK) + 3 s idle timeout.
-const TAG: &[u8] = b"bl4";
+const TAG: &[u8] = b"bl8";
 
 /// Block payload size = one internal-flash sector.
 const BLOCK_DATA: usize = 2048;
@@ -489,6 +492,52 @@ fn sample_ok() -> bool {
     held
 }
 
+// --- battery-domain boot request (the app's `run-bootloader` command) ---
+
+/// The magic in BPR DT2 meaning "enter update mode". The app's console
+/// command writes it and soft-resets (firmware/src/console.rs
+/// `request_bootloader`); a power cycle loses it, which is the safe
+/// failure mode — the device just boots normally.
+const BOOT_REQUEST_MAGIC: u16 = 0xB007;
+
+/// r168 lesson, copied from the app's console.rs: the BPR sits in the
+/// battery domain — CRM's APB1 PWC clock must be ON and PWC.CTRL.BPWEN
+/// set before the DT registers respond at all. Accessors are
+/// self-sufficient or everything silently reads 0. r188 (user's external
+/// review): the BPR peripheral needs its OWN APB1 clock too (bit 27) —
+/// only PWC was ever enabled, so every DT read returned 0 and every
+/// write dropped. BPDC (CRM block, LEXT probe) needs only BPWEN, which
+/// is why that always worked while the DT cookies never did. APB writes
+/// are POSTED — read the enable registers back before touching BPR.
+fn bpr_access() {
+    unsafe {
+        use embassy_at32::pac::at32f403a::{CRM, PWC};
+        let crm = CRM::steal();
+        crm.apb1en().modify(|_, w| w.pwc().bit(true));
+        crm.apb1en().modify(|_, w| w.bpr().bit(true));
+        let _ = crm.apb1en().read();
+        let pwc = PWC::steal();
+        pwc.ctrl().modify(|_, w| w.bpwen().set_bit());
+        let _ = pwc.ctrl().read();
+    }
+}
+
+/// Read BPR DT2 and consume the request if present: clearing it here is
+/// what keeps a normal reset (or the flasher's RESET command) from
+/// looping into update mode forever. r187: returns (honored, raw) — the
+/// raw value lands in the ring, so a cookie the app wrote but this side
+/// cannot see is distinguishable from one never written.
+fn consume_bootloader_request() -> (bool, u16) {
+    bpr_access();
+    let bpr = unsafe { embassy_at32::pac::at32f403a::BPR::steal() };
+    let raw = bpr.dt(2).read().dt().bits();
+    if raw != BOOT_REQUEST_MAGIC {
+        return (false, raw);
+    }
+    bpr.dt(2).write(|w| unsafe { w.dt().bits(0) });
+    (true, raw)
+}
+
 /// Disable IRQs, stop the SysTick, clear every NVIC enable/pending bit,
 /// then load the app's stack pointer and reset handler and branch. The
 /// app sets its own VTOR as its first act (kws-x1 pattern).
@@ -561,11 +610,33 @@ async fn main(_spawner: Spawner) {
 
     let ok_held = sample_ok();
 
-    if !ok_held && matches!(meta::check(), State::Valid { .. }) {
+    // r184: the app can request update mode over its console
+    // ('run-bootloader' -> BPR DT2 = 0xB007 -> soft reset). Honor it
+    // regardless of the OK button; the cookie is consumed (cleared) here
+    // so the flasher's RESET or a normal reboot cannot loop back in.
+    // r187: the raw DT2 always lands in the ring — the handshake's
+    // failing link names itself.
+    let (bl_requested, dt2_raw) = consume_bootloader_request();
+    {
+        let mut b = [0u8; 48];
+        let mut n = 0;
+        n += put(&mut b[..], b"[bl] dt2=");
+        n += put_hex8(&mut b[n..], u32::from(dt2_raw));
+        n += put(&mut b[..], b" requested=");
+        n += put(&mut b[n..], if bl_requested { b"1" } else { b"0" });
+        say(&b[..n]);
+        say(b"\r\n");
+    }
+    if bl_requested {
+        // Queued before USB is up: the ring drains once the host connects.
+        say(b"[bl] boot-to-bootloader requested via BPR\r\n");
+    }
+
+    if !ok_held && !bl_requested && matches!(meta::check(), State::Valid { .. }) {
         jump_to_app();
     }
-    // OK held (explicit update request) or the app is empty/invalid
-    // (recovery): update mode either way.
+    // OK held (explicit update request), the BPR request, or the app is
+    // empty/invalid (recovery): update mode either way.
     update_mode().await;
 }
 
@@ -581,7 +652,7 @@ async fn update_mode() -> ! {
     } else {
         b"NO APP - UPDATE\0"
     };
-    lcd.banner(b"FNB58 BL4", l2, b"CONNECT USB\0").await;
+    lcd.banner(b"FNB58 BL8", l2, b"CONNECT USB\0").await;
 
     // One distinct beep marks update mode (the app's boot beep is
     // 500 Hz / 30 ms).
@@ -595,7 +666,7 @@ async fn update_mode() -> ! {
         cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_L_CAN1_RX0);
         cortex_m::peripheral::NVIC::unmask(interrupt::USBFS_H_CAN1_TX);
     }
-    say(b"[bl] bl4 update mode ready\r\n");
+    say(b"[bl] bl8 update mode ready\r\n");
 
     loop {
         tx_ring().flush_step();
