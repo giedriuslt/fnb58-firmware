@@ -50,6 +50,9 @@ pub mod control {
     pub const GOOD_CRC: u16 = 0x01;
     pub const ACCEPT: u16 = 0x03;
     pub const REJECT: u16 = 0x04;
+    /// r175: the engine's contract-change flow (8.3.3.3.12) refreshes the
+    /// offer — and the source's MessageID — before a new Request.
+    pub const GET_SOURCE_CAP: u16 = 0x05;
     pub const SOFT_RESET: u16 = 0x0d;
     pub const NOT_SUPPORTED: u16 = 0x10;
     pub const GET_STATUS: u16 = 0x12;
