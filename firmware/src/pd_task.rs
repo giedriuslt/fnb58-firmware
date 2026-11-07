@@ -540,6 +540,16 @@ pub async fn run() {
                     return;
                 };
                 if selection.preview(target) && selection.confirm() {
+                    // r176: the exchange window opens HERE, not at session
+                    // start: the answer wait (Request -> Accept -> PS_RDY,
+                    // or Get_Source_Cap -> caps -> Request -> ...) must run
+                    // without a main-task blackout. The PE's answer select
+                    // polls the TIMEOUT future first, so a single ~55 ms
+                    // draw_pd inside the window loses the Accept (already
+                    // in our FIFO) to the SenderResponse timer — the r173
+                    // log's code=44 at +63 ms. publish() clears BUSY at
+                    // PS_RDY; the session end clears it on failure.
+                    BUSY.store(true, Ordering::Relaxed);
                     crate::pd_log(b"[pd] arm ok\r\n");
                 } else {
                     // confirm() refuses while rejected/waiting — fresh
