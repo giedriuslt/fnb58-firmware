@@ -293,8 +293,11 @@ async fn probe() {
                 contracted_9v = true;
                 pd_log(b"[pdmin] SUCCESS 9v contract\r\n");
                 // No quiesce: the contract stays alive (RX on, auto-GoodCRC
-                // keeps acknowledging; the probe just stops talking).
-                dbg_stage(20);
+                // keeps acknowledging; the probe just stops talking). No
+                // dbg_stage here either: 20 is transmit()'s own mark —
+                // parking the cookie on it would mislabel the next boot's
+                // evidence. The last real mark (22 FIFO write / 13 engine)
+                // is the accurate "where we ended".
                 break;
             }
             Negotiate::HardReset => {
@@ -304,10 +307,13 @@ async fn probe() {
                 quiesce().await;
                 Timer::after_millis(1600).await; // tSrcRecover + margin
             }
-            Negotiate::Silent => {
-                // Nothing at all arrived: wake it next attempt.
+            Negotiate::Silent(code) => {
+                // Nothing at all arrived: wake it next attempt. `code` is
+                // WHAT killed the wait (Budget=16 = the full ~16 s window;
+                // anything else = an early death before any packet — the
+                // distinction is evidence, not noise).
                 wake_due = true;
-                log_end(&phy, 0, t0_ms).await;
+                log_end(&phy, code, t0_ms).await;
                 quiesce().await;
             }
             Negotiate::Failed(code) => {
@@ -326,11 +332,12 @@ async fn probe() {
     console::PD_STAGE.store(0, Ordering::Relaxed);
 }
 
-/// What one negotiate pass concluded.
+/// What one negotiate pass concluded. `Silent` carries the code that ended
+/// the empty wait (Budget=16 = full window elapsed; else an early death).
 enum Negotiate {
     Contracted,
     HardReset,
-    Silent,
+    Silent(u16),
     Failed(u16),
 }
 
@@ -340,7 +347,7 @@ async fn negotiate(phy: &mut pd_phy::Session<'_, pd_phy::SharedBus, embassy_time
     let mut defers: u32 = 0;
     loop {
         console::PD_STAGE.store(4, Ordering::Relaxed);
-        buf = [0; 40];
+        buf.fill(0);
         match phy.receive(&mut buf).await {
             Ok(len) => {
                 if len < 2 {
@@ -490,7 +497,7 @@ async fn negotiate(phy: &mut pd_phy::Session<'_, pd_phy::SharedBus, embassy_time
                 // Peer... take_error names it; rx_packets==0 marks silence.
                 let code = phy.take_error().map_or(0, |e| error_code(&e));
                 if phy.observation.rx_packets == 0 {
-                    return Negotiate::Silent;
+                    return Negotiate::Silent(code);
                 }
                 return Negotiate::Failed(code);
             }
