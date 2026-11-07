@@ -166,10 +166,11 @@ fn phase_code(phase: Phase) -> u8 {
     }
 }
 
-/// r171: one console line when a contract lands (PS_RDY seen). The
-/// engine-end line only prints at session END, so a healthy persistent
-/// boot contract would otherwise be console-silent.
-static PSRDY_LOGGED: AtomicBool = AtomicBool::new(false);
+/// r179: the contract voltage of the last logged PS_RDY (0 = none yet).
+/// The line fires on every CHANGE — the boot 5 V and each chosen voltage —
+/// instead of once per attempt (the r178 log: the 9 V re-contract was
+/// console-silent because the boot 5 V had consumed the once-flag).
+static LAST_PSRDY_MV: AtomicU16 = AtomicU16::new(0);
 
 fn publish(observation: Observation) {
     let spr = observation.spr;
@@ -188,31 +189,32 @@ fn publish(observation: Observation) {
             .store(spr.peer_revision.unwrap_or(0), Ordering::Relaxed);
         VIEW.vbus_mv
             .store(spr.vbus_live_mv.unwrap_or(0), Ordering::Relaxed);
-        if spr.psrdy_seen && !PSRDY_LOGGED.swap(true, Ordering::Relaxed) {
-            // r172: the contract is up — the transmit chain is idle, so
-            // the main loop may draw and read the meter again.
+        if spr.psrdy_seen {
+            // r178 log: the re-contract's PS_RDY left BUSY stuck true (it
+            // lived inside the once-per-attempt gate) and froze the PD
+            // screen + meter. The exchange window closes on EVERY publish
+            // with the contract up, and the phase follows.
             BUSY.store(false, Ordering::Relaxed);
             VIEW.phase
                 .store(phase_code(Phase::Contracted), Ordering::Relaxed);
-            let mut d = [0u8; 40];
-            let mut n = 0;
-            for &b in b"[pd] psrdy v=" {
-                d[n] = b;
-                n += 1;
+            let mv = spr.selected_mv.unwrap_or(0);
+            if LAST_PSRDY_MV.swap(mv, Ordering::Relaxed) != mv {
+                let mut d = [0u8; 40];
+                let mut n = 0;
+                for &b in b"[pd] psrdy v=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                n = crate::push_dec(&mut d, n, u32::from(mv));
+                for &b in b"mV ma=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                n = crate::push_dec(&mut d, n, u32::from(spr.selected_ma.unwrap_or(0)));
+                d[n] = b'\r';
+                d[n + 1] = b'\n';
+                crate::pd_log(&d[..n + 2]);
             }
-            n = crate::push_dec(
-                &mut d,
-                n,
-                u32::from(spr.selected_mv.unwrap_or(0)),
-            );
-            for &b in b"mV ma=" {
-                d[n] = b;
-                n += 1;
-            }
-            n = crate::push_dec(&mut d, n, u32::from(spr.selected_ma.unwrap_or(0)));
-            d[n] = b'\r';
-            d[n + 1] = b'\n';
-            crate::pd_log(&d[..n + 2]);
         }
     }
     VIEW.boot_step.store(observation.boot_step, Ordering::Relaxed);
@@ -392,7 +394,6 @@ pub async fn run() {
         VIEW.rx_packets.store(0, Ordering::Relaxed);
         VIEW.rx_error.store(0, Ordering::Relaxed);
         VIEW.listen.store(0, Ordering::Relaxed);
-        PSRDY_LOGGED.store(false, Ordering::Relaxed);
 
         // One-shot CC diagnostic on the power-on configuration: measures
         // both CCs with Rd on both and listens for the source's traffic;
