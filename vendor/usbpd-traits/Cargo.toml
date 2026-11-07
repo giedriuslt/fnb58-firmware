@@ -1,0 +1,14 @@
+[package]
+name = "usbpd-traits"
+version = "2.0.0"
+description = "USB-PD library traits (vendored r174: tolerant SenderResponse window)."
+license = "MIT OR Apache-2.0"
+publish = false
+edition = "2021"
+
+[dependencies]
+defmt = { version = "0.6", optional = true, default-features = false }
+
+[features]
+default = []
+defmt = ["dep:defmt"]

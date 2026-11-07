@@ -22,6 +22,12 @@ usbpd-traits = { git = "https://github.com/kralonur/usbpd", rev = "16b13a23dafad
 [patch."https://github.com/kralonur/embedded-charging-protocols-rs"]
 pd-protocol = { path = "pd-protocol-debug/pd-protocol" }
 
+# r174: vendored usbpd-traits — the SenderResponseTimer widened 30 -> 100 ms
+# (the r173 log: this charger Accepts a re-Request slower than the spec's
+# 24-30 ms, so the spec-mandated Hard Reset killed every contract change).
+[patch."https://github.com/kralonur/usbpd"]
+usbpd-traits = { path = "vendor/usbpd-traits" }
+
 [profile.release]
 opt-level = "z"
 lto = true
