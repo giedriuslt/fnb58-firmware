@@ -69,6 +69,18 @@ pub fn cycle_desired(dir: i16) -> u16 {
     DESIRED_MV.store(next, Ordering::Relaxed);
     next
 }
+
+/// r173: set by the PD screen's OK-commit. The engine's control callback
+/// then previews+confirms the target on its next poll — a plain Request
+/// from Ready (the PD-native voltage change; PPS re-requests the same
+/// way). NO Hard Reset, NO session restart. Browsing (LEFT/RIGHT) never
+/// transmits — that is the Selection API's own contract ("browsing alone
+/// never schedules transmission").
+pub static COMMIT: AtomicBool = AtomicBool::new(false);
+
+pub fn commit_desired() {
+    COMMIT.store(true, Ordering::Relaxed);
+}
 /// r160: true for the whole diagnostic+session+restore span. The main
 /// loop freezes ALL screen draws, meter/accel reads and other SPI/I2C
 /// side-work while this is set: Spi::write_busy is a SYNCHRONOUS loop
@@ -486,34 +498,53 @@ pub async fn run() {
         let selection = pd_spr::Selection::<FnbLimits>::new();
         // r149: ARM the first Request ourselves (the shared engine NEVER
         // auto-requests — kws-x1's product sends PdCommand::Confirm from
-        // its selector UI). r171: the armed target is DESIRED_MV — the
-        // PPS screen's selection (default 5 V, the boot contract) —
-        // instead of the r149 "highest offered fixed": if the charger
-        // does not offer it, nothing is armed (a loud FAIL, not a silent
-        // fallback to a different voltage).
+        // its selector UI). r173: the arm happens (a) at boot — the first
+        // caps arm DESIRED_MV so the boot contract is 5 V — and (b) on an
+        // explicit COMMIT (the PD screen's OK): preview+confirm wakes the
+        // engine and it sends a plain Request FROM READY — the PD-native
+        // voltage change, no Hard Reset, no restart. Browsing never
+        // transmits; a commit for the already-established voltage is a
+        // no-op; a voltage the charger does not offer is logged, not
+        // silently ignored. confirm() refuses after a Reject until fresh
+        // caps — also logged.
         let control =
             |_observation: &mut Observation, _store: Option<&dyn pd_protocol::pd_svids::Store>| {
                 use pd_protocol::pd_spr::Supply;
-                if selection.established_target().is_none()
-                    && !selection.has_pending()
-                    && !selection.request_in_flight()
-                {
-                    let desired = DESIRED_MV.load(Ordering::Relaxed);
-                    let mut match_ = None;
-                    for index in 0..selection.option_count() {
-                        if let Some(target) = selection.option(index)
-                            && matches!(target.supply, Supply::Fixed)
-                            && target.mv == desired
-                        {
-                            match_ = Some(target);
-                            break;
-                        }
-                    }
-                    if let Some(target) = match_
-                        && selection.preview(target)
+                if selection.has_pending() || selection.request_in_flight() {
+                    return; // a latched COMMIT waits for the next idle poll
+                }
+                let established = selection.established_target();
+                let commit = COMMIT.swap(false, Ordering::Relaxed);
+                let desired = DESIRED_MV.load(Ordering::Relaxed);
+                let due = match established {
+                    None => true, // boot: arm the default before any contract
+                    Some(current) => commit && current.mv != desired,
+                };
+                if !due {
+                    return;
+                }
+                let mut match_ = None;
+                for index in 0..selection.option_count() {
+                    if let Some(target) = selection.option(index)
+                        && matches!(target.supply, Supply::Fixed)
+                        && target.mv == desired
                     {
-                        selection.confirm();
+                        match_ = Some(target);
+                        break;
                     }
+                }
+                let Some(target) = match_ else {
+                    if commit {
+                        crate::pd_log(b"[pd] arm: not offered\r\n");
+                    }
+                    return;
+                };
+                if selection.preview(target) && selection.confirm() {
+                    crate::pd_log(b"[pd] arm ok\r\n");
+                } else {
+                    // confirm() refuses while rejected/waiting — fresh
+                    // caps re-enable it.
+                    crate::pd_log(b"[pd] arm refused\r\n");
                 }
             };
         // r171: persistent sessions again (kws-x1's shape). The r120

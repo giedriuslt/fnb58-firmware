@@ -27,7 +27,9 @@ pub enum Screen {
 pub enum Press {
     None,
     Switch(Screen),
-    Discover,
+    /// r173: the OK-commit in voltage selection — a PD-native voltage
+    /// change (new Request from Ready), not a session restart.
+    Commit,
     /// r171: cycle the request target one step (1 = RIGHT = next, -1 =
     /// LEFT = previous) while the PPS screen is in voltage selection.
     Voltage(i16),
@@ -101,7 +103,7 @@ impl Ui {
             buttons::OK if self.screen == Screen::Pd => {
                 if self.selecting {
                     self.selecting = false;
-                    Press::Discover
+                    Press::Commit
                 } else {
                     self.selecting = true;
                     Press::Hint
