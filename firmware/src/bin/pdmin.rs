@@ -180,7 +180,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         console::boot_log().push(msg);
     }
-    say(b"[pdmin] FNB58 r168: usb log + fusb302 only\r\n");
+    say(b"[pdmin] FNB58 r170: usb log + fusb302 only\r\n");
     dbg_stage(1);
 
     let mut sender = console::Sender::new();
