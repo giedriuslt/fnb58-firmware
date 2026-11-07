@@ -1157,14 +1157,6 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
             && !self.recovering
             && bytes.len() == 2
             && header == header::control::SOFT_RESET | header::revision(self.tx_revision);
-        // r175: Get_Source_Cap from Ready (sections 6.3.9, 8.3.3.3.12): the
-        // engine's contract-change flow refreshes the offer — and advances
-        // the source's MessageID past a duplicate — before the new Request.
-        // One exact message: Control, sink/UFP, the negotiated revision.
-        let get_source_cap = sop == Sop::Partner
-            && bytes.len() == 2
-            && header & header::WITHOUT_ID
-                == header::control::GET_SOURCE_CAP | header::revision(self.tx_revision);
         // While a reset step is due it is the only permitted transmission, and
         // nothing is sent while capabilities are awaited after a reset.
         if self.reset.is_some() && !(soft_reset || reset_accept) {
@@ -1366,7 +1358,6 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
             || pps_status_query
             || query.is_some()
             || epr_request
-            || get_source_cap
             || (is_request
                 && self.config.persistent
                 && self.trace().contract_seen
@@ -1388,7 +1379,6 @@ impl<'a, B: GatedBus, D: Waiter, C: Clock, P: Platform> Session<'a, B, D, C, P> 
             && !epr_signal
             && !emarker_reply
             && !soft_reset
-            && !get_source_cap
         {
             LAST_TX_REFUSAL.store(6, core::sync::atomic::Ordering::Relaxed);
             return Err(Error::Request);
