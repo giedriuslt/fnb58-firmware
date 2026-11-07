@@ -92,6 +92,40 @@ async fn main(spawner: Spawner) {
         *guard = pd_task::BusCell(i2c.ok());
     }
 
+    // r168: configure the TPA626 (the Platform's qualified VBUS source).
+    // Without this its bus-voltage register reads garbage and Session::begin
+    // fails every first attempt with InputVoltage (start err=3, the r167
+    // log's 'attempt=1 works only from attempt=2' pattern). Same config the
+    // main build writes (AVG=64 continuous + the 10 mOhm shunt calibration).
+    {
+        use embedded_hal_async::i2c::I2c as _;
+        let mut guard = pd_task::BUS.lock().await;
+        if let Some(bus) = guard.0.as_mut() {
+            let cfg = bus
+                .write(0x40, &[0x00, 0x48, 0x97])
+                .await
+                .is_ok(); // AVG=64, continuous, 588 us + 588 us
+            let cal = bus.write(0x40, &[0x05, 0x28, 0x00]).await.is_ok(); // 5.12 mShunt cal
+            let mut d = [0u8; 40];
+            let mut n = 0;
+            for &b in b"[pdmin] tpa cfg=" {
+                d[n] = b;
+                n += 1;
+            }
+            d[n] = b'0' + cfg as u8;
+            n += 1;
+            for &b in b" cal=" {
+                d[n] = b;
+                n += 1;
+            }
+            d[n] = b'0' + cal as u8;
+            n += 1;
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            console::boot_log().push(&d[..n + 2]);
+        }
+    }
+
     spawner.spawn(probe().expect("one probe task"));
 
     // Unmask USB interrupt lines and bring the CDC console up.
@@ -104,7 +138,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         console::boot_log().push(msg);
     }
-    say(b"[pdmin] FNB58 r167: usb log + fusb302 only\r\n");
+    say(b"[pdmin] FNB58 r168: usb log + fusb302 only\r\n");
     dbg_stage(1);
 
     let mut sender = console::Sender::new();
@@ -376,7 +410,24 @@ async fn negotiate(phy: &mut pd_phy::Session<'_, pd_phy::SharedBus, embassy_time
                 } else if ty == 1 {
                     // Source_Capabilities: decode, then the 9 V Request at
                     // once — no engine, no await between this and transmit.
-                    pd_log(b"[m] caps\r\n");
+                    // r168: the decode ms (relative to session start) —
+                    // paired with the end line's e=/p= it decides whether
+                    // the 77 ms gap sits BEFORE transmit (delivery) or
+                    // inside the chain.
+                    let mut d = [0u8; 32];
+                    let mut n = 0;
+                    for &b in b"[m] caps@" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = push_dec(
+                        &mut d,
+                        n,
+                        (embassy_time::Instant::now().as_millis() as u32).wrapping_sub(t0_ms),
+                    );
+                    d[n] = b'\r';
+                    d[n + 1] = b'\n';
+                    pd_log(&d[..n + 2]);
                     log_pdos(phy);
                     match build_request(phy, hdr_rx, tx_id) {
                         Ok((req_hdr, rdo_raw, req)) => {
@@ -803,6 +854,38 @@ async fn log_end(
     }
     d[n] = b'0' + u32::from(fusb302_pd::phy::LAST_TX_REFUSAL.load(Ordering::Relaxed)) as u8;
     n += 1;
+    // r168: the transmit-chain timestamps (r161's fields, finally
+    // printable). e = transmit() entry, p = the pre-TX poll — both as ms
+    // after session start; '-' = the step never ran. With the caps@ line
+    // this splits the 77 ms gap: e large = delivery was late (receive
+    // side); e small + p large = inside the chain (impossible per the
+    // sync-read gauntlet); e,p small + HR = the latch predates the poll.
+    for &b in b" e=" {
+        d[n] = b;
+        n += 1;
+    }
+    {
+        let at = fusb302_pd::phy::TX_ENTER_MS.load(Ordering::Relaxed);
+        if at == 0 {
+            d[n] = b'-';
+            n += 1;
+        } else {
+            n = push_dec(&mut d, n, at.wrapping_sub(t0_ms));
+        }
+    }
+    for &b in b" p=" {
+        d[n] = b;
+        n += 1;
+    }
+    {
+        let at = fusb302_pd::phy::PRE_TX_MS.load(Ordering::Relaxed);
+        if at == 0 {
+            d[n] = b'-';
+            n += 1;
+        } else {
+            n = push_dec(&mut d, n, at.wrapping_sub(t0_ms));
+        }
+    }
     for &b in b" n=" {
         d[n] = b;
         n += 1;

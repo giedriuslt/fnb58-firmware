@@ -445,6 +445,19 @@ fn fault_halt() -> ! {
     }
 }
 
+/// r168: the BPR sits in the battery domain — CRM's APB1 PWC clock must be
+/// ON and PWC.CTRL.BPWEN set before the DT registers respond at all. The
+/// main build only got this from the LEXT probe block (r126); pdmin never
+/// ran it, so every r167 cookie write/read silently returned 0 ('[m] cookie
+/// stage=0' in every log line). The accessors are now self-sufficient.
+fn bpr_access() {
+    unsafe {
+        use embassy_at32::pac::at32f403a::{CRM, PWC};
+        CRM::steal().apb1en().modify(|_, w| w.pwc().bit(true));
+        PWC::steal().ctrl().modify(|_, w| w.bpwen().set_bit());
+    }
+}
+
 /// r164: battery-domain stage cookie. These two registers survive every
 /// reset (except full power removal), so each risky step stamps its ID
 /// and the next boot prints what the previous boot was doing when it
@@ -452,22 +465,21 @@ fn fault_halt() -> ! {
 /// start, 13 engine running, 14 finish/restore, 15 restart HR now,
 /// 16 vbus rerun, 20 transmit chain entered, 21 pre-TX poll, 22 FIFO write.
 pub(crate) fn dbg_stage(stage: u16) {
+    bpr_access();
     unsafe {
-        use embassy_at32::pac::at32f403a::{BPR, PWC};
-        let pwc = PWC::steal();
-        let bpr = BPR::steal();
-        pwc.ctrl().modify(|_, w| w.bpwen().set_bit());
-        bpr.dt(0).write(|w| unsafe { w.dt().bits(u16::from(stage)) });
+        use embassy_at32::pac::at32f403a::BPR;
+        BPR::steal()
+            .dt(0)
+            .write(|w| unsafe { w.dt().bits(u16::from(stage)) });
     }
 }
 
 /// Boot counter in dt1: +1 every boot (wraps at 65535).
 pub(crate) fn dbg_boot_count() -> u16 {
+    bpr_access();
     unsafe {
-        use embassy_at32::pac::at32f403a::{BPR, PWC};
-        let pwc = PWC::steal();
+        use embassy_at32::pac::at32f403a::BPR;
         let bpr = BPR::steal();
-        pwc.ctrl().modify(|_, w| w.bpwen().set_bit());
         let n = bpr.dt(1).read().dt().bits().wrapping_add(1);
         bpr.dt(1).write(|w| unsafe { w.dt().bits(n) });
         n
@@ -476,12 +488,10 @@ pub(crate) fn dbg_boot_count() -> u16 {
 
 /// Read dt0 without modifying it (boot log).
 pub(crate) fn dbg_last_stage() -> u16 {
+    bpr_access();
     unsafe {
-        use embassy_at32::pac::at32f403a::{BPR, PWC};
-        let pwc = PWC::steal();
-        let bpr = BPR::steal();
-        pwc.ctrl().modify(|_, w| w.bpwen().set_bit());
-        bpr.dt(0).read().dt().bits()
+        use embassy_at32::pac::at32f403a::BPR;
+        BPR::steal().dt(0).read().dt().bits()
     }
 }
 
