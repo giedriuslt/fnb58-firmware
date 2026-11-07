@@ -18,6 +18,7 @@ use fusb302_pd::observation::{Observation, Phase};
 use fusb302_pd::startup::Report;
 use pd_protocol::pd_spr;
 
+use crate::console::PD_STAGE as STAGE;
 use crate::pd_phy::{self, FnbLimits, MEASURE, SharedBus, wait_for_rx_idle};
 
 /// The HAL I2c handle, boxed for the shared bus. `I2c` is `!Send`/`!Sync`
@@ -47,9 +48,6 @@ pub static BUS: Bus = Bus::new();
 pub static START: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Pressed-button bitmask from the main loop (bit 0 = BACK held).
 pub static BTN: AtomicU8 = AtomicU8::new(0);
-/// r139 stall-watch breadcrumb: 1 = USB gate, 2 = CC diagnostic,
-/// 3 = session start, 4 = engine, 5 = finish/restore, 6 = parked on OK.
-pub static STAGE: AtomicU8 = AtomicU8::new(0);
 /// r160: true for the whole diagnostic+session+restore span. The main
 /// loop freezes ALL screen draws, meter/accel reads and other SPI/I2C
 /// side-work while this is set: Spi::write_busy is a SYNCHRONOUS loop
@@ -165,7 +163,8 @@ fn stop_requested() -> bool {
 /// leaves flags latched there, and the next Session::begin boundary gate
 /// refuses on them (the r144 'start err=99' = TransmissionFault). Reading
 /// clears; a real fault re-latches and the next begin still catches it.
-async fn restore_baseline(bus: &mut embassy_at32::i2c::I2c) -> Result<(), ()> {
+/// r167: also the pdmin probe's per-attempt bring-up step.
+pub(crate) async fn restore_baseline(bus: &mut embassy_at32::i2c::I2c) -> Result<(), ()> {
     use fusb302_pd::phy::Platform as _;
     let baseline = <crate::pd_phy::FnbPlatform as fusb302_pd::phy::Platform>::BASELINE;
     // REGISTERS is 13 wide (the two dynamic STATUS bytes trail); the
@@ -191,7 +190,8 @@ async fn restore_baseline(bus: &mut embassy_at32::i2c::I2c) -> Result<(), ()> {
 
 
 /// The session/PHY error mapped to a diagnostic code for the PD screen.
-fn error_code(error: &pd_phy::Error<embassy_at32::i2c::Error>) -> u16 {
+/// r167: shared with the pdmin probe's log lines.
+pub(crate) fn error_code(error: &pd_phy::Error<embassy_at32::i2c::Error>) -> u16 {
     use pd_phy::Error as E;
     match error {
         E::Orientation => 2,

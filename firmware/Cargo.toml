@@ -12,6 +12,13 @@ path = "src/main.rs"
 test = false
 bench = false
 
+# r167 pdmin probe: USB logging + FUSB302 only, boot-time 9 V request.
+[[bin]]
+name = "fnb58-pdmin"
+path = "src/bin/pdmin.rs"
+test = false
+bench = false
+
 [dependencies]
 cortex-m = { workspace = true, features = ["critical-section-single-core"] }
 cortex-m-rt = { workspace = true, features = ["paint-stack"] }
@@ -22,4 +29,6 @@ embassy-sync.workspace = true
 embedded-hal-async.workspace = true
 fusb302-pd.workspace = true
 pd-protocol.workspace = true
+usbpd.workspace = true
 usbpd-traits.workspace = true
+heapless = "0.9"

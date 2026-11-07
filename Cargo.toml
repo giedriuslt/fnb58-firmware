@@ -15,6 +15,7 @@ fusb302-pd = { path = "fusb302-pd" }
 # The sink engine (Selection/Trial/Limits) and the driver traits, pinned to
 # the revisions kws-x1 ships against.
 pd-protocol = { git = "https://github.com/kralonur/embedded-charging-protocols-rs", rev = "2c3d511cb7214f1db9f5e3528900e1fd9d1bc323" }
+usbpd = { git = "https://github.com/kralonur/usbpd", rev = "16b13a23dafad6c5dd0c18801ee978b785730f83" }
 usbpd-traits = { git = "https://github.com/kralonur/usbpd", rev = "16b13a23dafad6c5dd0c18801ee978b785730f83" }
 
 # r158 debug: vendored pd-protocol with dtrace instrumentation (host tests)
