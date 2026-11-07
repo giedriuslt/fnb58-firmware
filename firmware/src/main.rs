@@ -41,7 +41,7 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r170";
+const BUILD: &[u8] = b"r171";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -168,7 +168,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r170 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r171 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -241,7 +241,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r170 " {
+                for &b in b"r171 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -342,7 +342,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r170: pdmin probe\r\n");
+    say(b"[lcd] FNB58 r171: 5v boot + pps select\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -701,10 +701,27 @@ async fn main(spawner: Spawner) {
                 Press::Discover => {
                     // r119: the kws-x1 restart - the running session stops
                     // at its next idle point, the charger is restarted with
-                    // a Hard Reset, and the firmware reboots into a fresh
-                    // boot session against the fresh attach.
+                    // a Hard Reset, and a fresh session runs against the
+                    // fresh attach. r171: the fresh session requests
+                    // DESIRED_MV — the PPS screen's selection.
                     sender.push(b"[pd] restart requested\r\n");
                     pd_task::request_restart();
+                }
+                Press::Voltage(dir) => {
+                    // r171: the PPS screen's voltage selection.
+                    let mv = pd_task::cycle_desired(dir);
+                    let mut d = [0u8; 32];
+                    let mut n = 0;
+                    for &b in b"[pd] tgt=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = push_dec(&mut d, n, u32::from(mv));
+                    for &b in b"mV\r\n" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    sender.push(&d[..n]);
                 }
                 Press::None => {}
             }

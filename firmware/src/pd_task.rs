@@ -48,6 +48,27 @@ pub static BUS: Bus = Bus::new();
 pub static START: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Pressed-button bitmask from the main loop (bit 0 = BACK held).
 pub static BTN: AtomicU8 = AtomicU8::new(0);
+
+/// r171: the user-selected request target, cycled with LEFT/RIGHT on the
+/// PPS screen (pd_task::CHOICES_MV). The boot session arms it as-is, so
+/// the boot contract is whatever was last chosen (default 5 V).
+pub static DESIRED_MV: AtomicU16 = AtomicU16::new(5000);
+/// The selectable fixed targets (the PD screen cycles through these).
+pub const CHOICES_MV: [u16; 5] = [5000, 9000, 12000, 15000, 20000];
+
+/// Cycle [`DESIRED_MV`] by one step in `dir` (+1 right / -1 left), with
+/// wraparound. Returns the new value for the console line.
+pub fn cycle_desired(dir: i16) -> u16 {
+    let current = DESIRED_MV.load(Ordering::Relaxed);
+    let mut index = CHOICES_MV
+        .iter()
+        .position(|&mv| mv == current)
+        .unwrap_or(0);
+    index = (index as i16 + dir).rem_euclid(CHOICES_MV.len() as i16) as usize;
+    let next = CHOICES_MV[index];
+    DESIRED_MV.store(next, Ordering::Relaxed);
+    next
+}
 /// r160: true for the whole diagnostic+session+restore span. The main
 /// loop freezes ALL screen draws, meter/accel reads and other SPI/I2C
 /// side-work while this is set: Spi::write_busy is a SYNCHRONOUS loop
@@ -126,6 +147,11 @@ fn phase_code(phase: Phase) -> u8 {
     }
 }
 
+/// r171: one console line when a contract lands (PS_RDY seen). The
+/// engine-end line only prints at session END, so a healthy persistent
+/// boot contract would otherwise be console-silent.
+static PSRDY_LOGGED: AtomicBool = AtomicBool::new(false);
+
 fn publish(observation: Observation) {
     let spr = observation.spr;
     VIEW.phase.store(phase_code(observation.phase), Ordering::Relaxed);
@@ -143,6 +169,27 @@ fn publish(observation: Observation) {
             .store(spr.peer_revision.unwrap_or(0), Ordering::Relaxed);
         VIEW.vbus_mv
             .store(spr.vbus_live_mv.unwrap_or(0), Ordering::Relaxed);
+        if spr.psrdy_seen && !PSRDY_LOGGED.swap(true, Ordering::Relaxed) {
+            let mut d = [0u8; 40];
+            let mut n = 0;
+            for &b in b"[pd] psrdy v=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(
+                &mut d,
+                n,
+                u32::from(spr.selected_mv.unwrap_or(0)),
+            );
+            for &b in b"mV ma=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(&mut d, n, u32::from(spr.selected_ma.unwrap_or(0)));
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            crate::pd_log(&d[..n + 2]);
+        }
     }
     VIEW.boot_step.store(observation.boot_step, Ordering::Relaxed);
     VIEW.tx_written
@@ -287,70 +334,27 @@ fn restart_requested() -> bool {
 
 #[embassy_executor::task]
 pub async fn run() {
-    // r139: the boot session runs on PC power — USB configured within a
-    // BOUNDED 3 s (hosts finish enumeration in ~1 s, still well inside
-    // the source's ~10 s caps window). r138 started it unconditionally
-    // and charger-only power reboot-looped: the session's automatic
-    // GoodCRCs string the source along, its Hard Reset dips VBUS, the
-    // board browns out and the next boot acks fresh caps again (the r119
-    // wall; the HR is the charger's, so one-shot mode cannot prevent it).
-    // The boot LOG waits for nothing either way: the 4096-byte ring
-    // (main.rs BootLog) captures everything and flushes on connection.
-    // STAGE breadcrumbs feed the SysTick stall watch in main.rs.
-    unsafe extern "C" {
-        fn fnb58_usb_configured() -> u32;
-    }
-    let boot_ms = embassy_time::Instant::now().as_millis();
-    STAGE.store(1, Ordering::Relaxed); // 1 = USB gate
-    let mut powered = false;
-    for _ in 0..30 {
-        if unsafe { fnb58_usb_configured() } == 1 {
-            powered = true;
-            break;
-        }
-        embassy_time::Timer::after_millis(100).await;
-    }
-    // r142: charger-only OK presses INSIDE the source's post-attach caps
-    // window (~15 s: nCapsCount + NoResponse HR + one re-announce) string
-    // the source along with our auto-GoodCRC, and its Hard Reset dips
-    // VBUS - the r119 brownout, once per press (r141 hw result). A session
-    // that starts AFTER the window is harmless: the idle source never
-    // transmits, nothing is acked, no HR. Defer charger-only sessions
-    // until 20 s past boot; the LCD shows FAIL 45 meanwhile.
-    let charger_only = !powered;
-    crate::pd_log(if powered {
-        b"[pd] pc power: boot session\r\n"
-    } else {
-        b"[pd] no usb 3s: OK-only\r\n"
-    });
-    let mut first = powered;
+    // r171: the boot session starts IMMEDIATELY and unconditionally, and
+    // it now COMPLETES a contract: with the r170 I2C fix the Request is on
+    // the wire ~10 ms after the caps' GoodCRC, inside every charger's
+    // request window. The r138 3 s USB gate and the r142 20 s charger-only
+    // deferral existed only because the Request never left (acked caps ->
+    // Hard Reset -> VBUS dip); their reason is gone. The boot contract
+    // targets DESIRED_MV (default 5 V); OK on the PPS screen re-requests
+    // the chosen voltage. The boot LOG waits for nothing: the 4096-byte
+    // ring (console.rs BootLog) flushes when the host connects.
+    STAGE.store(1, Ordering::Relaxed);
+    crate::pd_log(b"[pd] boot session\r\n");
+    let mut first = true;
     loop {
         if !first {
             STAGE.store(6, Ordering::Relaxed); // parked, waiting for OK
             START.wait().await;
         }
         first = false;
-        // r145: RESTART is NO LONGER wiped here. request_restart() is the
-        // only START signaler, so wiping it turned every OK press into a
-        // plain session (the r144 log: no HR, no rerun). The flag is
-        // consumed below once the restart has been performed; every OK
-        // press is a restart now.
-        // r142 source-window deferral (charger-only): see `charger_only`.
-        // Error 45 = "source announce window, wait and press again".
-        // r147: a PC arriving LATE (past the 3 s gate — the cause of a
-        // confusing 'no usb 3s' boot with a working console) still counts:
-        // its 5 V backs the board through HR dips, so from that moment
-        // the deferral is unnecessary.
-        if charger_only && unsafe { fnb58_usb_configured() } != 1 {
-            const SRC_WINDOW_MS: u64 = 20_000;
-            let elapsed = embassy_time::Instant::now().as_millis() - boot_ms;
-            if elapsed < SRC_WINDOW_MS {
-                VIEW.error.store(45, Ordering::Relaxed);
-                VIEW.phase.store(phase_code(Phase::Failed), Ordering::Relaxed);
-                crate::pd_log(b"[pd] src window, wait\r\n");
-                continue;
-            }
-        }
+        // r145: RESTART is consumed below once the restart has been
+        // performed; every OK press is a restart (fresh session on the
+        // fresh attach our own Hard Reset creates).
         STAGE.store(2, Ordering::Relaxed); // CC diagnostic
         crate::dbg_stage(11);
         SESSION_ACTIVE.store(true, Ordering::Relaxed);
@@ -363,6 +367,7 @@ pub async fn run() {
         VIEW.rx_packets.store(0, Ordering::Relaxed);
         VIEW.rx_error.store(0, Ordering::Relaxed);
         VIEW.listen.store(0, Ordering::Relaxed);
+        PSRDY_LOGGED.store(false, Ordering::Relaxed);
 
         // One-shot CC diagnostic on the power-on configuration: measures
         // both CCs with Rd on both and listens for the source's traffic;
@@ -466,15 +471,13 @@ pub async fn run() {
         // r138 a second run repeated it, delaying the session start by up
         // to ~640 ms of listen windows).
         let selection = pd_spr::Selection::<FnbLimits>::new();
-        // r149: ARM the first Request ourselves. The shared engine NEVER
+        // r149: ARM the first Request ourselves (the shared engine NEVER
         // auto-requests — kws-x1's product sends PdCommand::Confirm from
-        // its selector UI ("nothing is transmitted before Confirm",
-        // firmware-core buttons.rs), and our config had control: None, so
-        // the selection's pending stayed None forever: caps arrived and
-        // were auto-GoodCRC'd, no Request followed, and the source
-        // Hard-Reset us (the r147/r148 st=5/0/1 code 37/40 wall — the
-        // same shape as r115's mystery). Once caps are advertised, request
-        // the highest offered fixed target.
+        // its selector UI). r171: the armed target is DESIRED_MV — the
+        // PPS screen's selection (default 5 V, the boot contract) —
+        // instead of the r149 "highest offered fixed": if the charger
+        // does not offer it, nothing is armed (a loud FAIL, not a silent
+        // fallback to a different voltage).
         let control =
             |_observation: &mut Observation, _store: Option<&dyn pd_protocol::pd_svids::Store>| {
                 use pd_protocol::pd_spr::Supply;
@@ -482,30 +485,31 @@ pub async fn run() {
                     && !selection.has_pending()
                     && !selection.request_in_flight()
                 {
-                    let mut best = None;
+                    let desired = DESIRED_MV.load(Ordering::Relaxed);
+                    let mut match_ = None;
                     for index in 0..selection.option_count() {
                         if let Some(target) = selection.option(index)
                             && matches!(target.supply, Supply::Fixed)
-                            && best.is_none_or(|current: pd_protocol::pd_spr::Target| {
-                                target.mv > current.mv
-                            })
+                            && target.mv == desired
                         {
-                            best = Some(target);
+                            match_ = Some(target);
+                            break;
                         }
                     }
-                    if let Some(target) = best
+                    if let Some(target) = match_
                         && selection.preview(target)
                     {
                         selection.confirm();
                     }
                 }
             };
-        // r120: ONE-SHOT sessions. A persistent engine loops Hard Resets
-        // when the charger refuses to acknowledge the Request, and every
-        // Hard Reset dips VBUS - a brownout on charger-only power. One
-        // clean attempt per OK press; the result lands in the view.
+        // r171: persistent sessions again (kws-x1's shape). The r120
+        // one-shot decision existed because a session that acked caps
+        // without ever requesting them looped Hard Resets; with the
+        // Request working, a contract must be MAINTAINABLE: Ready-state
+        // messages answered, contract_seen set, BACK finishing cleanly.
         let config = pd_phy::Config {
-            persistent: false,
+            persistent: true,
             selection: Some(&selection),
             // r149: the arming callback above (was None — the engine
             // never transmitted without it).
@@ -580,8 +584,14 @@ pub async fn run() {
             if phy.hard_reset_sent() {
                 RESTART.store(false, Ordering::Relaxed); // performed
                 match phy.transition_to_default().await {
+                    // r171: NO reboot on OK. The sys_reset wiped DESIRED_MV
+                    // (the chosen voltage reverted to 5 V) and made every OK
+                    // press a full power cycle on charger-only boards;
+                    // transition_to_default already re-baselined the PHY,
+                    // so rerun a fresh session instead.
                     Ok(()) => {
-                        cortex_m::peripheral::SCB::sys_reset();
+                        rerun = true;
+                        crate::pd_log(b"[pd] restart: default, rerun\r\n");
                     }
                     // r144: with the micro-B PC attached its 5 V holds the
                     // shared VBUS rail up through the charger's HR dip, so

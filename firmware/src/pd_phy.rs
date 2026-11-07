@@ -114,12 +114,12 @@ impl pd_protocol::pd_spr::Limits for FnbLimits {
     // 3.3 V is the lowest SPR PPS voltage the library accepts.
     const MIN_PPS_MV: u32 = 3_300;
     const MAX_PPS_MV: u32 = 21_000;
-    // r167 (user directive "select 9 volts from charger"): the boot target
-    // is 9 V — the same TARGET_MV the proven kws-x1 BoardLimits boot with
-    // (kws-x1 pins TARGET_MV=9000; our 5000 default was the odd one out).
-    // review_rdo's no-selection fallback checks the RDO against exactly
-    // this value, so the pdmin probe's hand-off passes the same review.
-    const TARGET_MV: u32 = 9_000;
+    // r171 (user directive): the boot contract is 5 V. The r170 I2C fix
+    // makes the Request land inside the charger's window, so the boot
+    // session completes a contract instead of spiraling into Hard Resets
+    // (the old reason for the 20 s source-window deferral is gone). The
+    // PPS screen's voltage selection arms the higher targets per request.
+    const TARGET_MV: u32 = 5_000;
     // Smallest Fixed PDO Maximum Current this sink accepts (100 mA class).
     const REQUEST_MA: u32 = 100;
     // Fixed Requests ask for the object's Maximum Current up to this value.

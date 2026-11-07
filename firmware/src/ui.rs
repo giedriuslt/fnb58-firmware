@@ -28,6 +28,9 @@ pub enum Press {
     None,
     Switch(Screen),
     Discover,
+    /// r171: cycle the request target one step (1 = RIGHT = next, -1 =
+    /// LEFT = previous) on the PPS screen.
+    Voltage(i16),
 }
 
 pub struct Ui {
@@ -37,6 +40,8 @@ pub struct Ui {
     pd_mv: u16,
     pd_ma: u16,
     pd_err: u16,
+    /// r171: the armed target voltage (PPS screen's TGT line).
+    pd_tgt: u16,
 }
 
 /// Draw a NUL-terminated copy of `s` (truncated to fit the buffer).
@@ -55,15 +60,29 @@ impl Ui {
             pd_mv: 0xFFFF,
             pd_ma: 0xFFFF,
             pd_err: 0xFFFF,
+            pd_tgt: 0xFFFF,
         }
     }
 
     /// Map a button press. LEFT = previous screen, RIGHT = next, BACK =
-    /// power screen; OK means scan on the PD screen.
+    /// power screen; on the PPS screen LEFT/RIGHT instead cycle the
+    /// request voltage (r171) and OK means re-request.
     pub fn on_press(&mut self, i: usize) -> Press {
         match i {
-            buttons::LEFT => Press::Switch(Screen::Power),
-            buttons::RIGHT => Press::Switch(Screen::Pd),
+            buttons::LEFT => {
+                if self.screen == Screen::Pd {
+                    Press::Voltage(-1)
+                } else {
+                    Press::Switch(Screen::Power)
+                }
+            }
+            buttons::RIGHT => {
+                if self.screen == Screen::Pd {
+                    Press::Voltage(1)
+                } else {
+                    Press::Switch(Screen::Pd)
+                }
+            }
             buttons::BACK => Press::Switch(Screen::Power),
             buttons::OK if self.screen == Screen::Pd => Press::Discover,
             _ => Press::None,
@@ -82,9 +101,9 @@ impl Ui {
                 text(lcd, 272, 8, b"1/2", 2, GRAY).await;
             }
             Screen::Pd => {
-                text(lcd, 8, 8, b"PD", 2, WHITE).await;
+                text(lcd, 8, 8, b"PPS", 2, WHITE).await;
                 text(lcd, 272, 8, b"2/2", 2, GRAY).await;
-                text(lcd, 8, 216, b"OK: SCAN", 2, GRAY).await;
+                text(lcd, 8, 216, b"<>TGT OK:REQ", 2, GRAY).await;
             }
         }
     }
@@ -156,14 +175,35 @@ impl Ui {
         let mv = view.selected_mv.load(core::sync::atomic::Ordering::Relaxed);
         let ma = view.selected_ma.load(core::sync::atomic::Ordering::Relaxed);
         let err = view.error.load(core::sync::atomic::Ordering::Relaxed);
-        if phase == self.pd_phase && mv == self.pd_mv && ma == self.pd_ma && err == self.pd_err {
+        let tgt = crate::pd_task::DESIRED_MV.load(core::sync::atomic::Ordering::Relaxed);
+        if phase == self.pd_phase
+            && mv == self.pd_mv
+            && ma == self.pd_ma
+            && err == self.pd_err
+            && tgt == self.pd_tgt
+        {
             return;
         }
         self.pd_phase = phase;
         self.pd_mv = mv;
         self.pd_ma = ma;
         self.pd_err = err;
+        self.pd_tgt = tgt;
         lcd.fill_window(0, 32, 319, 210, BLACK).await;
+
+        // r171: the armed request target, cycled with LEFT/RIGHT:
+        // "TGT 9V" (the next OK requests exactly this).
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        for &b in b"TGT " {
+            line[n] = b;
+            n += 1;
+        }
+        n = crate::push_dec(&mut line, n, u32::from(tgt / 1000));
+        line[n] = b'V';
+        n += 1;
+        line[n] = 0;
+        text(lcd, 8, 72, &line, 2, YELLOW).await;
 
         const NAMES: [&[u8]; 13] = [
             b"WAIT", b"PASSIVE", b"FAIL", b"SKIP", b"MEAS", b"GUARD", b"VERIFY", b"RX",
