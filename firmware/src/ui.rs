@@ -29,12 +29,17 @@ pub enum Press {
     Switch(Screen),
     Discover,
     /// r171: cycle the request target one step (1 = RIGHT = next, -1 =
-    /// LEFT = previous) on the PPS screen.
+    /// LEFT = previous) while the PPS screen is in voltage selection.
     Voltage(i16),
+    /// r172: the selection mode toggled — redraw the hint line.
+    Hint,
 }
 
 pub struct Ui {
     pub screen: Screen,
+    /// r172: the PPS screen's voltage-selection mode (OK enters, OK
+    /// commits, BACK exits; LEFT/RIGHT cycle the target inside it).
+    pub selecting: bool,
     /// PD-view identity at the last redraw (values that change rarely).
     pd_phase: u8,
     pd_mv: u16,
@@ -56,6 +61,7 @@ impl Ui {
     pub fn new() -> Self {
         Self {
             screen: Screen::Power,
+            selecting: false,
             pd_phase: 0xFF,
             pd_mv: 0xFFFF,
             pd_ma: 0xFFFF,
@@ -64,34 +70,52 @@ impl Ui {
         }
     }
 
-    /// Map a button press. LEFT = previous screen, RIGHT = next, BACK =
-    /// power screen; on the PPS screen LEFT/RIGHT instead cycle the
-    /// request voltage (r171) and OK means re-request.
+    /// r172 navigation (user spec): LEFT/RIGHT move between screens; OK on
+    /// the PPS screen ENTERS voltage selection; inside it LEFT/RIGHT choose
+    /// the voltage, OK selects it (re-request), BACK returns to screen
+    /// navigation. Only glyphs from lcd.rs FONT_CHARS (no '<'/'>'!).
     pub fn on_press(&mut self, i: usize) -> Press {
         match i {
             buttons::LEFT => {
-                if self.screen == Screen::Pd {
+                if self.screen == Screen::Pd && self.selecting {
                     Press::Voltage(-1)
                 } else {
                     Press::Switch(Screen::Power)
                 }
             }
             buttons::RIGHT => {
-                if self.screen == Screen::Pd {
+                if self.screen == Screen::Pd && self.selecting {
                     Press::Voltage(1)
                 } else {
                     Press::Switch(Screen::Pd)
                 }
             }
-            buttons::BACK => Press::Switch(Screen::Power),
-            buttons::OK if self.screen == Screen::Pd => Press::Discover,
+            buttons::BACK => {
+                if self.screen == Screen::Pd && self.selecting {
+                    self.selecting = false;
+                    Press::Hint
+                } else {
+                    Press::Switch(Screen::Power)
+                }
+            }
+            buttons::OK if self.screen == Screen::Pd => {
+                if self.selecting {
+                    self.selecting = false;
+                    Press::Discover
+                } else {
+                    self.selecting = true;
+                    Press::Hint
+                }
+            }
             _ => Press::None,
         }
     }
 
-    /// Switch screens: full clear, title and static chrome.
+    /// Switch screens: full clear, title and static chrome. Any switch
+    /// also leaves voltage-selection mode.
     pub async fn enter(&mut self, lcd: &mut Lcd, screen: Screen) {
         self.screen = screen;
+        self.selecting = false;
         // Force the next screen-specific redraw.
         self.pd_phase = 0xFF;
         lcd.fill(BLACK).await;
@@ -103,9 +127,20 @@ impl Ui {
             Screen::Pd => {
                 text(lcd, 8, 8, b"PPS", 2, WHITE).await;
                 text(lcd, 272, 8, b"2/2", 2, GRAY).await;
-                text(lcd, 8, 216, b"<>TGT OK:REQ", 2, GRAY).await;
+                self.draw_hint(lcd).await;
             }
         }
+    }
+
+    /// r172: the PPS screen's mode-dependent hint line. A single small
+    /// text draw — safe to run while a PD session is busy.
+    pub async fn draw_hint(&self, lcd: &mut Lcd) {
+        let hint: &[u8] = if self.selecting {
+            b"LR SEL OK:REQ BK:EX"
+        } else {
+            b"OK:TGT"
+        };
+        lcd.draw_text(8, 216, hint, 2, GRAY, BLACK).await;
     }
 
     /// Show the reset-cause flags in the title bar so a reboot loop is

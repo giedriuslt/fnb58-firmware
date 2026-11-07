@@ -41,7 +41,7 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r171";
+const BUILD: &[u8] = b"r172";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -168,7 +168,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r171 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r172 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -241,7 +241,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r171 " {
+                for &b in b"r172 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -342,7 +342,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r171: 5v boot + pps select\r\n");
+    say(b"[lcd] FNB58 r172: nav+select fix\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -659,10 +659,12 @@ async fn main(spawner: Spawner) {
         }
 
         // r113: the PD screen renders the engine view; the session runs
-        // in its own task on the shared bus. r160: NOT during a session —
-        // the blocking SPI draw starves the executor (the engine's
-        // transmit chain) past the charger's caps->HR window.
-        if ui.screen == Screen::Pd && !pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) {
+        // in its own task on the shared bus. r172: gated on BUSY, not
+        // SESSION_ACTIVE — a persistent contract keeps SESSION_ACTIVE true
+        // forever, which starved this screen of every redraw (the r171
+        // 'PPS screen was empty'). BUSY clears at PS_RDY: the transmit
+        // chain is idle from there on, so the ~230 ms draw is safe.
+        if ui.screen == Screen::Pd && !pd_task::BUSY.load(Ordering::Relaxed) {
             ui.draw_pd(&mut lcd, &pd_task::VIEW).await;
         }
 
@@ -707,6 +709,10 @@ async fn main(spawner: Spawner) {
                     sender.push(b"[pd] restart requested\r\n");
                     pd_task::request_restart();
                 }
+                Press::Hint => {
+                    // r172: the PPS screen's selection mode toggled.
+                    ui.draw_hint(&mut lcd).await;
+                }
                 Press::Voltage(dir) => {
                     // r171: the PPS screen's voltage selection.
                     let mv = pd_task::cycle_desired(dir);
@@ -729,9 +735,9 @@ async fn main(spawner: Spawner) {
         pd_task::BTN.store(held, Ordering::Relaxed);
 
         // Orientation poll: 200 ms cadence; a flip must hold ~1 s before
-        // the screen rotates (kws-x1's settle approach). r160: not during
-        // a PD session (I2C bus contention with the engine's chain).
-        if accel_ok && !pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) && tick % 20 == 0 {
+        // the screen rotates (kws-x1's settle approach). r172: gated on
+        // BUSY (see the draw_pd note) — not on SESSION_ACTIVE.
+        if accel_ok && !pd_task::BUSY.load(Ordering::Relaxed) && tick % 20 == 0 {
             MAIN_STAGE.store(3, Ordering::Relaxed); // accel BUS lock
             let mut guard = pd_task::BUS.lock().await;
             if let Some(bus) = guard.0.as_mut() {
@@ -773,8 +779,9 @@ async fn main(spawner: Spawner) {
         }
 
         // Meter: 200 ms cadence (screen values; TPA conversion window).
-        // r160: not during a PD session (bus contention + the draw).
-        if !pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) && tick % 20 == 0 {
+        // r172: gated on BUSY — a persistent contract must keep the
+        // power screen live.
+        if !pd_task::BUSY.load(Ordering::Relaxed) && tick % 20 == 0 {
             MAIN_STAGE.store(4, Ordering::Relaxed); // meter BUS lock
             let mut guard = pd_task::BUS.lock().await;
             let Some(bus) = guard.0.as_mut() else {

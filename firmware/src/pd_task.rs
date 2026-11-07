@@ -78,6 +78,13 @@ pub fn cycle_desired(dir: i16) -> u16 {
 /// caps->Hard-Reset window (r159: f=6, the HR caught at the pre-TX
 /// poll, Request built but never written - q=1 v=5000).
 pub static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// r172: true only while the session is actively NEGOTIATING (diagnostic
+/// + caps wait + request chain). False once the contract lands (PS_RDY)
+/// or the session ends. The main loop gates the ~230 ms SPI draws and the
+/// meter/accel I2C on THIS, not on SESSION_ACTIVE: a persistent contract
+/// keeps SESSION_ACTIVE true forever, which starved the PPS screen of
+/// every redraw (the r171 'PPS screen was empty') and froze the meter.
+pub static BUSY: AtomicBool = AtomicBool::new(false);
 const BACK_BIT: u8 = 0x01;
 
 /// What the UI renders on the PD screen. Atomics: the task writes, the main
@@ -170,6 +177,11 @@ fn publish(observation: Observation) {
         VIEW.vbus_mv
             .store(spr.vbus_live_mv.unwrap_or(0), Ordering::Relaxed);
         if spr.psrdy_seen && !PSRDY_LOGGED.swap(true, Ordering::Relaxed) {
+            // r172: the contract is up — the transmit chain is idle, so
+            // the main loop may draw and read the meter again.
+            BUSY.store(false, Ordering::Relaxed);
+            VIEW.phase
+                .store(phase_code(Phase::Contracted), Ordering::Relaxed);
             let mut d = [0u8; 40];
             let mut n = 0;
             for &b in b"[pd] psrdy v=" {
@@ -358,6 +370,7 @@ pub async fn run() {
         STAGE.store(2, Ordering::Relaxed); // CC diagnostic
         crate::dbg_stage(11);
         SESSION_ACTIVE.store(true, Ordering::Relaxed);
+        BUSY.store(true, Ordering::Relaxed);
         // r145: fresh view per attempt — a stale err=45/40/st= from the
         // previous attempt mislabeled the next one on the LCD.
         VIEW.error.store(0, Ordering::Relaxed);
@@ -571,16 +584,24 @@ pub async fn run() {
         pd_protocol::pd_spr::DEBUG_STAGE.store(0, Ordering::Relaxed);
         if restart_requested() && error.is_none() {
             // r147: a restart press never runs the engine — kws-x1's
-            // restart_unheard shape (Session::start, then the Hard Reset
-            // at once, against a source never heard). The r143-r146
-            // post-engine phy.restart() was refused silently three rounds
-            // in a row (the engine's failure leaves the session unusable
-            // for it; the old no-chain guard swallowed the error without
-            // a log line), so the HR never went out.
+            // restart shape (Session::start, then the Hard Reset at once).
+            // r172: a LIVE contract (or any heard source) needs the full
+            // phy.restart() — restart_unheard REFUSES once anything was
+            // received (rx_packets != 0), which made every OK press during
+            // the boot contract a silent no-op ("HR NOT sent").
             crate::pd_log(b"[pd] restart: HR now\r\n");
             STAGE.store(4, Ordering::Relaxed); // busy in session
             crate::dbg_stage(15);
-            error = phy.restart_unheard().await.err();
+            error = if phy.observation.rx_packets != 0
+                || phy
+                    .observation
+                    .spr
+                    .is_some_and(|s| s.peer_revision.is_some())
+            {
+                phy.restart().await.err()
+            } else {
+                phy.restart_unheard().await.err()
+            };
             if phy.hard_reset_sent() {
                 RESTART.store(false, Ordering::Relaxed); // performed
                 match phy.transition_to_default().await {
@@ -735,8 +756,13 @@ pub async fn run() {
             // phy's refusal char: G SinkTxOK gate, C source message won,
             // Q quiet override, V cable-safe-5V, '-' none), r = request
             // MessageID, and on a TX timeout its STATUS1 + INTERRUPTA.
-            // r155: h/n/s/d appended - the worst-case line is ~64 chars.
-            let mut d = [0u8; 96];
+            // r155: h/n/s/d appended. r172: 96 -> 160 bytes — push_dec is
+            // uncapped by design, and the FIRST successful contract's line
+            // (e=132 p=133 v=5000 st=3 ...) crossed 96 and PANICKED
+            // mid-write (pd_task.rs:913, the r171 hw log) — the same
+            // growth-kills-the-line class as the r157/r161 silent drops,
+            // now as a crash.
+            let mut d = [0u8; 160];
             let mut n = 0;
             for &b in b"[pd] engine code=" {
                 d[n] = b;
@@ -999,5 +1025,6 @@ pub async fn run() {
         } else {
             SESSION_ACTIVE.store(false, Ordering::Relaxed);
         }
+        BUSY.store(false, Ordering::Relaxed);
     }
 }
