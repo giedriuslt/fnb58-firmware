@@ -189,8 +189,68 @@ main loop samples the meter and builds the reports.
 ## Build and flash
 
 ```sh
-./make-bin.sh    # cargo build --release + rust-objcopy -> fnb58-firmware.bin
+./make-bin.sh    # cargo build --release + rust-objcopy
+                 # -> fnb58-bl-rNNN.bin (bootloader, <= 64 KiB guard)
+                 # -> fnb58-app-rNNN.bin (firmware, linked at 0x08010000)
+                 # -> fnb58-full-rNNN.bin (bl padded to 64 KiB + app) + md5s
 ```
+
+### r180: flash layout under the custom bootloader
+
+| Region | Range | Contents |
+|---|---|---|
+| Bootloader | 0x08000000..0x08010000 | `bootloader/` — CDC update port (tag `bl1`) |
+| App | 0x08010000..0x080FF800 | this firmware (main + pdmin bins share `firmware/memory.x`) |
+| Trailer | 0x080FF800..0x08100000 | image-valid metadata: magic `FNB5`, size, CRC-32, ~CRC |
+
+The trailer is the boot gate: the bootloader jumps only when the
+trailer's CRC matches the app bytes actually in flash. Because of that,
+`fnb58-full-rNNN.bin` is a **1 MiB install image that embeds the
+trailer** (`tools/mkfull.py` computes it from the app binary) — a bare
+bl+app concatenation would leave the trailer erased and the device
+would wait in update mode forever, even right after a DFU install. Any
+CDC upload without a fresh `COMMIT` makes the trailer disagree with
+flash again → back to update mode.
+
+The bootloader (tag `bl4`, 21.7 KB) starts when OK (PB4) is held at
+reset — or automatically when the trailer says the app is
+empty/invalid. It runs the vendor C CDC stack (2E3C:5740, same VID/PID
+as the app console), shows an LCD banner + one beep, and serves a text
+protocol (`INFO` / `BEGIN <size>` / a back-to-back stream of
+2056-byte CRC-checked blocks, one per 2 KiB sector / `COMMIT <size>
+<crc8>` / `RESET`) — every failure is a loud `[bl] ERR`/`[bl] NAK`
+line. bl4 stays in the Block phase until the announced block count is
+consumed (countdown on ACK, NAK'd blocks retried in place) or 3 s of
+silence, its writable-window guard covers the whole trailer sector, and
+its LCD constructor claims the PB3 backlight gate high (bl1 left the
+phase after every block; bl2 half-wrote the trailer via the narrow
+guard; bl3 left the backlight floating — screen dark — all found in
+the first hardware rounds). The trailer is
+written only when the device's own CRC of the written region matches
+the host's, so an interrupted or bad upload always leaves update mode
+reachable. The bootloader's own 64 KiB is hard-refused by its flash
+driver's address guard.
+
+Update flow after the one-time install:
+
+```sh
+# one-time install of both images via the BOOT0 DFU (trailer embedded —
+# the device boots the app on the FIRST power-up):
+python ../fnb58-research/at32dfu.py fnb58-full-r183.bin   # at 0x08000000
+# later app-only updates (hold OK while pressing reset):
+python tools/fnb58-flash.py COM7 fnb58-app-rNNN.bin       # pip install pyserial
+# adopt an app installed by other means (no upload; device CRCs its own
+# flash against the local image before writing the trailer):
+python tools/fnb58-flash.py COM7 --adopt fnb58-app-rNNN.bin
+```
+
+`tools/fnb58-flash.py` refuses to write anything until the device
+answers `INFO` with a `[bl]` line — talking to the app console by
+mistake fails loudly, never silently. PC-link (OpenFNB58 HID) moved
+from OK-held to **BACK-held (PB9) at boot** in r180, because the
+bootloader owns OK-at-boot. The app bins set `VTOR = 0x08010000` as
+their first act (cortex-m-rt's `set-vtor` is off; kws-x1 does the same
+write).
 
 Flashing: **BOOT0 (pin 44) strapped high at power-on → the AT32 mask-ROM
 boot ROM enumerates as a USB DFU device (2E3C:DF11) → flash

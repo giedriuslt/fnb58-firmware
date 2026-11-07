@@ -69,6 +69,17 @@ impl fusb302_pd::phy::Clock for MinClock {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // r180: this image is linked at 0x08010000 under the bootloader
+    // (first 64 KiB of the bank). Point VTOR at the vector table before
+    // anything can raise an exception — cortex-m-rt does not do it for
+    // us (set-vtor feature off); the kws-x1 app performs the same write
+    // first thing in main.
+    unsafe {
+        let scb = &*cortex_m::peripheral::SCB::PTR;
+        scb.vtor.write(board::APP_BASE);
+        core::arch::asm!("dsb", "isb", options(nostack, preserves_flags));
+    }
+
     // Crystal clock: 192 MHz PLL, USB /4 (same profile as the main build).
     let Ok((clocks, _)) = (unsafe { embassy_at32::clocks::configure_usb(board::HEXT_HZ) }) else {
         loop {
@@ -180,7 +191,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         console::boot_log().push(msg);
     }
-    say(b"[pdmin] FNB58 r170: usb log + fusb302 only\r\n");
+    say(b"[pdmin] FNB58 r180: usb log + fusb302 only\r\n");
     dbg_stage(1);
 
     let mut sender = console::Sender::new();

@@ -41,7 +41,7 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r179";
+const BUILD: &[u8] = b"r180";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -57,6 +57,17 @@ use embassy_at32::pac::at32f403a::interrupt;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // r180: this image is linked at 0x08010000 under the bootloader
+    // (first 64 KiB of the bank). Point VTOR at the vector table before
+    // anything can raise an exception — cortex-m-rt does not do it for
+    // us (set-vtor feature off); the kws-x1 app performs the same write
+    // first thing in main.
+    unsafe {
+        let scb = &*cortex_m::peripheral::SCB::PTR;
+        scb.vtor.write(board::APP_BASE);
+        core::arch::asm!("dsb", "isb", options(nostack, preserves_flags));
+    }
+
     // Crystal clock: 192 MHz PLL, USB /4.
     let Ok((clocks, _)) =
         (unsafe { embassy_at32::clocks::configure_usb(board::HEXT_HZ) })
@@ -74,17 +85,19 @@ async fn main(spawner: Spawner) {
     adc::init();
 
     // --- r134: PC-link mode (OpenFNB58 protocol) ---
-    // Hold OK while plugging in: the device enumerates as the stock
-    // FNB58 USB HID measurement interface (2E3C:5558, endpoints
+    // r180: hold BACK while plugging in. The bootloader (first 64 KiB of
+    // flash) now owns OK-held-at-boot as its update-mode trigger, so the
+    // app's mode-select button moves to BACK. The device enumerates as
+    // the stock FNB58 USB HID measurement interface (2E3C:5558, endpoints
     // 0x83/0x03, 64-byte reports) instead of the CDC console. The
-    // console stays the default — no button, no change. OK = PB4,
+    // console stays the default — no button, no change. BACK = PB9,
     // to-GND switch with an internal pull-up.
     let pc_link = {
         use embassy_at32::gpio::{InputPin, Port};
-        let ok = unsafe { InputPin::new_pull_up(Port::B, 4).expect("PB4 claim") };
+        let back = unsafe { InputPin::new_pull_up(Port::B, 9).expect("PB9 claim") };
         let mut held = true;
         for _ in 0..8 {
-            if !ok.is_low() {
+            if !back.is_low() {
                 held = false;
                 break;
             }
@@ -168,7 +181,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r175 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r180 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -241,7 +254,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r179 " {
+                for &b in b"r180 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -342,7 +355,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r179: contract reporting\r\n");
+    say(b"[lcd] FNB58 r180: contract reporting\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)

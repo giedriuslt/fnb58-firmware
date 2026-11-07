@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["firmware", "fusb302-pd"]
+members = ["firmware", "fusb302-pd", "bootloader"]
 exclude = ["pd-protocol-debug"]
 
 [workspace.dependencies]

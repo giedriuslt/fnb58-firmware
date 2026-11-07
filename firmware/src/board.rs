@@ -32,6 +32,12 @@ use embassy_at32::gpio::{Drive, Port};
 #[allow(dead_code)]
 pub const HEXT_HZ: u32 = 8_000_000;
 
+/// Application base under the bootloader (bootloader/, r180): this image
+/// is linked at 0x08010000 and main() must point VTOR here before any
+/// interrupt can fire. The bootloader's own 64 KiB (0x08000000..) and
+/// the trailer sector (0x080FF800..) are never part of this image.
+pub const APP_BASE: u32 = 0x0801_0000;
+
 /// Panel geometry: the ST7789's native 240x320 memory, rotated to
 /// landscape. `0x60` is MX | MV (as the KWS-X1 panel used); a full-size
 /// panel needs no window offsets in this rotation.

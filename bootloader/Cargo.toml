@@ -1,0 +1,28 @@
+[package]
+name = "fnb58-bootloader"
+version = "0.1.0"
+edition = "2024"
+description = "CDC firmware-update bootloader for the FNIRSI FNB58 (first 64 KiB of flash)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Pure logic (layout, CRC, trailer) is a lib so it host-tests on the CI
+# box; the device side is the bin.
+[lib]
+name = "fnb58_bootloader"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fnb58-bootloader"
+path = "src/main.rs"
+test = false
+bench = false
+
+# Device-only deps, gated to ARM targets: the lib's pure logic (crc32,
+# meta) host-tests on x86_64 without pulling the embassy stack in.
+[target.'cfg(target_arch = "arm")'.dependencies]
+cortex-m = { workspace = true, features = ["critical-section-single-core"] }
+cortex-m-rt.workspace = true
+embassy-at32.workspace = true
+embassy-executor.workspace = true
+embassy-time.workspace = true

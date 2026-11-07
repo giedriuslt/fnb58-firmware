@@ -7,7 +7,11 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [lib]
-test = false
+# r180: test = false has been here since the crate was vendored (r113) and
+# silently zeroed the suite — `cargo test -p fusb302-pd` reported "0 tests"
+# while the protocol treats 4/4 as a build gate. The #[cfg(test)] code
+# touches no firmware behavior; the gate has to be runnable.
+test = true
 bench = false
 
 [dependencies]
