@@ -43,7 +43,7 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r195";
+const BUILD: &[u8] = b"r197";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -183,7 +183,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r195 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r197 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -256,7 +256,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r195 " {
+                for &b in b"r197 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -360,7 +360,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r195: contract reporting\r\n");
+    say(b"[lcd] FNB58 r197: contract reporting\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -716,6 +716,11 @@ async fn main(spawner: Spawner) {
         if ui.screen == Screen::Qc && !pd_task::BUSY.load(Ordering::Relaxed) {
             ui.draw_qc(&mut lcd).await;
         }
+        // r196: the QC3 screen — same gate (the task's blocking work is
+        // µs-scale ADC reads plus 1 ms pulses).
+        if ui.screen == Screen::Qc3 && !pd_task::BUSY.load(Ordering::Relaxed) {
+            ui.draw_qc3(&mut lcd).await;
+        }
 
         // Buttons: debounced active-low (50 ms at this cadence); events
         // to the console queue, presses drive the UI screens.
@@ -755,11 +760,14 @@ async fn main(spawner: Spawner) {
             match ui.on_press(i) {
                 Press::Switch(screen) => ui.enter(&mut lcd, screen).await,
                 Press::Commit => {
-                    // r189: the QC screen's OK requests the selected
-                    // target through the QC task (entry guard inside).
+                    // r189/r196: the QC screens' OK requests their target
+                    // through the QC task (entry guard inside the task).
                     if ui.screen == Screen::Qc {
-                        qc_task::commit_desired();
+                        qc_task::commit_fixed();
                         sender.push(b"[qc] commit\r\n");
+                    } else if ui.screen == Screen::Qc3 {
+                        qc_task::commit_continuous();
+                        sender.push(b"[qc3] commit\r\n");
                     } else if pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) {
                         pd_task::commit_desired();
                         sender.push(b"[pd] commit\r\n");
@@ -773,12 +781,15 @@ async fn main(spawner: Spawner) {
                     ui.draw_hint(&mut lcd).await;
                 }
                 Press::Voltage(dir) => {
-                    // r171: the PPS screen's voltage selection. r189: the
-                    // QC screen cycles its own targets.
-                    let (prefix, mv): (&[u8], u16) = if ui.screen == Screen::Qc {
-                        (b"[qc] tgt=", qc_task::cycle_target(dir))
-                    } else {
-                        (b"[pd] tgt=", pd_task::cycle_desired(dir))
+                    // r171: the PPS screen's voltage selection. r189/r196:
+                    // the QC screens cycle their own targets.
+                    let (prefix, mv): (&[u8], u32) = match ui.screen {
+                        Screen::Qc => (b"[qc] tgt=", u32::from(qc_task::cycle_target(dir))),
+                        Screen::Qc3 => (
+                            b"[qc3] tgt=",
+                            u32::from(qc_task::cycle_m3_target(dir)),
+                        ),
+                        _ => (b"[pd] tgt=", u32::from(pd_task::cycle_desired(dir))),
                     };
                     let mut d = [0u8; 32];
                     let mut n = 0;
@@ -786,7 +797,7 @@ async fn main(spawner: Spawner) {
                         d[n] = b;
                         n += 1;
                     }
-                    n = push_dec(&mut d, n, u32::from(mv));
+                    n = push_dec(&mut d, n, mv);
                     for &b in b"mV\r\n" {
                         d[n] = b;
                         n += 1;

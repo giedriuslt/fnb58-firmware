@@ -196,15 +196,17 @@ mailbox — the vendor `custom_hid` class as a template), `fnb58_usb.c`
 picks the class at boot (`fnb58_usb_init_hid`), and the Rust
 main loop samples the meter and builds the reports.
 
-## QC2.0 trigger (r189–r195) — hardware-verified
+## QC2.0/QC3.0 trigger (r189–r197) — hardware-verified
 
 The QC screen (3rd in the LEFT/RIGHT cycle) triggers QC2 voltages
-5/9/12/20 V through the traced data-line front end: **PA5 (DAC2_OUT)
-drives D+ via 100 Ω, PA4 (DAC1_OUT) drives D− via 100 Ω; PA3/PA2
-(ADC12_IN3/IN2) read D+/D− via 1 kΩ each**. The protocol state machine
-is the vendored `qc-protocol` crate (pure logic, host-tested); the
-board layer is `dac.rs` (drive/release) + `adc.rs` (`read_line_mv`)
-+ `qc_task.rs` (the task).
+5/9/12/20 V; the QC3 screen (4th) triggers continuous-mode targets in
+native 200 mV steps (3.6–20 V) — the charger steps one pulse at a time
+toward the target (`SET` on screen tracks it). Both work through the
+traced data-line front end: **PA5 (DAC2_OUT) drives D+ via 100 Ω, PA4
+(DAC1_OUT) drives D− via 100 Ω; PA3/PA2 (ADC12_IN3/IN2) read D+/D− via
+1 kΩ each**. The protocol state machines are the vendored `qc-protocol`
+crate (pure logic, host-tested); the board layer is `dac.rs`
+(drive/release) + `adc.rs` (`read_line_mv`) + `qc_task.rs` (the task).
 
 - **Levels are DAC codes** (0.6 V ≈ 745, 3.3 V = 4095, VDDA-ratiometric
   via VREFINT) — no resistor ladder needed.
@@ -219,10 +221,15 @@ board layer is `dac.rs` (drive/release) + `adc.rs` (`read_line_mv`)
   low to accept requests). Every transition logs `[qc] …` with `t=`
   stamps; failures name the reason (`NODCP` = the short was never
   seen, `NOENTRY` = seen but never dropped).
+- **QC3 continuous mode** (r196): after entry, the `(Mid, High)` hold
+  requests continuous; each pulse (Up = both High, Down = both Mid,
+  1 ms) moves the output 200 mV. Leaving continuous = the 5 V pair
+  HELD (a sustained pair outlasts the pulse filter, so the charger
+  reads it as a fixed request and exits) before the next request.
 - **Verification is closed-loop**: the request levels are read back on
   the taps (screen + diag `dp=`/`dm=`) and the output is followed on
   the published TPA626 bus voltage (`vb=`) — `FOLLOWED`/`IGNORED`
-  verdicts per request.
+  verdicts per fixed request.
 
 The `run-bootloader` console command (r184–r188, BPR battery-domain
 cookie + the BPR *peripheral clock* fix) reboots into the update

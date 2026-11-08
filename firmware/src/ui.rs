@@ -22,10 +22,12 @@ pub enum Screen {
     Pd,
     /// r189: the QC2.0 trigger screen (targets 5/9/12/20 V, OK = REQ).
     Qc,
+    /// r196: the QC3.0 continuous screen (target in mV, 200 mV steps).
+    Qc3,
 }
 
-/// The r189 screen cycle order (LEFT/RIGHT walk it in both directions).
-const SCREEN_CYCLE: [Screen; 3] = [Screen::Power, Screen::Pd, Screen::Qc];
+/// The screen cycle order (LEFT/RIGHT walk it in both directions).
+const SCREEN_CYCLE: [Screen; 4] = [Screen::Power, Screen::Pd, Screen::Qc, Screen::Qc3];
 
 fn next_screen(screen: Screen, dir: i16) -> Screen {
     let i = SCREEN_CYCLE.iter().position(|&s| s == screen).unwrap_or(0);
@@ -68,6 +70,12 @@ pub struct Ui {
     qc_tgt: u16,
     /// r195: the dynamic rows' last in-place update (ms, wrapping u32).
     qc_dyn_at: u32,
+    /// r196: the QC3 screen's dynamic rows' last update (separate cadence
+    /// from the QC2 screen's — each screen redraws independently).
+    qc3_dyn_at: u32,
+    /// r196: the QC3 screen's static-layer cache (state + target).
+    qc3_state: u8,
+    qc3_tgt: u16,
 }
 
 /// Draw a NUL-terminated copy of `s` (truncated to fit the buffer).
@@ -93,6 +101,9 @@ impl Ui {
             qc_failure: 0xFF,
             qc_tgt: 0xFFFF,
             qc_dyn_at: 0,
+            qc3_dyn_at: 0,
+            qc3_state: 0xFF,
+            qc3_tgt: 0xFFFF,
         }
     }
 
@@ -124,7 +135,15 @@ impl Ui {
                     Press::Switch(next_screen(self.screen, -1))
                 }
             }
-            buttons::OK if self.screen == Screen::Pd || self.screen == Screen::Qc => {
+            // r196 fix: the OK arm missed Screen::Qc3 — on that screen OK
+            // fell through to Press::None (a dead button; four presses,
+            // zero commits in the first hardware log).
+            buttons::OK
+                if matches!(
+                    self.screen,
+                    Screen::Pd | Screen::Qc | Screen::Qc3
+                ) =>
+            {
                 if self.selecting {
                     self.selecting = false;
                     Press::Commit
@@ -145,20 +164,26 @@ impl Ui {
         // Force the next screen-specific redraw.
         self.pd_phase = 0xFF;
         self.qc_state = 0xFF;
+        self.qc3_state = 0xFF;
         lcd.fill(BLACK).await;
         match screen {
             Screen::Power => {
                 text(lcd, 8, 8, b"POWER", 2, WHITE).await;
-                text(lcd, 272, 8, b"1/3", 2, GRAY).await;
+                text(lcd, 272, 8, b"1/4", 2, GRAY).await;
             }
             Screen::Pd => {
                 text(lcd, 8, 8, b"PPS", 2, WHITE).await;
-                text(lcd, 272, 8, b"2/3", 2, GRAY).await;
+                text(lcd, 272, 8, b"2/4", 2, GRAY).await;
                 self.draw_hint(lcd).await;
             }
             Screen::Qc => {
                 text(lcd, 8, 8, b"QC", 2, WHITE).await;
-                text(lcd, 272, 8, b"3/3", 2, GRAY).await;
+                text(lcd, 272, 8, b"3/4", 2, GRAY).await;
+                self.draw_hint(lcd).await;
+            }
+            Screen::Qc3 => {
+                text(lcd, 8, 8, b"QC3", 2, WHITE).await;
+                text(lcd, 272, 8, b"4/4", 2, GRAY).await;
                 self.draw_hint(lcd).await;
             }
         }
@@ -221,8 +246,15 @@ impl Ui {
             line[n] = 0;
             text(lcd, 8, 48, &line, 2, YELLOW).await;
 
-            // State row.
-            const STATES: [&[u8]; 5] = [b"OFF", b"RELEASE", b"ENTRY", b"ACTIVE", b"FAIL"];
+        // State row.
+        const STATES: [&[u8]; 6] = [
+            b"OFF",
+            b"RELEASE",
+            b"ENTRY",
+            b"ACTIVE",
+            b"FAIL",
+            b"STEP",
+        ];
             let name = STATES.get(state as usize).copied().unwrap_or(b"?");
             let mut line = [0u8; 24];
             let mut n = 0;
@@ -277,6 +309,135 @@ impl Ui {
         }
         n = crate::push_dec(&mut line, n, u32::from(dm));
         while n < 15 {
+            line[n] = b' ';
+            n += 1;
+        }
+        line[n] = 0;
+        lcd.draw_text(8, 168, &line, 2, GREEN, BLACK).await;
+
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        for &b in b"VB " {
+            line[n] = b;
+            n += 1;
+        }
+        n = crate::push_dec(&mut line, n, u32::from(vb));
+        while n < 8 {
+            line[n] = b' ';
+            n += 1;
+        }
+        for &b in b"mV" {
+            line[n] = b;
+            n += 1;
+        }
+        line[n] = 0;
+        lcd.draw_text(8, 196, &line, 2, WHITE, BLACK).await;
+    }
+
+    /// r196: the QC3 screen — target (mV), state, the crate's tracked
+    /// continuous set point, and the taps/output. Same split as draw_qc:
+    /// the static rows (fill + TGT + state) redraw only on state/target
+    /// changes; the fast numbers update in place at 200 ms.
+    pub async fn draw_qc3(&mut self, lcd: &mut Lcd) {
+        use core::sync::atomic::Ordering;
+        let state = crate::qc_task::STATE.load(Ordering::Relaxed);
+        let failure = crate::qc_task::FAILURE.load(Ordering::Relaxed);
+        let tgt = crate::qc_task::M3_TARGET.load(Ordering::Relaxed);
+        let set = crate::qc_task::SET_MV.load(Ordering::Relaxed);
+        let dp = crate::qc_task::DP_MV.load(Ordering::Relaxed);
+        let dm = crate::qc_task::DM_MV.load(Ordering::Relaxed);
+        let vb = crate::qc_task::VBUS_MV.load(Ordering::Relaxed);
+        let statics_changed = state != self.qc3_state || tgt != self.qc3_tgt;
+        let now = embassy_time::Instant::now().as_millis() as u32;
+        let dyn_due = now.wrapping_sub(self.qc3_dyn_at) >= 200;
+        if !statics_changed && !dyn_due {
+            return;
+        }
+        if statics_changed {
+            self.qc3_state = state;
+            self.qc3_tgt = tgt;
+            lcd.fill_window(0, 32, 319, 210, BLACK).await;
+
+            // The next OK steps to exactly this target.
+            let mut line = [0u8; 24];
+            let mut n = 0;
+            for &b in b"TGT " {
+                line[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(&mut line, n, u32::from(tgt));
+            for &b in b"mV" {
+                line[n] = b;
+                n += 1;
+            }
+            line[n] = 0;
+            text(lcd, 8, 48, &line, 2, YELLOW).await;
+
+            const STATES: [&[u8]; 6] = [
+                b"OFF",
+                b"RELEASE",
+                b"ENTRY",
+                b"ACTIVE",
+                b"FAIL",
+                b"STEP",
+            ];
+            let name = STATES.get(state as usize).copied().unwrap_or(b"?");
+            let mut line = [0u8; 24];
+            let mut n = 0;
+            for &b in b"QC3 " {
+                line[n] = b;
+                n += 1;
+            }
+            line[n..n + name.len()].copy_from_slice(name);
+            n += name.len();
+            line[n] = 0;
+            text(lcd, 8, 88, &line, 3, WHITE).await;
+
+            let detail: &[u8] = match (state, failure) {
+                (4, 1) => b"FAIL NODCP",
+                (4, 2) => b"FAIL NOENTRY",
+                _ => b"",
+            };
+            if !detail.is_empty() {
+                let mut line = [0u8; 24];
+                line[..detail.len()].copy_from_slice(detail);
+                line[detail.len()] = 0;
+                text(lcd, 8, 132, &line, 2, CYAN).await;
+            }
+        }
+        if !(statics_changed || dyn_due) {
+            return;
+        }
+        self.qc3_dyn_at = now;
+
+        // SET row (the crate's tracked continuous set point) + the taps,
+        // in place: space-padded fixed-width blocks erase stale digits.
+        let mut line = [0u8; 32];
+        let mut n = 0;
+        for &b in b"SET " {
+            line[n] = b;
+            n += 1;
+        }
+        n = crate::push_dec(&mut line, n, u32::from(set));
+        while n < 12 {
+            line[n] = b' ';
+            n += 1;
+        }
+        for &b in b"DP " {
+            line[n] = b;
+            n += 1;
+        }
+        n = crate::push_dec(&mut line, n, u32::from(dp));
+        while n < 20 {
+            line[n] = b' ';
+            n += 1;
+        }
+        for &b in b"DM " {
+            line[n] = b;
+            n += 1;
+        }
+        n = crate::push_dec(&mut line, n, u32::from(dm));
+        while n < 28 {
             line[n] = b' ';
             n += 1;
         }

@@ -1,52 +1,72 @@
-//! QC2.0 trigger task (r189): drives the data lines through the DAC
-//! board layer (dac.rs), verifies the driven levels with the PA2/PA3 ADC
-//! taps, and follows the output on the TPA626 bus voltage the main loop
-//! publishes. The protocol state machine is the vendored qc-protocol
-//! crate (pure logic, host-tested); this file is the board layer.
+//! QC trigger task (r189 QC2.0, r196 QC3.0 continuous): drives the data
+//! lines through the DAC board layer (dac.rs), verifies the driven
+//! levels with the PA2/PA3 ADC taps, and follows the output on the
+//! TPA626 bus voltage the main loop publishes. The protocol state
+//! machines are the vendored qc-protocol crate (pure logic,
+//! host-tested); this file is the board layer.
 //!
 //! kws-x1 parity: firmware/src/qc_drive.rs is the reference consumer —
-//! the state shapes mirror its Off/Releasing/Entering/Active flow minus
-//! QC3 stepping and the capability probe (not requested). Entry is
-//! guarded the same way: only from a measured ~5 V output with the PD
-//! stack idle. Every transition logs a [qc] line — no silent branches.
+//! the state shapes mirror its Off/Releasing/Entering/Active/Stepping
+//! flow minus the capability probe. Entry is guarded the same way: only
+//! from a measured ~5 V output with the PD stack idle. Every transition
+//! logs a [qc] line — no silent branches.
+//!
+//! Two screens share this task: the QC2 screen commits Fixed voltages,
+//! the QC3 screen commits a Continuous target (mV). The mode rides with
+//! the commit (MODE stored before COMMIT), and a commit from the other
+//! screen switches flows mid-session — Fixed→Continuous enters stepping
+//! from the current output; Continuous→Fixed drives the 5 V pair held
+//! (which exits continuous mode) and re-requests after the settle.
 //!
 //! Coordination (the pd_task convention): atomics + the executor only.
 //! No I2C here — the main loop's meter read publishes VBUS_MV.
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
-use embassy_time::{Instant, Timer};
+use embassy_time::{block_for, Duration, Instant, Timer};
 use qc_protocol::detect::{Follow, Outcome};
 use qc_protocol::qc2::{Failure, Handshake, Level, Progress, Session, Voltage, REQUEST_SETTLE_MS};
+use qc_protocol::qc3::Continuous;
 
 use crate::adc;
 use crate::dac::{self, Line};
 
 // --- UI-facing state (atomics only) ---
 
-/// Selected target: an index into Voltage::ALL (0 = V5 .. 3 = V20).
-/// Default 9 V — the reason this screen exists.
+/// Selected QC2 target: an index into Voltage::ALL (0 = V5 .. 3 = V20).
+/// Default 9 V — the reason the QC2 screen exists.
 pub static TARGET: AtomicU8 = AtomicU8::new(1);
+/// Selected QC3 target in mV (the QC3 screen cycles it in 200 mV steps,
+/// clamped to qc3::MIN_MV..=20000).
+pub static M3_TARGET: AtomicU16 = AtomicU16::new(9000);
 pub static COMMIT: AtomicBool = AtomicBool::new(false);
 /// TPA626 bus voltage in mV, published by the main loop's meter read.
 pub static VBUS_MV: AtomicU16 = AtomicU16::new(0);
-/// Measured line taps in mV (PA3 = D+, PA2 = D−), for the QC screen.
+/// Measured line taps in mV (PA3 = D+, PA2 = D−), for the QC screens.
 pub static DP_MV: AtomicU16 = AtomicU16::new(0);
 pub static DM_MV: AtomicU16 = AtomicU16::new(0);
-/// 0 Off, 1 Releasing, 2 Entering, 3 Active, 4 Failed.
+/// 0 Off, 1 Releasing, 2 Entering, 3 Active (fixed), 4 Failed,
+/// 5 Stepping (continuous), 6 Exiting (leaving continuous).
 pub static STATE: AtomicU8 = AtomicU8::new(0);
 /// 0 none, 1 Waiting, 2 Followed, 3 Ignored.
 pub static OUTCOME: AtomicU8 = AtomicU8::new(0);
 /// 0 none, 1 NotDcp, 2 NoEntry.
 pub static FAILURE: AtomicU8 = AtomicU8::new(0);
+/// The continuous-mode set point in mV (the crate's own count), for the
+/// QC3 screen.
+pub static SET_MV: AtomicU16 = AtomicU16::new(0);
 
 const STATE_OFF: u8 = 0;
 const STATE_RELEASING: u8 = 1;
 const STATE_ENTERING: u8 = 2;
 const STATE_ACTIVE: u8 = 3;
 const STATE_FAILED: u8 = 4;
+const STATE_STEPPING: u8 = 5;
 
-/// The selectable targets in cycle order (5 V = the stop/restore request).
+/// The selectable QC2 targets in cycle order (5 V = the stop/restore).
 pub const TARGETS_MV: [u16; 4] = [5000, 9000, 12000, 20000];
+/// The QC3 target range (the crate floors stepping at qc3::MIN_MV).
+pub const M3_MIN_MV: u16 = 3600;
+pub const M3_MAX_MV: u16 = 20_000;
 
 /// Cycle [`TARGET`] one step in `dir` (+1 right / −1 left), wraparound.
 /// Returns the new target in mV for the console line.
@@ -57,14 +77,28 @@ pub fn cycle_target(dir: i16) -> u16 {
     TARGETS_MV[next]
 }
 
-/// The QC screen's OK in selection mode.
-pub fn commit_desired() {
+/// Cycle the QC3 target by one 200 mV step in `dir`, clamped to the
+/// range. Returns the new target in mV for the console line.
+pub fn cycle_m3_target(dir: i16) -> u16 {
+    let step = i32::from(qc_protocol::qc3::STEP_MV) * i32::from(dir);
+    let next = (i32::from(M3_TARGET.load(Ordering::Relaxed)) + step)
+        .clamp(i32::from(M3_MIN_MV), i32::from(M3_MAX_MV));
+    let next = next as u16;
+    M3_TARGET.store(next, Ordering::Relaxed);
+    next
+}
+
+/// The QC2 screen's OK in selection mode: a fixed-voltage request.
+pub fn commit_fixed() {
+    MODE.store(MODE_FIXED, Ordering::Relaxed);
     COMMIT.store(true, Ordering::Relaxed);
 }
 
-/// r193 (user directive lifted — the Apple-signature reading proved the
-/// front end): the DAC drive is ENABLED for the QC2.0 handshake.
-pub const DRIVE_ENABLED: bool = true;
+/// The QC3 screen's OK in selection mode: a continuous-mode target.
+pub fn commit_continuous() {
+    MODE.store(MODE_CONTINUOUS, Ordering::Relaxed);
+    COMMIT.store(true, Ordering::Relaxed);
+}
 
 fn log(line: &[u8]) {
     crate::pd_log(line);
@@ -108,17 +142,43 @@ fn log_dec(prefix: &[u8], values: &[u32], infixes: &[&[u8]]) {
     log(&d[..n]);
 }
 
+// --- commit plumbing (mode rides with the commit) ---
+
+const MODE_FIXED: u8 = 0;
+const MODE_CONTINUOUS: u8 = 1;
+static MODE: AtomicU8 = AtomicU8::new(MODE_FIXED);
+
+/// What the handshake is FOR, captured at the starting commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Request {
+    Fixed(Voltage),
+    Continuous(u16),
+}
+
+fn request_from_statics() -> Request {
+    match MODE.load(Ordering::Relaxed) {
+        MODE_CONTINUOUS => Request::Continuous(M3_TARGET.load(Ordering::Relaxed)),
+        _ => Request::Fixed(
+            Voltage::ALL[TARGET.load(Ordering::Relaxed) as usize % Voltage::ALL.len()],
+        ),
+    }
+}
+
+fn request_mv(request: Request) -> u32 {
+    match request {
+        Request::Fixed(v) => u32::from(v.millivolts()),
+        Request::Continuous(t) => u32::from(t),
+    }
+}
+
 #[embassy_executor::task]
 pub async fn run() {
-    // r192: DAC/pad init is gated off — PA4/PA5 float untouched.
-    if DRIVE_ENABLED {
-        dac::init();
-    }
+    dac::init();
     log(b"[qc] task up\r\n");
     let mut state = State::Off;
     loop {
         let now = now_ms();
-        let target = Voltage::ALL[TARGET.load(Ordering::Relaxed) as usize % Voltage::ALL.len()];
+        let request = request_from_statics();
         let commit = COMMIT.swap(false, Ordering::Relaxed);
         // PA3 = D+ tap, PA2 = D− tap (user trace: 1 kΩ series each).
         let dp_mv = adc::read_line_mv(3);
@@ -131,7 +191,7 @@ pub async fn run() {
         }
         let vbus_mv = u32::from(VBUS_MV.load(Ordering::Relaxed));
 
-        state = update(state, now, target, commit, dp_mv, dm_mv, vbus_mv);
+        state = update(state, now, request, commit, dp_mv, dm_mv, vbus_mv);
         Timer::after_millis(50).await;
     }
 }
@@ -139,14 +199,31 @@ pub async fn run() {
 enum State {
     Off,
     Releasing(u64),
-    /// The handshake plus the target entry is FOR (captured at the
+    /// The handshake plus the request entry is FOR (captured at the
     /// starting commit; a later commit retargets it).
-    Entering(Handshake, Voltage),
+    Entering(Handshake, Request),
+    /// The fixed-voltage flow: a request held and its output followed.
     Active {
         session: Session,
         voltage: Voltage,
         follow: Option<Follow>,
         decided: bool,
+    },
+    /// The continuous flow: the mode was taken, steps run toward the
+    /// target one pulse per settle window.
+    Stepping {
+        session: Session,
+        continuous: Continuous,
+        target: u16,
+        last_pulse: u64,
+    },
+    /// The 5 V pair is held — it exits continuous mode (sustained levels
+    /// are not a pulse) and requests 5 V — while the next request
+    /// settles behind it.
+    Exiting {
+        since: u64,
+        session: Session,
+        request: Request,
     },
     /// A 5 V stop request settles before the lines release.
     Stopping(u64),
@@ -155,7 +232,7 @@ enum State {
 fn update(
     state: State,
     now: u64,
-    target: Voltage,
+    request: Request,
     commit: bool,
     _dp_mv: Option<u16>,
     dm_mv: Option<u16>,
@@ -166,11 +243,7 @@ fn update(
             if !commit {
                 return State::Off;
             }
-            if !DRIVE_ENABLED {
-                log(b"[qc] trigger disabled (drive off this build)\r\n");
-                return State::Off;
-            }
-            if target == Voltage::V5 {
+            if request == Request::Fixed(Voltage::V5) {
                 // 5 V is the restore request; with the lines released
                 // there is nothing to drive.
                 log(b"[qc] off: released (5v default)\r\n");
@@ -210,31 +283,31 @@ fn update(
             );
             STATE.store(STATE_ENTERING, Ordering::Relaxed);
             FAILURE.store(0, Ordering::Relaxed);
-            State::Entering(Handshake::start(now), target)
+            State::Entering(Handshake::start(now), request)
         }
-        State::Entering(handshake, entry_target) => {
+        State::Entering(handshake, entry_request) => {
             // A commit during entry retargets it (the handshake itself is
             // level-only: D+ mid, D− released — retargeting is free).
-            let entry_target = if commit && target != entry_target {
+            let entry_request = if commit && request != entry_request {
                 log_dec(
                     b"[qc] entry retarget ",
-                    &[u32::from(target.millivolts())],
+                    &[request_mv(request)],
                     &[b"mV\r\n"],
                 );
-                target
+                request
             } else {
-                entry_target
+                entry_request
             };
             // A failed scan keeps waiting (kws-x1: same). D− readings of
             // 0 mV are VALID here — D− going low is the entry signal.
             let Some(dm) = dm_mv else {
-                return State::Entering(handshake, entry_target);
+                return State::Entering(handshake, entry_request);
             };
             match handshake.poll(now, dm) {
-                Progress::Waiting(handshake) => State::Entering(handshake, entry_target),
+                Progress::Waiting(handshake) => State::Entering(handshake, entry_request),
                 Progress::Ready(session) => {
                     log(b"[qc] entry ready\r\n");
-                    begin(session, entry_target, now, vbus_mv)
+                    dispatch(session, entry_request, now, vbus_mv)
                 }
                 Progress::Failed(failure) => {
                     let name: &[u8] = match failure {
@@ -290,7 +363,7 @@ fn update(
             // The vendored Session moves by value, so re-requests rebuild
             // the Active state through begin().
             if commit {
-                if target == Voltage::V5 && voltage != Voltage::V5 {
+                if request == Request::Fixed(Voltage::V5) && voltage != Voltage::V5 {
                     let (dp, dm) = session.request(Voltage::V5);
                     let (dp_mv, dm_mv) = drive_request(dp, dm);
                     log_dec(
@@ -301,8 +374,8 @@ fn update(
                     STATE.store(STATE_OFF, Ordering::Relaxed);
                     return State::Stopping(now);
                 }
-                if target != voltage {
-                    return begin(session, target, now, vbus_mv);
+                if request != Request::Fixed(voltage) {
+                    return dispatch(session, request, now, vbus_mv);
                 }
             }
             // Follow the output until it decides (midpoint crossing or
@@ -332,6 +405,65 @@ fn update(
                 decided,
             }
         }
+        State::Stepping {
+            session,
+            mut continuous,
+            target,
+            last_pulse,
+        } => {
+            // A commit retargets the stepping, switches the flow, or
+            // stops (5 V).
+            if commit {
+                match request {
+                    Request::Continuous(t) if t != target => {
+                        log_dec(b"[qc] step retarget ", &[u32::from(t)], &[b"mV\r\n"]);
+                        return State::Stepping {
+                            session,
+                            continuous,
+                            target: t,
+                            last_pulse,
+                        };
+                    }
+                    Request::Continuous(_) => {}
+                    other => {
+                        // Leave continuous the crate's way: the 5 V pair
+                        // held (a sustained pair is not a pulse) requests
+                        // 5 V and ends continuous mode.
+                        return exit_continuous(session, other, now);
+                    }
+                }
+            }
+            // One pulse per settle window toward the target.
+            let mut last_pulse = last_pulse;
+            if now.saturating_sub(last_pulse) >= REQUEST_SETTLE_MS {
+                if let Some(pulse) = continuous.step_toward(target) {
+                    let hold = continuous.hold();
+                    let _ = drive_request(pulse.0, pulse.1);
+                    block_for(Duration::from_micros(u64::from(
+                        qc_protocol::qc3::PULSE_US,
+                    )));
+                    let _ = drive_request(hold.0, hold.1);
+                    SET_MV.store(continuous.set_mv(), Ordering::Relaxed);
+                    // No per-pulse log: a ramp fires one pulse per settle
+                    // window and would flood the ring — the QC3 screen's
+                    // SET row shows the progress live.
+                    last_pulse = now;
+                }
+            }
+            STATE.store(STATE_STEPPING, Ordering::Relaxed);
+            State::Stepping {
+                session,
+                continuous,
+                target,
+                last_pulse,
+            }
+        }
+        State::Exiting { since, session, request } => {
+            if now.saturating_sub(since) < REQUEST_SETTLE_MS {
+                return State::Exiting { since, session, request };
+            }
+            dispatch(session, request, now, vbus_mv)
+        }
         State::Stopping(since) => {
             if now.saturating_sub(since) < REQUEST_SETTLE_MS {
                 return State::Stopping(since);
@@ -340,6 +472,71 @@ fn update(
             STATE.store(STATE_OFF, Ordering::Relaxed);
             State::Off
         }
+    }
+}
+
+/// Route a settled session to its request: fixed voltages drive and
+/// follow; a continuous target takes the mode (from the current output)
+/// and steps toward it.
+fn dispatch(session: Session, request: Request, now: u64, vbus_mv: u32) -> State {
+    match request {
+        Request::Fixed(Voltage::V5) => {
+            let (dp, dm) = session.request(Voltage::V5);
+            let (dp_mv, dm_mv) = drive_request(dp, dm);
+            log_dec(
+                b"[qc] 5v dp=",
+                &[dp_mv, dm_mv],
+                &[b"mV dm=", b"mV release\r\n"],
+            );
+            release_lines();
+            STATE.store(STATE_OFF, Ordering::Relaxed);
+            State::Off
+        }
+        Request::Fixed(voltage) => begin(session, voltage, now, vbus_mv),
+        Request::Continuous(target) => {
+            // The output is wherever the last request left it; continuous
+            // mode starts from there (kws-x1 resets to 5 V first — ours
+            // starts from the honest current set point).
+            let from = Voltage::V5;
+            let (continuous, hold) = Continuous::request(&session, from);
+            let (dp_mv, dm_mv) = drive_request(hold.0, hold.1);
+            SET_MV.store(continuous.set_mv(), Ordering::Relaxed);
+            log_dec(
+                b"[qc] continuous from=",
+                &[u32::from(from.millivolts()), u32::from(target)],
+                &[b"mV target=", b"mV\r\n"],
+            );
+            let _ = (dp_mv, dm_mv);
+            STATE.store(STATE_STEPPING, Ordering::Relaxed);
+            State::Stepping {
+                session,
+                continuous,
+                target,
+                last_pulse: now,
+            }
+        }
+    }
+}
+
+/// Leave continuous mode: the 5 V pair held (a sustained pair outlasts
+/// the pulse filter, so the charger reads it as a fixed request and ends
+/// continuous mode), then settle behind it.
+fn exit_continuous(session: Session, request: Request, now: u64) -> State {
+    let (dp, dm) = session.request(Voltage::V5);
+    let (dp_mv, dm_mv) = drive_request(dp, dm);
+    log_dec(
+        b"[qc] exit continuous dp=",
+        &[dp_mv, dm_mv],
+        &[b"mV dm=", b"mV settle\r\n"],
+    );
+    STATE.store(STATE_OFF, Ordering::Relaxed);
+    match request {
+        Request::Fixed(Voltage::V5) => State::Stopping(now),
+        other => State::Exiting {
+            since: now,
+            session,
+            request: other,
+        },
     }
 }
 
