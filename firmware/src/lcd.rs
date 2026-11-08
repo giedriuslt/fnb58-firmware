@@ -216,8 +216,10 @@ impl Lcd {
     /// composed into a line buffer (max scale 3: 15x21x2 = 630 B) and
     /// streamed with one busy write.
     pub async fn draw_char(&mut self, x: u16, y: u16, ch: u8, scale: u8, fg: u16, bg: u16) -> u16 {
-        const FONT_CHARS: &[u8] = b"0123456789. VAWmu-PSCDBEFGHIKLMNORTUY:/";
-        static FONT_5X7: [[u8; 5]; 39] = [
+        // r189: Q and X appended (the QC screen title + the BK:EX hint);
+        // the blank fallback stays at index 11 — append only at the end.
+        const FONT_CHARS: &[u8] = b"0123456789. VAWmu-PSCDBEFGHIKLMNORTUY:/QX";
+        static FONT_5X7: [[u8; 5]; 41] = [
             [0x3E, 0x51, 0x49, 0x45, 0x3E], // 0
             [0x00, 0x42, 0x7F, 0x40, 0x00], // 1
             [0x62, 0x51, 0x49, 0x49, 0x46], // 2
@@ -257,6 +259,8 @@ impl Lcd {
             [0x03, 0x04, 0x78, 0x04, 0x03], // Y
             [0x00, 0x36, 0x36, 0x00, 0x00], // :
             [0x00, 0x60, 0x18, 0x06, 0x01], // /
+            [0x3E, 0x51, 0x49, 0x45, 0x3B], // Q (r189: tail on the O)
+            [0x33, 0x33, 0x1E, 0x33, 0x33], // X (r189)
         ];
         let idx = FONT_CHARS
             .iter()

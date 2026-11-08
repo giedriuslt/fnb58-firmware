@@ -10,6 +10,8 @@
 //! reference) instead of the example's fixed 3.3 V.
 
 use embassy_at32::pac;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 
 /// ADC clock: PCLK2 96 MHz / 8 = 12 MHz (the vendor example runs the
 /// same ADC at 30 MHz, so this is comfortably in range). CRM_ADC_DIV_8
@@ -21,6 +23,12 @@ const ADCDIV_HIGH: bool = false;
 /// Wait bound for one 12-bit conversion at 12 MHz (~21 us) and for the
 /// calibration steps: generous, they take far less.
 const WAIT_BOUND: u32 = 2_000_000;
+
+/// r189: ADC1 is shared — the main loop's temperature read and the QC
+/// task's line taps would race on the sequence/trigger registers. One
+/// conversion per critical-section lock (~40 us, far under the >1 ms
+/// IRQ-mask window that loses SysTick ticks).
+static ADC_LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 
 /// Enable and calibrate ADC1 with CH16/CH17 ready. Call once at boot,
 /// before either USB mode's loop runs.
@@ -57,6 +65,12 @@ pub fn init() {
         w.cspt16().bits(0b111);
         w.cspt17().bits(0b111)
     });
+    // r189: CH2/CH3 (the QC data-line taps, PA2/PA3 through 1 kΩ) get the
+    // same long window — the tap cadence is tens of Hz, speed is free.
+    adc.spt2().modify(|_, w| unsafe {
+        w.cspt2().bits(0b111);
+        w.cspt3().bits(0b111)
+    });
     // Ordinary sequence length 1; the channel is written per read.
     adc.osq1().modify(|_, w| unsafe { w.oclen().bits(0) });
 
@@ -75,9 +89,13 @@ pub fn init() {
     }
 }
 
-/// One software-triggered conversion of `ch` (0..=17). Returns None on
-/// the (never-seen) EOC timeout.
+/// One software-triggered conversion of `ch` (0..=17), under the ADC
+/// lock. Returns None on the (never-seen) EOC timeout.
 fn read_raw(ch: u8) -> Option<u16> {
+    ADC_LOCK.lock(|_| raw_once(ch))
+}
+
+fn raw_once(ch: u8) -> Option<u16> {
     let adc = unsafe { pac::at32f403a::ADC1::steal() };
     adc.osq3().modify(|_, w| unsafe { w.osn1().bits(ch) });
     adc.sts().write(|w| w.occe().bit(true)); // write-1-to-clear
@@ -88,6 +106,28 @@ fn read_raw(ch: u8) -> Option<u16> {
         }
     }
     None
+}
+
+/// Measured VDDA in mV from the 1.2 V internal reference — the DAC code
+/// math and the line-tap mV both scale against this. None on timeout.
+pub fn vdda_mv() -> Option<u32> {
+    let vref = u32::from(read_raw(17)?);
+    if vref == 0 {
+        return None;
+    }
+    Some(1200 * 4095 / vref)
+}
+
+/// One external line conversion in mV (PA2 = CH2 = D−, PA3 = CH3 = D+),
+/// 4-sample mean, VDDA-ratiometric — the kws-x1 LineAdc pattern. None
+/// on timeout (caller keeps the previous value).
+pub fn read_line_mv(ch: u8) -> Option<u16> {
+    let vdda = vdda_mv()?;
+    let mut sum: u32 = 0;
+    for _ in 0..4 {
+        sum += u32::from(read_raw(ch)?);
+    }
+    Some((sum * vdda / 4095 / 4) as u16)
 }
 
 /// Internal die temperature in tenths of a degree C, measured against

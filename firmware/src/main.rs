@@ -22,8 +22,10 @@
 mod board;
 mod adc;
 mod console;
+mod dac;
 mod pd_phy;
 mod pd_task;
+mod qc_task;
 mod buttons;
 mod buzzer;
 mod flash;
@@ -41,7 +43,7 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r188";
+const BUILD: &[u8] = b"r195";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -181,7 +183,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r188 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r195 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -254,7 +256,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r188 " {
+                for &b in b"r195 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -334,6 +336,9 @@ async fn main(spawner: Spawner) {
             *guard = pd_task::BusCell(i2c.ok());
         }
         spawner.spawn(pd_task::run().expect("one pd task"));
+        // r189: the QC2.0 trigger task — DAC drive + ADC verify on the
+        // traced data-line front end (board.rs).
+        spawner.spawn(qc_task::run().expect("one qc task"));
     }
 
     // Unmask USB interrupt lines.
@@ -355,7 +360,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r188: contract reporting\r\n");
+    say(b"[lcd] FNB58 r195: contract reporting\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -706,6 +711,11 @@ async fn main(spawner: Spawner) {
         if ui.screen == Screen::Pd && !pd_task::BUSY.load(Ordering::Relaxed) {
             ui.draw_pd(&mut lcd, &pd_task::VIEW).await;
         }
+        // r189: the QC screen draws under the same BUSY gate (the QC
+        // task's own blocking work is microseconds-scale ADC reads).
+        if ui.screen == Screen::Qc && !pd_task::BUSY.load(Ordering::Relaxed) {
+            ui.draw_qc(&mut lcd).await;
+        }
 
         // Buttons: debounced active-low (50 ms at this cadence); events
         // to the console queue, presses drive the UI screens.
@@ -745,13 +755,12 @@ async fn main(spawner: Spawner) {
             match ui.on_press(i) {
                 Press::Switch(screen) => ui.enter(&mut lcd, screen).await,
                 Press::Commit => {
-                    // r173: the PD-native voltage change. With a session
-                    // running, the engine sends a plain Request from Ready
-                    // (Accept -> PS_RDY -> new contract) — NO Hard Reset,
-                    // NO restart. Only when NO session is running do we
-                    // start one, whose restart Hard Reset also wakes a
-                    // sleeping charger — restart_unheard's actual purpose.
-                    if pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) {
+                    // r189: the QC screen's OK requests the selected
+                    // target through the QC task (entry guard inside).
+                    if ui.screen == Screen::Qc {
+                        qc_task::commit_desired();
+                        sender.push(b"[qc] commit\r\n");
+                    } else if pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) {
                         pd_task::commit_desired();
                         sender.push(b"[pd] commit\r\n");
                     } else {
@@ -764,11 +773,16 @@ async fn main(spawner: Spawner) {
                     ui.draw_hint(&mut lcd).await;
                 }
                 Press::Voltage(dir) => {
-                    // r171: the PPS screen's voltage selection.
-                    let mv = pd_task::cycle_desired(dir);
+                    // r171: the PPS screen's voltage selection. r189: the
+                    // QC screen cycles its own targets.
+                    let (prefix, mv): (&[u8], u16) = if ui.screen == Screen::Qc {
+                        (b"[qc] tgt=", qc_task::cycle_target(dir))
+                    } else {
+                        (b"[pd] tgt=", pd_task::cycle_desired(dir))
+                    };
                     let mut d = [0u8; 32];
                     let mut n = 0;
-                    for &b in b"[pd] tgt=" {
+                    for &b in prefix {
                         d[n] = b;
                         n += 1;
                     }
@@ -846,6 +860,9 @@ async fn main(spawner: Spawner) {
                     let mv = (bus as u32 * 5) / 4; // 1.25 mV/LSB
                     let ua = (cur as i16 as i32) * 50; // 50 uA/LSB
                     let mw = ((pwr as i16 as i32) * 5) / 4; // 1.25 mW/LSB
+                    // r189: the QC task follows the output through this
+                    // published value (no I2C access of its own).
+                    qc_task::VBUS_MV.store(mv as u16, Ordering::Relaxed);
                     if ui.screen == Screen::Power {
                         ui.draw_power(&mut lcd, mv, ua, mw).await;
                     }
@@ -905,7 +922,8 @@ async fn main(spawner: Spawner) {
         if tick % 200 == 0 {
             // r140: 128-wide so every field's worst case fits (the old 96
             // could overflow at 5-digit rx_packets / negative temps).
-            let mut d = [0u8; 128];
+            // r190: 160 — the QC dp=/dm= fields join the line.
+            let mut d = [0u8; 160];
             let mut n = 0;
             for &b in b"[diag " {
                 d[n] = b;
@@ -979,6 +997,27 @@ async fn main(spawner: Spawner) {
                 n += 1;
             }
             n = push_dec(&mut d, n, u32::from(pd_task::VIEW.rx_error.load(Ordering::Relaxed)));
+            // r190: the QC data-line taps (PA3/PA2) — with a charger
+            // connected the idle levels name the charger type (QC2 idle:
+            // D+ ≈ 600 mV, D− ≈ 0; floating: both ~0) and prove the taps
+            // see the connector at all.
+            for &b in b" dp=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, u32::from(qc_task::DP_MV.load(Ordering::Relaxed)));
+            for &b in b" dm=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, u32::from(qc_task::DM_MV.load(Ordering::Relaxed)));
+            // r191: the published output (the r191 mux= diagnostic field
+            // is gone — PB2 stays untouched per user directive).
+            for &b in b" vb=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, u32::from(qc_task::VBUS_MV.load(Ordering::Relaxed)));
             // r136: die temperature from the internal sensor (the same
             // reading the PC-link reports carry).
             for &b in b" T=" {

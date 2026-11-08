@@ -12,6 +12,9 @@ embassy-time = { version = "0.5.1", features = ["tick-hz-1_000"] }
 embassy-sync = "0.8.0"
 embedded-hal-async = "1.0.0"
 fusb302-pd = { path = "fusb302-pd" }
+# r189: the QC2.0 trigger consumes the vendored pure-logic crate
+# (handshake/requests/follow — the same one kws-x1 drives).
+qc-protocol = { path = "pd-protocol-debug/qc-protocol" }
 # The sink engine (Selection/Trial/Limits) and the driver traits, pinned to
 # the revisions kws-x1 ships against.
 pd-protocol = { git = "https://github.com/kralonur/embedded-charging-protocols-rs", rev = "2c3d511cb7214f1db9f5e3528900e1fd9d1bc323" }

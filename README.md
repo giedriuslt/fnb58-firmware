@@ -196,6 +196,39 @@ mailbox — the vendor `custom_hid` class as a template), `fnb58_usb.c`
 picks the class at boot (`fnb58_usb_init_hid`), and the Rust
 main loop samples the meter and builds the reports.
 
+## QC2.0 trigger (r189–r195) — hardware-verified
+
+The QC screen (3rd in the LEFT/RIGHT cycle) triggers QC2 voltages
+5/9/12/20 V through the traced data-line front end: **PA5 (DAC2_OUT)
+drives D+ via 100 Ω, PA4 (DAC1_OUT) drives D− via 100 Ω; PA3/PA2
+(ADC12_IN3/IN2) read D+/D− via 1 kΩ each**. The protocol state machine
+is the vendored `qc-protocol` crate (pure logic, host-tested); the
+board layer is `dac.rs` (drive/release) + `adc.rs` (`read_line_mv`)
++ `qc_task.rs` (the task).
+
+- **Levels are DAC codes** (0.6 V ≈ 745, 3.3 V = 4095, VDDA-ratiometric
+  via VREFINT) — no resistor ladder needed.
+- **Release = channel power-down** (`d1en`/`d2en` clear), NOT pad-mode
+  switching: the r193 hardware round proved the DAC output buffer
+  drives its pad in every GPIO mode on this part (the code-0 outputs
+  held both lines at ~0 V and forced `NODCP`); with the channels
+  disabled the lines belong to the charger again. Drive = code write,
+  then channel enable.
+- **Entry handshake**: D+ held at 0.6 V, D− released (the charger
+  drives it — shorts it to D+ during the glitch window, then pulls it
+  low to accept requests). Every transition logs `[qc] …` with `t=`
+  stamps; failures name the reason (`NODCP` = the short was never
+  seen, `NOENTRY` = seen but never dropped).
+- **Verification is closed-loop**: the request levels are read back on
+  the taps (screen + diag `dp=`/`dm=`) and the output is followed on
+  the published TPA626 bus voltage (`vb=`) — `FOLLOWED`/`IGNORED`
+  verdicts per request.
+
+The `run-bootloader` console command (r184–r188, BPR battery-domain
+cookie + the BPR *peripheral clock* fix) reboots into the update
+bootloader without the OK button; `tools/fnb58-flash.py` installs a
+new app over the bootloader's CDC link.
+
 ## Build and flash
 
 ```sh

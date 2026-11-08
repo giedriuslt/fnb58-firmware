@@ -58,3 +58,10 @@ echo "bootloader: $BL_SIZE bytes (limit $BL_LIMIT)"
 echo "app:        $APP_SIZE bytes (limit $APP_LIMIT)"
 echo "full:       $(stat -c %s "fnb58-full-$ROUND.bin") bytes (install image incl. trailer)"
 md5sum "fnb58-bl-$ROUND.bin" "fnb58-app-$ROUND.bin" "fnb58-full-$ROUND.bin"
+
+# r195: fixed-name copies for git — the tracked artifacts are overwritten
+# every round (no version-number accumulation in the repo); the
+# round-tagged files above stay as untracked scratch copies.
+cp "fnb58-bl-$ROUND.bin" fnb58-bl.bin
+cp "fnb58-app-$ROUND.bin" fnb58-app.bin
+cp "fnb58-full-$ROUND.bin" fnb58-full.bin

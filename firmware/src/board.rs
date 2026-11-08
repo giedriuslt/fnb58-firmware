@@ -99,6 +99,17 @@ pub const PIN_DRIVE: Drive = Drive::Moderate;
 /// DMA unit and channel (1-based) used for panel pixel bursts.
 pub const PANEL_DMA: (embassy_at32::dma::Unit, u8) = (embassy_at32::dma::Unit::Dma1, 1);
 
+/// QC2.0 data-line front end (user board trace, 2026-11-08): PA5
+/// (pin 15, DAC2_OUT) drives D+ through 100 Ω, PA4 (pin 14, DAC1_OUT)
+/// drives D− through 100 Ω; PA3 (pin 13, ADC12_IN3) reads D+ and PA2
+/// (pin 12, ADC12_IN2) reads D− through 1 kΩ each. The RS2228 mux
+/// (PB2) is not in this path. Drivers: dac.rs (drive) and adc.rs
+/// (read_line_mv); the protocol task is qc_task.rs.
+pub const QC_DP_DRIVE: (Port, u8) = (Port::A, 5);
+pub const QC_DM_DRIVE: (Port, u8) = (Port::A, 4);
+pub const QC_DP_READ: (Port, u8) = (Port::A, 3);
+pub const QC_DM_READ: (Port, u8) = (Port::A, 2);
+
 /// Power-path hardware (user board trace, 2026-10-30): four ~20-ohm
 /// power resistors and one MOSFET sit directly behind the AT32. The
 /// working theory: a switchable current-pulse load bank for MediaTek

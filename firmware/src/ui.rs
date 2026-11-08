@@ -20,6 +20,17 @@ const MAGENTA: u16 = 0xF81F;
 pub enum Screen {
     Power,
     Pd,
+    /// r189: the QC2.0 trigger screen (targets 5/9/12/20 V, OK = REQ).
+    Qc,
+}
+
+/// The r189 screen cycle order (LEFT/RIGHT walk it in both directions).
+const SCREEN_CYCLE: [Screen; 3] = [Screen::Power, Screen::Pd, Screen::Qc];
+
+fn next_screen(screen: Screen, dir: i16) -> Screen {
+    let i = SCREEN_CYCLE.iter().position(|&s| s == screen).unwrap_or(0);
+    let next = (i as i16 + dir).rem_euclid(SCREEN_CYCLE.len() as i16) as usize;
+    SCREEN_CYCLE[next]
 }
 
 /// What a button press means to the UI (buttons.rs order:
@@ -49,6 +60,14 @@ pub struct Ui {
     pd_err: u16,
     /// r171: the armed target voltage (PPS screen's TGT line).
     pd_tgt: u16,
+    /// r189: QC-view identity at the last static redraw (state changes
+    /// only — the fast numbers update in place, see draw_qc).
+    qc_state: u8,
+    qc_outcome: u8,
+    qc_failure: u8,
+    qc_tgt: u16,
+    /// r195: the dynamic rows' last in-place update (ms, wrapping u32).
+    qc_dyn_at: u32,
 }
 
 /// Draw a NUL-terminated copy of `s` (truncated to fit the buffer).
@@ -69,6 +88,11 @@ impl Ui {
             pd_ma: 0xFFFF,
             pd_err: 0xFFFF,
             pd_tgt: 0xFFFF,
+            qc_state: 0xFF,
+            qc_outcome: 0xFF,
+            qc_failure: 0xFF,
+            qc_tgt: 0xFFFF,
+            qc_dyn_at: 0,
         }
     }
 
@@ -79,28 +103,28 @@ impl Ui {
     pub fn on_press(&mut self, i: usize) -> Press {
         match i {
             buttons::LEFT => {
-                if self.screen == Screen::Pd && self.selecting {
+                if self.selecting {
                     Press::Voltage(-1)
                 } else {
-                    Press::Switch(Screen::Power)
+                    Press::Switch(next_screen(self.screen, -1))
                 }
             }
             buttons::RIGHT => {
-                if self.screen == Screen::Pd && self.selecting {
+                if self.selecting {
                     Press::Voltage(1)
                 } else {
-                    Press::Switch(Screen::Pd)
+                    Press::Switch(next_screen(self.screen, 1))
                 }
             }
             buttons::BACK => {
-                if self.screen == Screen::Pd && self.selecting {
+                if self.selecting {
                     self.selecting = false;
                     Press::Hint
                 } else {
-                    Press::Switch(Screen::Power)
+                    Press::Switch(next_screen(self.screen, -1))
                 }
             }
-            buttons::OK if self.screen == Screen::Pd => {
+            buttons::OK if self.screen == Screen::Pd || self.screen == Screen::Qc => {
                 if self.selecting {
                     self.selecting = false;
                     Press::Commit
@@ -120,15 +144,21 @@ impl Ui {
         self.selecting = false;
         // Force the next screen-specific redraw.
         self.pd_phase = 0xFF;
+        self.qc_state = 0xFF;
         lcd.fill(BLACK).await;
         match screen {
             Screen::Power => {
                 text(lcd, 8, 8, b"POWER", 2, WHITE).await;
-                text(lcd, 272, 8, b"1/2", 2, GRAY).await;
+                text(lcd, 272, 8, b"1/3", 2, GRAY).await;
             }
             Screen::Pd => {
                 text(lcd, 8, 8, b"PPS", 2, WHITE).await;
-                text(lcd, 272, 8, b"2/2", 2, GRAY).await;
+                text(lcd, 272, 8, b"2/3", 2, GRAY).await;
+                self.draw_hint(lcd).await;
+            }
+            Screen::Qc => {
+                text(lcd, 8, 8, b"QC", 2, WHITE).await;
+                text(lcd, 272, 8, b"3/3", 2, GRAY).await;
                 self.draw_hint(lcd).await;
             }
         }
@@ -143,6 +173,133 @@ impl Ui {
             b"OK:TGT"
         };
         lcd.draw_text(8, 216, hint, 2, GRAY, BLACK).await;
+    }
+
+    /// r189: the QC screen — state, target, the measured line taps and
+    /// the published output. r195 flicker fix: the static rows (fill +
+    /// TGT + state + detail) redraw only when the state changes; the
+    /// fast tap/output numbers update IN PLACE (fixed-width, no fill)
+    /// at a 200 ms cadence — the r194 full fill re-fired on every 50 ms
+    /// tap swing (released lines float by hundreds of mV) and the screen
+    /// never stopped flashing.
+    pub async fn draw_qc(&mut self, lcd: &mut Lcd) {
+        use core::sync::atomic::Ordering;
+        let state = crate::qc_task::STATE.load(Ordering::Relaxed);
+        let outcome = crate::qc_task::OUTCOME.load(Ordering::Relaxed);
+        let failure = crate::qc_task::FAILURE.load(Ordering::Relaxed);
+        let tgt_idx = crate::qc_task::TARGET.load(Ordering::Relaxed) as usize;
+        let tgt = crate::qc_task::TARGETS_MV
+            .get(tgt_idx)
+            .copied()
+            .unwrap_or(5000);
+        let statics_changed = state != self.qc_state
+            || outcome != self.qc_outcome
+            || failure != self.qc_failure
+            || tgt != self.qc_tgt;
+        let now = embassy_time::Instant::now().as_millis() as u32;
+        let dyn_due = now.wrapping_sub(self.qc_dyn_at) >= 200;
+        if !statics_changed && !dyn_due {
+            return;
+        }
+        if statics_changed {
+            self.qc_state = state;
+            self.qc_outcome = outcome;
+            self.qc_failure = failure;
+            self.qc_tgt = tgt;
+            lcd.fill_window(0, 32, 319, 210, BLACK).await;
+
+            // The next OK requests exactly this target.
+            let mut line = [0u8; 24];
+            let mut n = 0;
+            for &b in b"TGT " {
+                line[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(&mut line, n, u32::from(tgt / 1000));
+            line[n] = b'V';
+            n += 1;
+            line[n] = 0;
+            text(lcd, 8, 48, &line, 2, YELLOW).await;
+
+            // State row.
+            const STATES: [&[u8]; 5] = [b"OFF", b"RELEASE", b"ENTRY", b"ACTIVE", b"FAIL"];
+            let name = STATES.get(state as usize).copied().unwrap_or(b"?");
+            let mut line = [0u8; 24];
+            let mut n = 0;
+            for &b in b"QC " {
+                line[n] = b;
+                n += 1;
+            }
+            line[n..n + name.len()].copy_from_slice(name);
+            n += name.len();
+            line[n] = 0;
+            text(lcd, 8, 88, &line, 3, WHITE).await;
+
+            // Detail row: the failure reason, or the output-follow verdict.
+            let detail: &[u8] = match (state, failure, outcome) {
+                (4, 1, _) => b"FAIL NODCP",
+                (4, 2, _) => b"FAIL NOENTRY",
+                (3, _, 1) => b"WAIT",
+                (3, _, 2) => b"FOLLOWED",
+                (3, _, 3) => b"IGNORED",
+                _ => b"",
+            };
+            if !detail.is_empty() {
+                let mut line = [0u8; 24];
+                line[..detail.len()].copy_from_slice(detail);
+                line[detail.len()] = 0;
+                text(lcd, 8, 132, &line, 2, CYAN).await;
+            }
+        }
+        if !(statics_changed || dyn_due) {
+            return;
+        }
+        self.qc_dyn_at = now;
+        // The dynamic rows, in place: space-padded fixed-width numbers so
+        // a redraw erases stale digits — no fill, no flicker.
+        let dp = crate::qc_task::DP_MV.load(Ordering::Relaxed);
+        let dm = crate::qc_task::DM_MV.load(Ordering::Relaxed);
+        let vb = crate::qc_task::VBUS_MV.load(Ordering::Relaxed);
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        for &b in b"DP " {
+            line[n] = b;
+            n += 1;
+        }
+        n = crate::push_dec(&mut line, n, u32::from(dp));
+        while n < 7 {
+            line[n] = b' ';
+            n += 1;
+        }
+        for &b in b" DM " {
+            line[n] = b;
+            n += 1;
+        }
+        n = crate::push_dec(&mut line, n, u32::from(dm));
+        while n < 15 {
+            line[n] = b' ';
+            n += 1;
+        }
+        line[n] = 0;
+        lcd.draw_text(8, 168, &line, 2, GREEN, BLACK).await;
+
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        for &b in b"VB " {
+            line[n] = b;
+            n += 1;
+        }
+        n = crate::push_dec(&mut line, n, u32::from(vb));
+        while n < 8 {
+            line[n] = b' ';
+            n += 1;
+        }
+        for &b in b"mV" {
+            line[n] = b;
+            n += 1;
+        }
+        line[n] = 0;
+        lcd.draw_text(8, 196, &line, 2, WHITE, BLACK).await;
     }
 
     /// Show the reset-cause flags in the title bar so a reboot loop is
@@ -203,6 +360,34 @@ impl Ui {
         }
         l3.pad();
         lcd.draw_text(20, 170, l3.bytes(), 3, CYAN, BLACK).await;
+
+        // r192: the data-line taps (PA3 = D+, PA2 = D−, user trace) read
+        // by the QC task — shown on the power screen so plug/unplug is
+        // visible without navigating. Fixed-width decimal digits so a
+        // redraw overwrites the previous value cleanly (no Line12: it
+        // inserts decimal points and caps at 12 chars).
+        let dp = crate::qc_task::DP_MV.load(core::sync::atomic::Ordering::Relaxed);
+        let dm = crate::qc_task::DM_MV.load(core::sync::atomic::Ordering::Relaxed);
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        for &b in b"DP " {
+            line[n] = b;
+            n += 1;
+        }
+        for div in [1000u16, 100, 10, 1] {
+            line[n] = b'0' + ((dp / div) % 10) as u8;
+            n += 1;
+        }
+        for &b in b" DM " {
+            line[n] = b;
+            n += 1;
+        }
+        for div in [1000u16, 100, 10, 1] {
+            line[n] = b'0' + ((dm / div) % 10) as u8;
+            n += 1;
+        }
+        line[n] = 0;
+        lcd.draw_text(20, 202, &line, 1, GRAY, BLACK).await;
     }
 
     /// PD screen: the engine view (vendored fusb302-pd session). Redrawn

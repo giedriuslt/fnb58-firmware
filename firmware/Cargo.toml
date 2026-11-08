@@ -28,6 +28,7 @@ embassy-time.workspace = true
 embassy-sync.workspace = true
 embedded-hal-async.workspace = true
 fusb302-pd.workspace = true
+qc-protocol.workspace = true
 pd-protocol.workspace = true
 usbpd.workspace = true
 usbpd-traits.workspace = true
