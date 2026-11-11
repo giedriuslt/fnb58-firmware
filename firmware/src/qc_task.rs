@@ -26,8 +26,10 @@ use embassy_time::{block_for, Duration, Instant, Timer};
 use qc_protocol::detect::{Follow, Outcome};
 use qc_protocol::qc2::{Failure, Handshake, Level, Progress, Session, Voltage, REQUEST_SETTLE_MS};
 use qc_protocol::qc3::Continuous;
+use single_wire_protocols::afc::{self, Voltage as AfcVoltage};
 
 use crate::adc;
+use crate::afc_phy::DmWire;
 use crate::dac::{self, Line};
 
 // --- UI-facing state (atomics only) ---
@@ -38,6 +40,8 @@ pub static TARGET: AtomicU8 = AtomicU8::new(1);
 /// Selected QC3 target in mV (the QC3 screen cycles it in 200 mV steps,
 /// clamped to qc3::MIN_MV..=20000).
 pub static M3_TARGET: AtomicU16 = AtomicU16::new(9000);
+/// r198: the AFC screen's target (5000 or 9000 — the two AFC requests).
+pub static AFC_TARGET: AtomicU16 = AtomicU16::new(9000);
 pub static COMMIT: AtomicBool = AtomicBool::new(false);
 /// TPA626 bus voltage in mV, published by the main loop's meter read.
 pub static VBUS_MV: AtomicU16 = AtomicU16::new(0);
@@ -61,6 +65,9 @@ const STATE_ENTERING: u8 = 2;
 const STATE_ACTIVE: u8 = 3;
 const STATE_FAILED: u8 = 4;
 const STATE_STEPPING: u8 = 5;
+/// r198: AFC states — the wire detection exchange, then the session.
+const STATE_AFC_DETECT: u8 = 6;
+const STATE_AFC: u8 = 7;
 
 /// The selectable QC2 targets in cycle order (5 V = the stop/restore).
 pub const TARGETS_MV: [u16; 4] = [5000, 9000, 12000, 20000];
@@ -100,6 +107,22 @@ pub fn commit_continuous() {
     COMMIT.store(true, Ordering::Relaxed);
 }
 
+/// r198: the AFC screen's target cycle (5000 ↔ 9000, the two AFC
+/// requests). Returns the new target in mV for the console line.
+pub fn cycle_afc_target(dir: i16) -> u16 {
+    let current = AFC_TARGET.load(Ordering::Relaxed);
+    let next = if current >= 9000 { 5000 } else { 9000 };
+    AFC_TARGET.store(next, Ordering::Relaxed);
+    let _ = dir;
+    next
+}
+
+/// The AFC screen's OK in selection mode: a single-wire AFC request.
+pub fn commit_afc() {
+    MODE.store(MODE_AFC, Ordering::Relaxed);
+    COMMIT.store(true, Ordering::Relaxed);
+}
+
 fn log(line: &[u8]) {
     crate::pd_log(line);
 }
@@ -109,6 +132,9 @@ fn log(line: &[u8]) {
 const ENTRY_VBUS_WINDOW: core::ops::RangeInclusive<u32> = 4500..=5500;
 /// Release settle before the handshake starts (kws-x1 RELEASE_MS).
 const RELEASE_MS: u64 = 100;
+/// r198: kws-x1's DP_SETTLE_MS — the charger needs D+ stable at the AFC
+/// data level before the wire exchange.
+const DP_SETTLE_MS: u64 = 80;
 
 fn now_ms() -> u64 {
     Instant::now().as_millis()
@@ -146,6 +172,7 @@ fn log_dec(prefix: &[u8], values: &[u32], infixes: &[&[u8]]) {
 
 const MODE_FIXED: u8 = 0;
 const MODE_CONTINUOUS: u8 = 1;
+const MODE_AFC: u8 = 2;
 static MODE: AtomicU8 = AtomicU8::new(MODE_FIXED);
 
 /// What the handshake is FOR, captured at the starting commit.
@@ -153,11 +180,14 @@ static MODE: AtomicU8 = AtomicU8::new(MODE_FIXED);
 enum Request {
     Fixed(Voltage),
     Continuous(u16),
+    /// r198: an AFC single-wire request (5000 or 9000 mV).
+    Afc(u16),
 }
 
 fn request_from_statics() -> Request {
     match MODE.load(Ordering::Relaxed) {
         MODE_CONTINUOUS => Request::Continuous(M3_TARGET.load(Ordering::Relaxed)),
+        MODE_AFC => Request::Afc(AFC_TARGET.load(Ordering::Relaxed)),
         _ => Request::Fixed(
             Voltage::ALL[TARGET.load(Ordering::Relaxed) as usize % Voltage::ALL.len()],
         ),
@@ -167,13 +197,15 @@ fn request_from_statics() -> Request {
 fn request_mv(request: Request) -> u32 {
     match request {
         Request::Fixed(v) => u32::from(v.millivolts()),
-        Request::Continuous(t) => u32::from(t),
+        Request::Continuous(t) | Request::Afc(t) => u32::from(t),
     }
 }
 
 #[embassy_executor::task]
 pub async fn run() {
     dac::init();
+    // r198: the DWT cycle counter for the single-wire µs clock.
+    crate::afc_phy::init();
     log(b"[qc] task up\r\n");
     let mut state = State::Off;
     loop {
@@ -227,6 +259,19 @@ enum State {
     },
     /// A 5 V stop request settles before the lines release.
     Stopping(u64),
+    /// r198 (kws-x1's Promoting): D+ settled at the AFC data level
+    /// (Mid) after the DCP entry, the 80 ms settle before the wire
+    /// detection exchange, with the line levels verified.
+    AfcPromoting { since: u64, target: u16 },
+    /// The AFC identification exchange runs (one blocking exchange).
+    AfcDetecting { target: u16 },
+    /// An AFC session: requests sent, output followed on VBUS.
+    AfcActive {
+        session: afc::Session,
+        target: u16,
+        follow: Option<Follow>,
+        decided: bool,
+    },
 }
 
 fn update(
@@ -234,7 +279,7 @@ fn update(
     now: u64,
     request: Request,
     commit: bool,
-    _dp_mv: Option<u16>,
+    dp_mv: Option<u16>,
     dm_mv: Option<u16>,
     vbus_mv: u32,
 ) -> State {
@@ -243,7 +288,10 @@ fn update(
             if !commit {
                 return State::Off;
             }
-            if request == Request::Fixed(Voltage::V5) {
+            if matches!(
+                request,
+                Request::Fixed(Voltage::V5) | Request::Afc(5000)
+            ) {
                 // 5 V is the restore request; with the lines released
                 // there is nothing to drive.
                 log(b"[qc] off: released (5v default)\r\n");
@@ -307,7 +355,21 @@ fn update(
                 Progress::Waiting(handshake) => State::Entering(handshake, entry_request),
                 Progress::Ready(session) => {
                     log(b"[qc] entry ready\r\n");
-                    dispatch(session, entry_request, now, vbus_mv)
+                    match entry_request {
+                        // r198: the AFC wire flow takes over HERE (kws-x1
+                        // discards the QC session the same way) — D+ stays
+                        // at Mid (the AFC data level), D− stays released.
+                        Request::Afc(target) => {
+                            log_dec(
+                                b"[afc] promoting target=",
+                                &[u32::from(target)],
+                                &[b"mV\r\n"],
+                            );
+                            STATE.store(STATE_AFC_DETECT, Ordering::Relaxed);
+                            State::AfcPromoting { since: now, target }
+                        }
+                        _ => dispatch(session, entry_request, now, vbus_mv),
+                    }
                 }
                 Progress::Failed(failure) => {
                     let name: &[u8] = match failure {
@@ -472,6 +534,185 @@ fn update(
             STATE.store(STATE_OFF, Ordering::Relaxed);
             State::Off
         }
+        // --- r198: the AFC wire flow (kws-x1's Promoting/Detecting/Output) ---
+        State::AfcPromoting { since, target } => {
+            // kws-x1's DP_SETTLE_MS: the charger needs D+ stable at the
+            // data level before the wire exchange.
+            if now.saturating_sub(since) < DP_SETTLE_MS {
+                return State::AfcPromoting { since, target };
+            }
+            // Verify like kws-x1: D+ in the AFC window, D− idle-low, and
+            // the output still at its default 5 V.
+            let dp_ok = dp_mv.is_some_and(|v| (500..=700).contains(&v));
+            let dm_ok = dm_mv.is_some_and(|v| v <= 600);
+            let in_window = ENTRY_VBUS_WINDOW.contains(&vbus_mv);
+            if !dp_ok || !dm_ok || !in_window {
+                log_dec(
+                    b"[afc] promote fail dp=",
+                    &[u32::from(dp_mv.unwrap_or(0)), u32::from(dm_mv.unwrap_or(0)), vbus_mv],
+                    &[b" dm=", b" vbus=", b"\r\n"],
+                );
+                FAILURE.store(4, Ordering::Relaxed);
+                STATE.store(STATE_FAILED, Ordering::Relaxed);
+                release_lines();
+                return State::Off;
+            }
+            STATE.store(STATE_AFC_DETECT, Ordering::Relaxed);
+            State::AfcDetecting { target }
+        }
+        State::AfcDetecting { target } => {
+            // One identification exchange (blocking; the crate's retry
+            // policy bounds it, ~60 ms worst case).
+            let mut phy = DmWire;
+            let mut detection = afc::Detection::new();
+            match detection.poll(&mut phy) {
+                Ok(_) => {
+                    log(b"[afc] adapter answered\r\n");
+                    let session = afc::Session::start(afc::Adapter, afc_voltage(target));
+                    STATE.store(STATE_AFC, Ordering::Relaxed);
+                    State::AfcActive {
+                        session,
+                        target,
+                        follow: None,
+                        decided: false,
+                    }
+                }
+                Err(error) => {
+                    // Timeout without ever answering = a silent (non-AFC)
+                    // adapter; anything else is wire damage.
+                    let silent = matches!(
+                        error,
+                        single_wire_protocols::Error::Timeout
+                    ) && !detection.answered();
+                    let name: &[u8] = if silent { b"SILENT" } else { b"WIRE" };
+                    let mut d = [0u8; 64];
+                    let mut n = 0;
+                    for &b in b"[afc] fail " {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    d[n..n + name.len()].copy_from_slice(name);
+                    n += name.len();
+                    for &b in b"\r\n" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    log(&d[..n]);
+                    FAILURE.store(if silent { 3 } else { 4 }, Ordering::Relaxed);
+                    STATE.store(STATE_FAILED, Ordering::Relaxed);
+                    release_lines();
+                    State::Off
+                }
+            }
+        }
+        State::AfcActive {
+            mut session,
+            target,
+            mut follow,
+            mut decided,
+        } => {
+            if commit {
+                match request {
+                    Request::Afc(t) if t != target => {
+                        if t < 9000 {
+                            // Stop: queue + send the 5 V request, then the
+                            // crate's 100-UI reset pulse, then release.
+                            session.stop();
+                            let mut phy = DmWire;
+                            let _ = session.poll(&mut phy);
+                            let _ = afc::reset(&mut phy);
+                            release_lines();
+                            log(b"[afc] stop: 5v + reset\r\n");
+                            STATE.store(STATE_OFF, Ordering::Relaxed);
+                            return State::Stopping(now);
+                        }
+                        let _ = session.set(AfcVoltage::V9);
+                        log(b"[afc] req 9v\r\n");
+                        STATE.store(STATE_AFC, Ordering::Relaxed);
+                        return State::AfcActive {
+                            session,
+                            target: t,
+                            follow: None,
+                            decided: false,
+                        };
+                    }
+                    _ => {
+                        // A commit from another screen: stop AFC first
+                        // (a fresh entry is needed for any QC flow — the
+                        // QC session was consumed at the wire takeover).
+                        let mut phy = DmWire;
+                        let _ = afc::reset(&mut phy);
+                        release_lines();
+                        log(b"[afc] switch: stopped (re-commit to enter QC)\r\n");
+                        STATE.store(STATE_OFF, Ordering::Relaxed);
+                        return State::Off;
+                    }
+                }
+            }
+            // Send the pending request (the initial one or a retarget's).
+            if session.busy() {
+                let mut phy = DmWire;
+                match session.poll(&mut phy) {
+                    Ok(()) => {
+                        log_dec(
+                            b"[afc] req ",
+                            &[u32::from(target / 1000)],
+                            &[b"v sent\r\n"],
+                        );
+                        if vbus_mv != 0 {
+                            OUTCOME.store(1, Ordering::Relaxed);
+                            follow = Some(Follow::start(
+                                now,
+                                u16::try_from(vbus_mv).unwrap_or(u16::MAX),
+                                target,
+                            ));
+                            decided = false;
+                        }
+                    }
+                    Err(_) => {
+                        log(b"[afc] fail WIRE\r\n");
+                        FAILURE.store(4, Ordering::Relaxed);
+                        STATE.store(STATE_FAILED, Ordering::Relaxed);
+                        release_lines();
+                        return State::Off;
+                    }
+                }
+            }
+            // Follow the output (same verdicts as the QC Active flow).
+            let (follow, decided) = if let (Some(f), false) = (follow, decided) {
+                match f.poll(now, u16::try_from(vbus_mv).unwrap_or(u16::MAX)) {
+                    Outcome::Waiting => (Some(f), false),
+                    Outcome::Followed => {
+                        log(b"[afc] follow: output followed\r\n");
+                        OUTCOME.store(2, Ordering::Relaxed);
+                        (None, true)
+                    }
+                    Outcome::Ignored => {
+                        log(b"[afc] follow: output ignored\r\n");
+                        OUTCOME.store(3, Ordering::Relaxed);
+                        (None, true)
+                    }
+                }
+            } else {
+                (follow, decided)
+            };
+            STATE.store(STATE_AFC, Ordering::Relaxed);
+            State::AfcActive {
+                session,
+                target,
+                follow,
+                decided,
+            }
+        }
+    }
+}
+
+/// The AFC voltage for a mV target (the two AFC requests).
+fn afc_voltage(target_mv: u16) -> AfcVoltage {
+    if target_mv >= 9000 {
+        AfcVoltage::V9
+    } else {
+        AfcVoltage::V5
     }
 }
 
@@ -480,6 +721,15 @@ fn update(
 /// and steps toward it.
 fn dispatch(session: Session, request: Request, now: u64, vbus_mv: u32) -> State {
     match request {
+        // AFC never reaches dispatch (the wire takeover routes at the
+        // handshake); this arm is the honest unreachable guard.
+        Request::Afc(_) => {
+            let _ = session;
+            log(b"[qc] internal: afc in dispatch\r\n");
+            release_lines();
+            STATE.store(STATE_OFF, Ordering::Relaxed);
+            State::Off
+        }
         Request::Fixed(Voltage::V5) => {
             let (dp, dm) = session.request(Voltage::V5);
             let (dp_mv, dm_mv) = drive_request(dp, dm);

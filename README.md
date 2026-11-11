@@ -196,7 +196,7 @@ mailbox — the vendor `custom_hid` class as a template), `fnb58_usb.c`
 picks the class at boot (`fnb58_usb_init_hid`), and the Rust
 main loop samples the meter and builds the reports.
 
-## QC2.0/QC3.0 trigger (r189–r197) — hardware-verified
+## QC2.0/QC3.0/AFC trigger (r189–r198)
 
 The QC screen (3rd in the LEFT/RIGHT cycle) triggers QC2 voltages
 5/9/12/20 V; the QC3 screen (4th) triggers continuous-mode targets in
@@ -226,6 +226,13 @@ crate (pure logic, host-tested); the board layer is `dac.rs`
   1 ms) moves the output 200 mV. Leaving continuous = the 5 V pair
   HELD (a sustained pair outlasts the pulse filter, so the charger
   reads it as a fixed request and exits) before the next request.
+- **AFC** (r198, the 5th screen): Samsung Adaptive Fast Charging over
+  the same front end — after the DCP handshake, D+ stays at 0.6 V and
+  a single-wire exchange runs on D− (the vendored
+  `single-wire-protocols` crate; 160 µs UI, DWT-cycle-counter timing,
+  cached DAC codes and a fast single-conversion tap read for the wire
+  budget). Requests: 5 V / 9 V only. Failures named: `SILENT` = the
+  charger has no AFC, `WIRE` = a damaged exchange.
 - **Verification is closed-loop**: the request levels are read back on
   the taps (screen + diag `dp=`/`dm=`) and the output is followed on
   the published TPA626 bus voltage (`vb=`) — `FOLLOWED`/`IGNORED`
@@ -234,7 +241,10 @@ crate (pure logic, host-tested); the board layer is `dac.rs`
 The `run-bootloader` console command (r184–r188, BPR battery-domain
 cookie + the BPR *peripheral clock* fix) reboots into the update
 bootloader without the OK button; `tools/fnb58-flash.py` installs a
-new app over the bootloader's CDC link.
+new app over the bootloader's CDC link — and (r198) when it finds the
+tester in log mode it sends `run-bootloader` itself, waits for the
+re-enumeration (rescanning if Windows renumbers the COM port) and
+flashes: one command from any state.
 
 ## Build and flash
 

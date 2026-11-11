@@ -15,7 +15,15 @@
 //! to the pad regardless of the GPIO mode on this part. Release is now
 //! CHANNEL DISABLE (`d1en`/`d2en` clear = power-down, output Hi-Z); the
 //! pads stay analog permanently and the pad mode is never touched.
+//!
+//! r198 FAST PATH: the single-wire (AFC) wire layer's hold() guard gives
+//! drives a fraction of a 160 µs UI — a per-drive VREFINT ADC pass
+//! (hundreds of µs) cannot run there. The High/Mid codes are computed
+//! ONCE at init from the measured VDDA and cached; `drive_fast` (boolean
+//! level) and `release` are pure register writes. The QC paths keep the
+//! Level-based `drive`, now also on the cached codes.
 
+use core::sync::atomic::{AtomicU16, Ordering};
 use embassy_at32::gpio::{AnalogPin, Port};
 use embassy_at32::pac;
 use qc_protocol::qc2::Level;
@@ -37,11 +45,23 @@ pub fn level_mv(level: Level) -> u32 {
     }
 }
 
-/// Enable the DAC clock, put PA4/PA5 in analog mode, and configure both
-/// channels with the output buffers ON but the CHANNELS DISABLED
-/// (r194: an enabled channel drives its pad in every GPIO mode — the
-/// r193 release-by-pad-mode left code-0 outputs crushing both data
-/// lines to ~0 V). Call once before the QC task's first drive.
+/// Cached 12-bit codes (r198): computed once at init against the
+/// measured VDDA. VDDA drift within a session is far inside the QC
+/// comparator windows, and every driven level is ADC-verified anyway.
+static CODE_MID: AtomicU16 = AtomicU16::new(745); // 600 mV at 3.3 V
+static CODE_HIGH: AtomicU16 = AtomicU16::new(4095); // rail
+
+fn code_for(mv: u32, vdda_mv: u32) -> u16 {
+    if vdda_mv == 0 {
+        return 0;
+    }
+    ((mv * 4095) / vdda_mv).min(4095) as u16
+}
+
+/// Enable the DAC clock, put PA4/PA5 in analog mode, cache the level
+/// codes from the measured VDDA, and configure both channels with the
+/// output buffers ON but the CHANNELS DISABLED (r194: an enabled channel
+/// drives its pad in every GPIO mode). Call once before the first drive.
 pub fn init() {
     let crm = unsafe { pac::at32f403a::CRM::steal() };
     crm.apb1en().modify(|_, w| w.dac().set_bit());
@@ -49,6 +69,12 @@ pub fn init() {
     // SAFETY: exclusive-startup contract — the QC task owns PA4/PA5.
     unsafe { AnalogPin::new(Port::A, 4).expect("PA4 claim") };
     unsafe { AnalogPin::new(Port::A, 5).expect("PA5 claim") };
+
+    // r198: one VDDA pass here (ADC1 is up — adc::init runs first at
+    // boot); every later drive is a pure register write.
+    let vdda = crate::adc::vdda_mv().unwrap_or(3300);
+    CODE_MID.store(code_for(600, vdda), Ordering::Relaxed);
+    CODE_HIGH.store(code_for(3300, vdda), Ordering::Relaxed);
 
     let dac = unsafe { pac::at32f403a::DAC::steal() };
     dac.ctrl().modify(|_, w| {
@@ -59,23 +85,53 @@ pub fn init() {
     });
 }
 
-/// Drive one line to `Some(level)` (write the code, then enable the
-/// channel — the buffer starts driving at that level; returns the
-/// applied mV for logging) or `None` (release: channel power-down, the
-/// pad stays analog and the line returns to the charger).
+/// Drive one line to `Some(level)` (cached code, then channel enable —
+/// the buffer starts at that level; returns the applied mV for logging)
+/// or `None` (release: channel power-down, the line returns to the
+/// charger).
 pub fn drive(line: Line, level: Option<Level>) -> u32 {
-    let dac = unsafe { pac::at32f403a::DAC::steal() };
     let Some(level) = level else {
-        match line {
-            Line::Dm => dac.ctrl().modify(|_, w| w.d1en().clear_bit()),
-            Line::Dp => dac.ctrl().modify(|_, w| w.d2en().clear_bit()),
-        };
+        release(line);
         return 0;
     };
-    let vdda = crate::adc::vdda_mv().unwrap_or(3300);
-    let code = code_for(level_mv(level), vdda);
+    let applied = level_mv(level);
+    let code = match level {
+        Level::Low => 0,
+        Level::Mid => CODE_MID.load(Ordering::Relaxed),
+        Level::High => CODE_HIGH.load(Ordering::Relaxed),
+    };
+    write_code(line, code);
+    applied
+}
+
+/// Fast boolean drive for the single-wire paths: high = cached High code,
+/// low = code 0. Pure register writes — safe inside a ¼-UI hold.
+pub fn drive_fast(line: Line, high: bool) {
+    let code = if high {
+        CODE_HIGH.load(Ordering::Relaxed)
+    } else {
+        0
+    };
+    write_code(line, code);
+}
+
+/// Release one line: channel power-down (r194), output Hi-Z.
+pub fn release(line: Line) {
+    let dac = unsafe { pac::at32f403a::DAC::steal() };
     match line {
-        // Code first, then enable: the buffer starts at the right level.
+        Line::Dm => {
+            dac.ctrl().modify(|_, w| w.d1en().clear_bit());
+        }
+        Line::Dp => {
+            dac.ctrl().modify(|_, w| w.d2en().clear_bit());
+        }
+    }
+}
+
+/// Code first, then enable: the buffer starts driving at the code.
+fn write_code(line: Line, code: u16) {
+    let dac = unsafe { pac::at32f403a::DAC::steal() };
+    match line {
         Line::Dm => {
             dac.d1dth12r().write(|w| unsafe { w.d1dt12r().bits(code) });
             dac.ctrl().modify(|_, w| w.d1en().set_bit());
@@ -84,13 +140,5 @@ pub fn drive(line: Line, level: Option<Level>) -> u32 {
             dac.d2dth12r().write(|w| unsafe { w.d2dt12r().bits(code) });
             dac.ctrl().modify(|_, w| w.d2en().set_bit());
         }
-    };
-    level_mv(level)
-}
-
-fn code_for(mv: u32, vdda_mv: u32) -> u16 {
-    if vdda_mv == 0 {
-        return 0;
     }
-    ((mv * 4095) / vdda_mv).min(4095) as u16
 }

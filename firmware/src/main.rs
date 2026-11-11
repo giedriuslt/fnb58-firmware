@@ -23,6 +23,7 @@ mod board;
 mod adc;
 mod console;
 mod dac;
+mod afc_phy;
 mod pd_phy;
 mod pd_task;
 mod qc_task;
@@ -43,7 +44,7 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r197";
+const BUILD: &[u8] = b"r198";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -183,7 +184,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r197 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r198 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -256,7 +257,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r197 " {
+                for &b in b"r198 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -360,7 +361,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r197: contract reporting\r\n");
+    say(b"[lcd] FNB58 r198: contract reporting\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -721,6 +722,10 @@ async fn main(spawner: Spawner) {
         if ui.screen == Screen::Qc3 && !pd_task::BUSY.load(Ordering::Relaxed) {
             ui.draw_qc3(&mut lcd).await;
         }
+        // r198: the AFC screen — same gate.
+        if ui.screen == Screen::Afc && !pd_task::BUSY.load(Ordering::Relaxed) {
+            ui.draw_afc(&mut lcd).await;
+        }
 
         // Buttons: debounced active-low (50 ms at this cadence); events
         // to the console queue, presses drive the UI screens.
@@ -768,6 +773,9 @@ async fn main(spawner: Spawner) {
                     } else if ui.screen == Screen::Qc3 {
                         qc_task::commit_continuous();
                         sender.push(b"[qc3] commit\r\n");
+                    } else if ui.screen == Screen::Afc {
+                        qc_task::commit_afc();
+                        sender.push(b"[afc] commit\r\n");
                     } else if pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) {
                         pd_task::commit_desired();
                         sender.push(b"[pd] commit\r\n");
@@ -788,6 +796,10 @@ async fn main(spawner: Spawner) {
                         Screen::Qc3 => (
                             b"[qc3] tgt=",
                             u32::from(qc_task::cycle_m3_target(dir)),
+                        ),
+                        Screen::Afc => (
+                            b"[afc] tgt=",
+                            u32::from(qc_task::cycle_afc_target(dir)),
                         ),
                         _ => (b"[pd] tgt=", u32::from(pd_task::cycle_desired(dir))),
                     };

@@ -21,7 +21,7 @@ bench = false
 
 [dependencies]
 cortex-m = { workspace = true, features = ["critical-section-single-core"] }
-cortex-m-rt = { workspace = true, features = ["paint-stack"] }
+cortex-m-rt.workspace = true
 embassy-at32.workspace = true
 embassy-executor.workspace = true
 embassy-time.workspace = true
@@ -29,6 +29,7 @@ embassy-sync.workspace = true
 embedded-hal-async.workspace = true
 fusb302-pd.workspace = true
 qc-protocol.workspace = true
+single-wire-protocols.workspace = true
 pd-protocol.workspace = true
 usbpd.workspace = true
 usbpd-traits.workspace = true

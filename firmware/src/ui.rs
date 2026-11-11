@@ -24,10 +24,18 @@ pub enum Screen {
     Qc,
     /// r196: the QC3.0 continuous screen (target in mV, 200 mV steps).
     Qc3,
+    /// r198: the AFC screen (5 V / 9 V single-wire requests).
+    Afc,
 }
 
 /// The screen cycle order (LEFT/RIGHT walk it in both directions).
-const SCREEN_CYCLE: [Screen; 4] = [Screen::Power, Screen::Pd, Screen::Qc, Screen::Qc3];
+const SCREEN_CYCLE: [Screen; 5] = [
+    Screen::Power,
+    Screen::Pd,
+    Screen::Qc,
+    Screen::Qc3,
+    Screen::Afc,
+];
 
 fn next_screen(screen: Screen, dir: i16) -> Screen {
     let i = SCREEN_CYCLE.iter().position(|&s| s == screen).unwrap_or(0);
@@ -76,6 +84,10 @@ pub struct Ui {
     /// r196: the QC3 screen's static-layer cache (state + target).
     qc3_state: u8,
     qc3_tgt: u16,
+    /// r198: the AFC screen's caches (same pattern as the QC screens).
+    afc_state: u8,
+    afc_tgt: u16,
+    afc_dyn_at: u32,
 }
 
 /// Draw a NUL-terminated copy of `s` (truncated to fit the buffer).
@@ -104,6 +116,9 @@ impl Ui {
             qc3_dyn_at: 0,
             qc3_state: 0xFF,
             qc3_tgt: 0xFFFF,
+            afc_state: 0xFF,
+            afc_tgt: 0xFFFF,
+            afc_dyn_at: 0,
         }
     }
 
@@ -137,11 +152,12 @@ impl Ui {
             }
             // r196 fix: the OK arm missed Screen::Qc3 — on that screen OK
             // fell through to Press::None (a dead button; four presses,
-            // zero commits in the first hardware log).
+            // zero commits in the first hardware log). r198: Afc joined
+            // the list up front.
             buttons::OK
                 if matches!(
                     self.screen,
-                    Screen::Pd | Screen::Qc | Screen::Qc3
+                    Screen::Pd | Screen::Qc | Screen::Qc3 | Screen::Afc
                 ) =>
             {
                 if self.selecting {
@@ -165,25 +181,31 @@ impl Ui {
         self.pd_phase = 0xFF;
         self.qc_state = 0xFF;
         self.qc3_state = 0xFF;
+        self.afc_state = 0xFF;
         lcd.fill(BLACK).await;
         match screen {
             Screen::Power => {
                 text(lcd, 8, 8, b"POWER", 2, WHITE).await;
-                text(lcd, 272, 8, b"1/4", 2, GRAY).await;
+                text(lcd, 272, 8, b"1/5", 2, GRAY).await;
             }
             Screen::Pd => {
                 text(lcd, 8, 8, b"PPS", 2, WHITE).await;
-                text(lcd, 272, 8, b"2/4", 2, GRAY).await;
+                text(lcd, 272, 8, b"2/5", 2, GRAY).await;
                 self.draw_hint(lcd).await;
             }
             Screen::Qc => {
                 text(lcd, 8, 8, b"QC", 2, WHITE).await;
-                text(lcd, 272, 8, b"3/4", 2, GRAY).await;
+                text(lcd, 272, 8, b"3/5", 2, GRAY).await;
                 self.draw_hint(lcd).await;
             }
             Screen::Qc3 => {
                 text(lcd, 8, 8, b"QC3", 2, WHITE).await;
-                text(lcd, 272, 8, b"4/4", 2, GRAY).await;
+                text(lcd, 272, 8, b"4/5", 2, GRAY).await;
+                self.draw_hint(lcd).await;
+            }
+            Screen::Afc => {
+                text(lcd, 8, 8, b"AFC", 2, WHITE).await;
+                text(lcd, 272, 8, b"5/5", 2, GRAY).await;
                 self.draw_hint(lcd).await;
             }
         }
@@ -438,6 +460,118 @@ impl Ui {
         }
         n = crate::push_dec(&mut line, n, u32::from(dm));
         while n < 28 {
+            line[n] = b' ';
+            n += 1;
+        }
+        line[n] = 0;
+        lcd.draw_text(8, 168, &line, 2, GREEN, BLACK).await;
+
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        for &b in b"VB " {
+            line[n] = b;
+            n += 1;
+        }
+        n = crate::push_dec(&mut line, n, u32::from(vb));
+        while n < 8 {
+            line[n] = b' ';
+            n += 1;
+        }
+        for &b in b"mV" {
+            line[n] = b;
+            n += 1;
+        }
+        line[n] = 0;
+        lcd.draw_text(8, 196, &line, 2, WHITE, BLACK).await;
+    }
+
+    /// r198: the AFC screen — target (5 V/9 V), state, failure reason,
+    /// the line taps and the output. Same flicker-free split.
+    pub async fn draw_afc(&mut self, lcd: &mut Lcd) {
+        use core::sync::atomic::Ordering;
+        let state = crate::qc_task::STATE.load(Ordering::Relaxed);
+        let failure = crate::qc_task::FAILURE.load(Ordering::Relaxed);
+        let tgt = crate::qc_task::AFC_TARGET.load(Ordering::Relaxed);
+        let dp = crate::qc_task::DP_MV.load(Ordering::Relaxed);
+        let dm = crate::qc_task::DM_MV.load(Ordering::Relaxed);
+        let vb = crate::qc_task::VBUS_MV.load(Ordering::Relaxed);
+        let statics_changed = state != self.afc_state || tgt != self.afc_tgt;
+        let now = embassy_time::Instant::now().as_millis() as u32;
+        let dyn_due = now.wrapping_sub(self.afc_dyn_at) >= 200;
+        if !statics_changed && !dyn_due {
+            return;
+        }
+        if statics_changed {
+            self.afc_state = state;
+            self.afc_tgt = tgt;
+            lcd.fill_window(0, 32, 319, 210, BLACK).await;
+
+            // The next OK requests exactly this target.
+            let mut line = [0u8; 24];
+            let mut n = 0;
+            for &b in b"TGT " {
+                line[n] = b;
+                n += 1;
+            }
+            n = crate::push_dec(&mut line, n, u32::from(tgt / 1000));
+            line[n] = b'V';
+            n += 1;
+            line[n] = 0;
+            text(lcd, 8, 48, &line, 2, YELLOW).await;
+
+            // State row: the shared STATE machine, AFC-labeled
+            // (6 = the wire detection exchange, 7 = the AFC session).
+            const STATES: [&[u8]; 8] = [
+                b"OFF", b"RELEASE", b"ENTRY", b"ACTIVE", b"FAIL", b"STEP", b"DETECT", b"AFC",
+            ];
+            let name = STATES.get(state as usize).copied().unwrap_or(b"?");
+            let mut line = [0u8; 24];
+            let mut n = 0;
+            for &b in b"AFC " {
+                line[n] = b;
+                n += 1;
+            }
+            line[n..n + name.len()].copy_from_slice(name);
+            n += name.len();
+            line[n] = 0;
+            text(lcd, 8, 88, &line, 3, WHITE).await;
+
+            // Failure reasons: the QC names plus the AFC-specific codes
+            // (3 = SILENT, 4 = wire/promote damage).
+            let detail: &[u8] = match (state, failure) {
+                (4, 1) => b"FAIL NODCP",
+                (4, 2) => b"FAIL NOENTRY",
+                (4, 3) => b"FAIL SILENT",
+                (4, 4) => b"FAIL WIRE",
+                _ => b"",
+            };
+            if !detail.is_empty() {
+                let mut line = [0u8; 24];
+                line[..detail.len()].copy_from_slice(detail);
+                line[detail.len()] = 0;
+                text(lcd, 8, 132, &line, 2, CYAN).await;
+            }
+        }
+        self.afc_dyn_at = now;
+
+        // The dynamic rows, in place (fixed-width, space-padded).
+        let mut line = [0u8; 32];
+        let mut n = 0;
+        for &b in b"DP " {
+            line[n] = b;
+            n += 1;
+        }
+        n = crate::push_dec(&mut line, n, u32::from(dp));
+        while n < 12 {
+            line[n] = b' ';
+            n += 1;
+        }
+        for &b in b"DM " {
+            line[n] = b;
+            n += 1;
+        }
+        n = crate::push_dec(&mut line, n, u32::from(dm));
+        while n < 20 {
             line[n] = b' ';
             n += 1;
         }

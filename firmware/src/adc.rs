@@ -60,16 +60,19 @@ pub fn init() {
         w.adcen().enable()
     });
 
-    // CH16/CH17 sample time 239.5 cycles (sensor needs the long window).
+    // r189: CH16/CH17 keep the long window (sensor needs it). r198: the
+    // CH2/CH3 data-line taps drop to a 13.5-cycle window — the
+    // single-wire (AFC) wire layer's sample guard is 8 µs, and one
+    // conversion at 13.5+12.5 = 26 cycles @ 12 MHz is ≈ 2.2 µs; the 1 kΩ
+    // tap source is stiff enough for the short window (the QC 4-sample
+    // mean tolerates the small noise cost).
     adc.spt1().modify(|_, w| unsafe {
         w.cspt16().bits(0b111);
         w.cspt17().bits(0b111)
     });
-    // r189: CH2/CH3 (the QC data-line taps, PA2/PA3 through 1 kΩ) get the
-    // same long window — the tap cadence is tens of Hz, speed is free.
     adc.spt2().modify(|_, w| unsafe {
-        w.cspt2().bits(0b111);
-        w.cspt3().bits(0b111)
+        w.cspt2().bits(0b010);
+        w.cspt3().bits(0b010)
     });
     // Ordinary sequence length 1; the channel is written per read.
     adc.osq1().modify(|_, w| unsafe { w.oclen().bits(0) });
@@ -128,6 +131,13 @@ pub fn read_line_mv(ch: u8) -> Option<u16> {
         sum += u32::from(read_raw(ch)?);
     }
     Some((sum * vdda / 4095 / 4) as u16)
+}
+
+/// r198: one raw tap conversion (counts, ≈2.2 µs) for the single-wire
+/// sampler — no VREFINT pass, no averaging. The caller thresholds the
+/// counts directly (the wire levels are 0 and ~VDDA, far from mid).
+pub fn read_tap_raw(ch: u8) -> Option<u16> {
+    read_raw(ch)
 }
 
 /// Internal die temperature in tenths of a degree C, measured against

@@ -15,6 +15,9 @@ fusb302-pd = { path = "fusb302-pd" }
 # r189: the QC2.0 trigger consumes the vendored pure-logic crate
 # (handshake/requests/follow — the same one kws-x1 drives).
 qc-protocol = { path = "pd-protocol-debug/qc-protocol" }
+# r198: the AFC trigger consumes the single-wire-protocols crate
+# (AFC/SCP/FCP detection and output control — the same family kws-x1 uses).
+single-wire-protocols = { git = "https://github.com/kralonur/embedded-charging-protocols-rs", rev = "cdd1101" }
 # The sink engine (Selection/Trial/Limits) and the driver traits, pinned to
 # the revisions kws-x1 ships against.
 pd-protocol = { git = "https://github.com/kralonur/embedded-charging-protocols-rs", rev = "2c3d511cb7214f1db9f5e3528900e1fd9d1bc323" }

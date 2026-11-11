@@ -40,6 +40,7 @@ import zlib
 
 try:
     import serial  # pyserial; pip install pyserial
+    import serial.tools.list_ports
 except ImportError:
     sys.exit("pyserial missing: pip install pyserial")
 
@@ -88,6 +89,28 @@ def flush_input(ser):
     _rx_leftover = bytearray()
 
 
+def wait_for_port(port, timeout_s):
+    """Wait for the CDC port to (re)appear after a reboot. Returns an open
+    handle; prefers the original COM name, falls back to any 2E3C:5740
+    device if the OS renumbered it."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        try:
+            return serial.Serial(port, 115200, timeout=0.1)
+        except serial.SerialException:
+            pass
+        # The reboot may have renumbered the port: scan for the device.
+        try:
+            for p in serial.tools.list_ports.comports():
+                if p.vid == 0x2E3C and p.pid == 0x5740 and p.device != port:
+                    print(f"port renumbered: {port} -> {p.device}")
+                    return serial.Serial(p.device, 115200, timeout=0.1)
+        except Exception:
+            pass
+    sys.exit(f"FATAL: {port} never came back after the reboot")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("port", help="COM port of the device (bootloader or console)")
@@ -103,7 +126,38 @@ def main():
     # Identify FIRST. The app console will not answer with [bl].
     flush_input(ser)
     ser.write(b"INFO\n")
-    info = expect(ser, b"[bl] INFO ", timeout_s=5.0)
+    line = read_line(ser, 5.0)
+    if line is None or not line.startswith(b"[bl] INFO "):
+        # r198: the tester is probably in LOG (app console) mode — it answers
+        # INFO with the echo '[flash] cmd: I N F O' and heartbeats. Reboot it
+        # into the bootloader via the run-bootloader command, then wait for
+        # the CDC re-enumeration and re-identify.
+        print("not in bootloader mode - requesting run-bootloader")
+        ser.write(b"run-bootloader\n")
+        # The ack is '[app] bootloader requested rb=.., rebooting'; the port
+        # then detaches as the device resets.
+        deadline = time.monotonic() + 5.0
+        acked = False
+        while time.monotonic() < deadline:
+            l = read_line(ser, 0.5)
+            if l and b"bootloader requested" in l:
+                acked = True
+                break
+        if not acked:
+            # The port may already have detached mid-read; that also counts.
+            print("no ack seen (port may have detached) - continuing")
+        ser.close()
+        # Wait for the CDC to come back (same VID/PID; the OS may renumber
+        # the COM port, so re-scan if the original does not return).
+        ser = wait_for_port(args.port, 20.0)
+        flush_input(ser)
+        ser.write(b"INFO\n")
+        line = read_line(ser, 5.0)
+    if line is None:
+        sys.exit("FATAL: no response from device after reboot attempt")
+    if not line.startswith(b"[bl] INFO "):
+        sys.exit(f"FATAL: unexpected response {line!r} (expected '[bl] INFO ')")
+    info = line
     print(info.decode("ascii", "replace"))
 
     if args.info_only:
