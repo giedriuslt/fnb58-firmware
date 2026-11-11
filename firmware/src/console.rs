@@ -245,6 +245,13 @@ pub(crate) fn push_hex8(buf: &mut [u8], pos: usize, v: u32) -> usize {
     pos + 2
 }
 
+/// r200: four hex digits — a full 16-bit register (push_hex8 prints
+/// only the low byte; register dumps need the whole value).
+pub(crate) fn push_hex16(buf: &mut [u8], pos: usize, v: u32) -> usize {
+    let pos = push_hex8(buf, pos, v >> 8);
+    push_hex8(buf, pos, v)
+}
+
 /// Send one line directly, retrying while the previous USB packet is
 /// still in flight (bounded).
 pub(crate) fn send_direct(line: &[u8]) {

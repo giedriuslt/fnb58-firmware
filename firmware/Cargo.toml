@@ -34,3 +34,5 @@ pd-protocol.workspace = true
 usbpd.workspace = true
 usbpd-traits.workspace = true
 heapless = "0.9"
+# r199: the ripple analysis crate (kws-x1's firmware-core split, ported).
+ripple-core.workspace = true

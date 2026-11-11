@@ -27,6 +27,7 @@ mod afc_phy;
 mod pd_phy;
 mod pd_task;
 mod qc_task;
+mod ripple;
 mod buttons;
 mod buzzer;
 mod flash;
@@ -44,7 +45,7 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r198";
+const BUILD: &[u8] = b"r207";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -184,7 +185,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r198 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r207 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -257,7 +258,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r198 " {
+                for &b in b"r207 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -340,6 +341,9 @@ async fn main(spawner: Spawner) {
         // r189: the QC2.0 trigger task — DAC drive + ADC verify on the
         // traced data-line front end (board.rs).
         spawner.spawn(qc_task::run().expect("one qc task"));
+        // r199: the ripple scope task — dedicated ADC2 + DMA1 channel 3
+        // on PA6 (ripple.rs).
+        spawner.spawn(ripple::run().expect("one ripple task"));
     }
 
     // Unmask USB interrupt lines.
@@ -361,7 +365,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r198: contract reporting\r\n");
+    say(b"[lcd] FNB58 r207: dtd direction fix\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -543,6 +547,10 @@ async fn main(spawner: Spawner) {
     // and renders pd_task::VIEW.
 
     let mut tick: u32 = 0;
+    // r199: the ripple capture stream — the task publishes, this loop
+    // consumes (kws-x1 main.rs:1066-1069's receiver + held reading).
+    let mut ripple_updates = ripple::RIPPLE.anon_receiver();
+    let mut ripple_reading: Option<ripple_core::ripple::Reading> = None;
     // LEXT probe: enable the 32.768 kHz crystal oscillator on PC14/PC15
     // and wait for its stable flag. If the board has the RTC crystal
     // footprint populated, lextstblf sets within a second; with nothing
@@ -726,6 +734,20 @@ async fn main(spawner: Spawner) {
         if ui.screen == Screen::Afc && !pd_task::BUSY.load(Ordering::Relaxed) {
             ui.draw_afc(&mut lcd).await;
         }
+        // r199: the ripple screen — same BUSY gate (the capture itself
+        // is DMA-driven and needs no executor; only the draw blocks).
+        if ui.screen == Screen::Ripple && !pd_task::BUSY.load(Ordering::Relaxed) {
+            // kws-x1 main.rs:1282-1286: take the latest capture unless
+            // held (the task stops publishing while held anyway).
+            if let Some(update) = ripple_updates.try_changed() {
+                if !ui.ripple_hold {
+                    ripple_reading = update;
+                }
+            }
+            let reference = Some(ripple::REFERENCE.load(Ordering::Relaxed));
+            ui.draw_ripple(&mut lcd, ripple_reading.as_ref(), reference)
+                .await;
+        }
 
         // Buttons: debounced active-low (50 ms at this cadence); events
         // to the console queue, presses drive the UI screens.
@@ -816,10 +838,86 @@ async fn main(spawner: Spawner) {
                     }
                     sender.push(&d[..n]);
                 }
+                Press::RippleTime(dir) => {
+                    // r199/kws-x1 buttons.rs:1657: cycling the timebase
+                    // drops the hold (a held capture cannot be re-timed).
+                    let all = ripple_core::ripple::Timebase::ALL;
+                    let index = all
+                        .iter()
+                        .position(|&t| t == ui.ripple_timebase)
+                        .unwrap_or(0);
+                    let next = (index as i16 + dir).rem_euclid(all.len() as i16) as usize;
+                    ui.ripple_timebase = all[next];
+                    ui.ripple_hold = false;
+                    ripple::TIMEBASE.store(next as u8, Ordering::Relaxed);
+                    let mut d = [0u8; 32];
+                    let mut n = 0;
+                    for &b in b"[ripple] tb=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = push_dec(&mut d, n, u32::from(all[next].us_per_div()));
+                    for &b in b"us\r\n" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    sender.push(&d[..n]);
+                }
+                Press::RippleScale(dir) => {
+                    // r199/kws-x1 buttons.rs:1666.
+                    let all = ripple_core::ripple::Scale::ALL;
+                    let index = all
+                        .iter()
+                        .position(|&s| s == ui.ripple_scale)
+                        .unwrap_or(0);
+                    let next = (index as i16 + dir).rem_euclid(all.len() as i16) as usize;
+                    ui.ripple_scale = all[next];
+                    let mut d = [0u8; 32];
+                    let mut n = 0;
+                    for &b in b"[ripple] scale=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    match all[next].millivolts() {
+                        Some(mv) => n = push_dec(&mut d, n, u32::from(mv)),
+                        None => {
+                            for &b in b"auto" {
+                                d[n] = b;
+                                n += 1;
+                            }
+                        }
+                    }
+                    for &b in b"\r\n" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    sender.push(&d[..n]);
+                }
+                Press::RippleHold => {
+                    // r199/kws-x1 buttons.rs:1674.
+                    ui.ripple_hold = !ui.ripple_hold;
+                    let mut d = [0u8; 24];
+                    let mut n = 0;
+                    for &b in b"[ripple] hold=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    d[n] = b'0' + u8::from(ui.ripple_hold);
+                    n += 1;
+                    d[n] = b'\r';
+                    d[n + 1] = b'\n';
+                    sender.push(&d[..n + 2]);
+                }
                 Press::None => {}
             }
         }
         pd_task::BTN.store(held, Ordering::Relaxed);
+        // r199: captures run only on a live ripple screen (enter() also
+        // maintains this on screen switches).
+        ripple::LIVE.store(
+            ui.screen == Screen::Ripple && !ui.ripple_hold,
+            Ordering::Relaxed,
+        );
 
         // Orientation poll: 200 ms cadence; a flip must hold ~1 s before
         // the screen rotates (kws-x1's settle approach). r172: gated on
@@ -1069,6 +1167,88 @@ async fn main(spawner: Spawner) {
             d[n + 1] = b'\n';
             n += 2;
             sender.push(&d[..n]);
+
+            // r199: the ripple capture's own evidence line while its
+            // screen is shown — tb/pp/rms in the screen's units, plus
+            // the raw min/max (the PA6 diode node should idle around
+            // ~745 counts / 0.6 V) and the trigger verdict. 64-byte rule.
+            if ui.screen == Screen::Ripple {
+                let mut d = [0u8; 64];
+                let mut n = 0;
+                for &b in b"[ripple]" {
+                    d[n] = b;
+                    n += 1;
+                }
+                match (&ripple_reading, ripple::REFERENCE.load(Ordering::Relaxed)) {
+                    (Some(r), reference) => {
+                        for &b in b" tb=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        n = push_dec(&mut d, n, u32::from(r.timebase.us_per_div()));
+                        for &b in b" pp=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        // The estimator itself rejects a zero/saturated
+                        // reference (Some only when it is usable).
+                        match r.peak_to_peak_mv(reference, ripple::REFERENCE_MV) {
+                            Some(mv) => {
+                                n = push_dec(&mut d, n, u32::from(mv));
+                            }
+                            None => {
+                                for &b in b"--" {
+                                    d[n] = b;
+                                    n += 1;
+                                }
+                            }
+                        }
+                        for &b in b" rms=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        match r.rms_tenths_mv(reference, ripple::REFERENCE_MV) {
+                            Some(tenths) => {
+                                n = push_dec(&mut d, n, u32::from(tenths / 10));
+                                d[n] = b'.';
+                                d[n + 1] = b'0' + (tenths % 10) as u8;
+                                n += 2;
+                            }
+                            None => {
+                                for &b in b"--" {
+                                    d[n] = b;
+                                    n += 1;
+                                }
+                            }
+                        }
+                        for &b in b" mn=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        n = push_dec(&mut d, n, u32::from(r.min));
+                        for &b in b" mx=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        n = push_dec(&mut d, n, u32::from(r.max));
+                        for &b in b" tr=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        d[n] = b'0' + u8::from(r.triggered);
+                        n += 1;
+                    }
+                    _ => {
+                        for &b in b" no capture" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                    }
+                }
+                d[n] = b'\r';
+                d[n + 1] = b'\n';
+                sender.push(&d[..n + 2]);
+            }
         }
 
         // r139: pd_task console lines join the queue (behind the boot-ring
@@ -1132,6 +1312,69 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
                 sender.push(b"[flash] sector out of range (0..4095)
 ");
             }
+        }
+        // r204: one-shot diagnostic scan of the ADC1 pin block (PA0..PA7
+        // = IN0..IN7) with forced long sample windows — read-only. With
+        // the DUT charger connected, shows which pin (if any) carries
+        // the ~0.6 V / ~745-count diode-bias signature.
+        b'a' => {
+            for half in 0..2u8 {
+                let mut d = [0u8; 64];
+                let mut n = 0;
+                for &b in b"[adc] " {
+                    d[n] = b;
+                    n += 1;
+                }
+                for ch in half * 4..half * 4 + 4 {
+                    d[n] = b'c';
+                    d[n + 1] = b'0' + ch;
+                    d[n + 2] = b'=';
+                    n += 3;
+                    match adc::probe_raw(ch) {
+                        Some(v) => n = push_dec(&mut d, n, u32::from(v)),
+                        None => {
+                            d[n] = b'-';
+                            d[n + 1] = b'-';
+                            n += 2;
+                        }
+                    }
+                    d[n] = b' ';
+                    n += 1;
+                }
+                if half == 1 {
+                    for &b in b"vr=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    match adc::read_vref_raw() {
+                        Some(v) => n = push_dec(&mut d, n, u32::from(v)),
+                        None => {
+                            d[n] = b'-';
+                            d[n + 1] = b'-';
+                            n += 2;
+                        }
+                    }
+                }
+                d[n] = b'\r';
+                d[n + 1] = b'\n';
+                send_direct(&d[..n + 2]);
+            }
+        }
+        // r204: ripple self-test — one CH17 (VREFINT) burst through the
+        // exact capture machinery; the ripple task logs the outcome.
+        b'r' if cmd == b"rs" => {
+            ripple::SELFTEST.store(true, Ordering::Relaxed);
+            send_direct(b"[ripple] selftest armed\r\n");
+        }
+        // r205: the 32-bit-wide variant of the same CH17 burst.
+        b'r' if cmd == b"r2" => {
+            ripple::SELFTEST2.store(true, Ordering::Relaxed);
+            send_direct(b"[ripple] selftest32 armed\r\n");
+        }
+        // r205: the memory-to-memory DMA probe.
+        b'm' => {
+            ripple::SELFTEST_M2M.store(true, Ordering::Relaxed);
+            send_direct(b"[ripple] m2m armed\r\n");
         }
         // r184: soft-reset into the bootloader's update mode via the
         // battery-domain cookie (BPR DT2 = 0xB007, consumed + cleared by

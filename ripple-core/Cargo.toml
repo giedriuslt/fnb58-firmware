@@ -1,0 +1,11 @@
+[package]
+name = "ripple-core"
+version = "0.1.0"
+edition = "2024"
+description = "Ripple capture analysis (statistics, trigger, envelope, FFT) for the FNB58 port of the kws-x1 ripple scope — pure logic, no hardware."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+libm = "0.2.16"
+microfft = { version = "0.6.0", default-features = false, features = ["size-1024"] }

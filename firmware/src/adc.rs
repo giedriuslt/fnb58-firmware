@@ -1,6 +1,15 @@
-//! AT32F403A ADC1: internal temperature sensor (CH16) with VREFINT
-//! (CH17) ratiometric correction, for the PC-link temperature field
-//! (r136) and the console heartbeat.
+//! AT32F403A ADCs, split by role (r201, user-directed):
+//! - **ADC1**: internal temperature sensor (CH16) + VREFINT (CH17) +
+//!   the ripple scope's DMA bursts on PA6/CH6 (ripple.rs). One-shot
+//!   reads here are fail-fast while a ripple burst owns the converter
+//!   (the BURST flag below).
+//! - **ADC3**: the D+/D− line taps (PA3 = ADC123_IN3, PA2 =
+//!   ADC123_IN2 — the datasheet names all three ADCs on those pins).
+//!   ADC2 is unusable for either role: it has NO DMA request line (RM
+//!   Table 9-5: 0x02 is reserved) and ADC3 cannot see IN6/PA6, so the
+//!   ripple bursts stay on ADC1 while the timing-critical QC/AFC tap
+//!   reads get a converter of their own — no ADC_LOCK contention with
+//!   the 2 s temperature read or the bursts.
 //!
 //! Artery's `internal_temperature_sensor` example on PAC registers
 //! (the embassy HAL has no ADC yet): software-triggered one-shot
@@ -29,6 +38,33 @@ const WAIT_BOUND: u32 = 2_000_000;
 /// conversion per critical-section lock (~40 us, far under the >1 ms
 /// IRQ-mask window that loses SysTick ticks).
 static ADC_LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
+
+/// r200: while a ripple DMA burst owns ADC1 (repeat mode + OCDMAEN, up
+/// to ~4 ms), one-shot readers must NOT reprogram the sequence/trigger
+/// registers mid-burst. Fail-fast flag instead of a long-held lock: the
+/// readers are passive (they keep their previous value for one tick),
+/// and on this single-core cooperative executor a synchronous
+/// check-then-convert cannot interleave with the equally synchronous
+/// burst claim (no ADC use from ISRs), so no tighter race exists.
+static BURST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Claim ADC1 for a ripple DMA burst (ripple.rs). Returns false if a
+/// burst already runs (one task bursts; the guard is for form).
+pub fn burst_begin() -> bool {
+    ADC_LOCK.lock(|_| {
+        if BURST.load(core::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        BURST.store(true, core::sync::atomic::Ordering::Relaxed);
+        true
+    })
+}
+
+/// Release ADC1 after a burst (always paired with [`burst_begin`], even
+/// on failure).
+pub fn burst_end() {
+    ADC_LOCK.lock(|_| BURST.store(false, core::sync::atomic::Ordering::Relaxed));
+}
 
 /// Enable and calibrate ADC1 with CH16/CH17 ready. Call once at boot,
 /// before either USB mode's loop runs.
@@ -77,6 +113,13 @@ pub fn init() {
     // Ordinary sequence length 1; the channel is written per read.
     adc.osq1().modify(|_, w| unsafe { w.oclen().bits(0) });
 
+    // r200: CTRL2.OCDMAEN (bit 8 — the PAC lacks this field; layout per
+    // the vendor header's ctrl2_bit struct), a DMA request per ordinary
+    // conversion for the ripple bursts. Left permanently enabled: with
+    // no channel armed the request is simply ignored, so the one-shot
+    // reads are unaffected.
+    adc.ctrl2().modify(|r, w| unsafe { w.bits(r.bits() | (1 << 8)) });
+
     // Calibration (vendor example: init -> wait, start -> wait).
     adc.ctrl2().modify(|_, w| w.adcalinit().init());
     for _ in 0..WAIT_BOUND {
@@ -90,11 +133,87 @@ pub fn init() {
             break;
         }
     }
+
+    // r201: ADC3 owns the data-line taps (see the module doc).
+    init_adc3();
+}
+
+/// r201: bring up ADC3 for the D+/D− taps — the same one-shot
+/// software-trigger pattern as ADC1, on its own register set. No lock:
+/// only the QC task's single context reads taps (qc_task and its
+/// afc_phy sampler), and ADC1's bursts cannot reach these registers.
+/// PA2/PA3 also move to true analog mode here (they sampled fine as
+/// floating digital inputs, but analog mode removes the Schmitt
+/// trigger's loading).
+fn init_adc3() {
+    use embassy_at32::gpio::{AnalogPin, Port};
+    let crm = unsafe { pac::at32f403a::CRM::steal() };
+    let adc = unsafe { pac::at32f403a::ADC3::steal() };
+
+    // SAFETY: exclusive-startup contract — adc::init runs once at boot,
+    // before any task; the pin claims are leaked like every other claim.
+    unsafe {
+        crm.apb2en().modify(|_, w| w.adc3().set_bit());
+        crm.apb2rst().modify(|_, w| w.adc3().set_bit());
+        crm.apb2rst().modify(|_, w| w.adc3().clear_bit());
+
+        core::mem::forget(AnalogPin::new(Port::A, 2).ok());
+        core::mem::forget(AnalogPin::new(Port::A, 3).ok());
+
+        adc.ctrl1().modify(|_, w| w.sqen().clear_bit());
+        adc.ctrl2().modify(|_, w| {
+            w.rpen().disable();
+            w.dtalign().right();
+            unsafe { w.octesel_l().bits(0b111) }; // ADC12_ORDINARY_TRIG_SOFTWARE
+            w.octesel_h().clear_bit();
+            w.octen().set_bit();
+            w.adcen().enable()
+        });
+        // The taps keep r198's fast 13.5-cycle window (2.2 us/conversion
+        // — the single-wire sampler's budget).
+        adc.spt2().modify(|_, w| unsafe {
+            w.cspt2().bits(0b010);
+            w.cspt3().bits(0b010)
+        });
+        adc.osq1().modify(|_, w| unsafe { w.oclen().bits(0) });
+
+        adc.ctrl2().modify(|_, w| w.adcalinit().init());
+        for _ in 0..WAIT_BOUND {
+            if adc.ctrl2().read().adcalinit().is_completed() {
+                break;
+            }
+        }
+        adc.ctrl2().modify(|_, w| w.adcal().calibrate());
+        for _ in 0..WAIT_BOUND {
+            if adc.ctrl2().read().adcal().is_completed() {
+                break;
+            }
+        }
+    }
+}
+
+/// One software-triggered conversion of `ch` (2 = D−, 3 = D+) on ADC3.
+fn adc3_raw_once(ch: u8) -> Option<u16> {
+    let adc = unsafe { pac::at32f403a::ADC3::steal() };
+    adc.osq3().modify(|_, w| unsafe { w.osn1().bits(ch) });
+    adc.sts().write(|w| w.occe().bit(true));
+    adc.ctrl2().modify(|_, w| w.ocswtrg().triggered());
+    for _ in 0..WAIT_BOUND {
+        if adc.sts().read().occe().bit() {
+            return Some(adc.odt().read().odt().bits() as u16);
+        }
+    }
+    None
 }
 
 /// One software-triggered conversion of `ch` (0..=17), under the ADC
-/// lock. Returns None on the (never-seen) EOC timeout.
+/// lock. Returns None on the (never-seen) EOC timeout, or while a
+/// ripple burst owns ADC1 (r200 — callers keep their previous value;
+/// the AFC wire sampler's None becomes a retried Error::Timing).
 fn read_raw(ch: u8) -> Option<u16> {
+    if BURST.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     ADC_LOCK.lock(|_| raw_once(ch))
 }
 
@@ -113,22 +232,81 @@ fn raw_once(ch: u8) -> Option<u16> {
 
 /// Measured VDDA in mV from the 1.2 V internal reference — the DAC code
 /// math and the line-tap mV both scale against this. None on timeout.
+/// The last good vref count is cached (r201) so the ADC3 tap reads can
+/// scale during a ripple burst, when this ADC1 read is fail-fast; VDDA
+/// drifts far slower than the cache refreshes (temp read every 2 s,
+/// ripple's vref every 100 ms).
+static VREF_CACHE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
 pub fn vdda_mv() -> Option<u32> {
     let vref = u32::from(read_raw(17)?);
     if vref == 0 {
         return None;
     }
+    VREF_CACHE.store(vref as u16, core::sync::atomic::Ordering::Relaxed);
     Some(1200 * 4095 / vref)
 }
 
-/// One external line conversion in mV (PA2 = CH2 = D−, PA3 = CH3 = D+),
-/// 4-sample mean, VDDA-ratiometric — the kws-x1 LineAdc pattern. None
-/// on timeout (caller keeps the previous value).
+/// [`vdda_mv`] with the cached fallback for burst windows (r201).
+fn vdda_mv_cached() -> Option<u32> {
+    if let Some(vdda) = vdda_mv() {
+        return Some(vdda);
+    }
+    let cached = u32::from(VREF_CACHE.load(core::sync::atomic::Ordering::Relaxed));
+    (cached > 0).then(|| 1200 * 4095 / cached)
+}
+
+/// r204: one diagnostic conversion of `ch` (0..=7, the PA0..PA7 block)
+/// with a FORCED 239.5-cycle sample window — the per-channel windows
+/// default to the fast end and a high-impedance node (the PA6
+/// diode/100k front end) cannot charge the S/H cap in 1.5 cycles. The
+/// channel's configured window is saved and restored. For the console
+/// 'a' pin scan; read-only, fails fast under a ripple burst.
+pub fn probe_raw(ch: u8) -> Option<u16> {
+    if ch > 9 {
+        return None;
+    }
+    let adc = unsafe { pac::at32f403a::ADC1::steal() };
+    ADC_LOCK.lock(|_| {
+        if BURST.load(core::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let saved = adc.spt2().read().bits();
+        adc.spt2().modify(|_, w| unsafe {
+            match ch {
+                0 => w.cspt0().bits(0b111),
+                1 => w.cspt1().bits(0b111),
+                2 => w.cspt2().bits(0b111),
+                3 => w.cspt3().bits(0b111),
+                4 => w.cspt4().bits(0b111),
+                5 => w.cspt5().bits(0b111),
+                6 => w.cspt6().bits(0b111),
+                _ => w.cspt7().bits(0b111),
+            };
+            w
+        });
+        let result = raw_once(ch);
+        adc.spt2().write(|w| unsafe { w.bits(saved) });
+        result
+    })
+}
+
+/// r199: one raw VREFINT (CH17) conversion — the ripple task reads it
+/// as the ratiometric reference before each PA6 burst (the kws-x1
+/// borrow idea, same converter). None on timeout.
+pub fn read_vref_raw() -> Option<u16> {
+    read_raw(17)
+}
+
+/// One external line conversion in mV (PA2 = ADC3_IN2 = D−, PA3 =
+/// ADC3_IN3 = D+), 4-sample mean on ADC3, VDDA-ratiometric — the kws-x1
+/// LineAdc pattern. None on timeout (caller keeps the previous value).
+/// r201: on ADC3, so a ripple burst can no longer stall the tap reads.
 pub fn read_line_mv(ch: u8) -> Option<u16> {
-    let vdda = vdda_mv()?;
+    let vdda = vdda_mv_cached()?;
     let mut sum: u32 = 0;
     for _ in 0..4 {
-        sum += u32::from(read_raw(ch)?);
+        sum += u32::from(adc3_raw_once(ch)?);
     }
     Some((sum * vdda / 4095 / 4) as u16)
 }
@@ -136,8 +314,10 @@ pub fn read_line_mv(ch: u8) -> Option<u16> {
 /// r198: one raw tap conversion (counts, ≈2.2 µs) for the single-wire
 /// sampler — no VREFINT pass, no averaging. The caller thresholds the
 /// counts directly (the wire levels are 0 and ~VDDA, far from mid).
+/// r201: ADC3 — no ADC1 lock, no ripple-burst interaction; the r198
+/// ADC_LOCK-collision risk with the temp read is gone entirely.
 pub fn read_tap_raw(ch: u8) -> Option<u16> {
-    read_raw(ch)
+    adc3_raw_once(ch)
 }
 
 /// Internal die temperature in tenths of a degree C, measured against

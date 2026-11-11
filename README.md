@@ -246,6 +246,69 @@ tester in log mode it sends `run-bootloader` itself, waits for the
 re-enumeration (rescanning if Windows renumbers the COM port) and
 flashes: one command from any state.
 
+## Ripple scope (r199–r200)
+
+The 6th screen is a port of kws-x1's ripple tab. Analysis is a 1:1
+port into the `ripple-core` workspace crate (host-tested, 11 tests) of
+kws-x1's `firmware-core` ripple/spectrum modules; the acquisition task
+(`ripple.rs`) follows their dedicated-ADC arrangement as far as the
+chip allows:
+
+- **Hardware** (user trace): **PA6 / ADC12_IN6 / LQFP48 pin 16** — a
+  diode to GND with a 100 k pull-up biases the node to ~0.6 V, so a
+  raw reading near ~745 counts is the *expected* idle, and the
+  analysis is mean-centered (exact DC removal) so the bias drops out.
+- **Why ADC1 + DMA1 ch1, shared with the internal channels — not a
+  dedicated ADC (r200/r201, RM receipts)**: the first hardware round
+  (r199, ADC2 + DMA1 ch3) failed every capture, and the RM explains
+  why: **Table 9-5 (p.133) lists the DMA request sources as 0x00=No
+  select, 0x01=ADC1, 0x02=RESERVED, 0x03=ADC3 — the AT32F403A gives
+  ADC2 no DMA request line** (p.323), and ADC3's external channels are
+  only IN0..IN3 and IN10..IN13 (p.318), so it cannot see IN6/PA6.
+  The r199 build also exposed that the embassy-at32 HAL's
+  `dma::Request` ADC+I2C codes were off by a row (Adc1=0x00 is "No
+  select"); the HAL enum now carries the RM's values. The r200 log
+  then proved the chip runs the FIXED request mapping regardless (the
+  SRC_SEL registers read back 0 after write) — RM Table 9-3 (p.132)
+  puts ADC1 on **DMA1 channel 1**, so the burst rides ch1: the
+  vendor's repeat_conversion_loop_transfer pairing. The D+/D− taps
+  moved to **ADC3** (r201, user-directed; PA2/PA3 are ADC123_IN2/IN3
+  per the datasheet), which removes every timing-critical reader from
+  ADC1: bursts are bracketed by adc.rs's `BURST` fail-fast flag, the
+  only co-tenant is the 2 s temperature/VREFINT read (ADC1-only
+  peripherals) with a cached-VDDA fallback for the tap scaling, and no
+  long-held lock ever exists (SysTick-safe). The ratiometric reference
+  is ADC1's own VREFINT (CH17) read before each burst. The r200 log
+  also exposed a lost-wakeup race in the HAL's DMA `wait()` (the ISR
+  cleared the completion flags before the woken poll could read them)
+  — the ISR now wakes only and the poll consumes the flags.
+- **kws-x1 semantics kept**: 5 timebases (20/50/100/200/500 µs/div, a
+  nominal `~` label), rising-edge trigger with hysteresis (never
+  wrapping the capture), 112-column min/max envelope trace over 8×4
+  divisions, DC-removed RMS + PeakHistory-smoothed p-p (65/35
+  mean/max blend over 30 captures), Hann-windowed FFT with 224 bars
+  behind the trace and 3 labelled peaks, 9 AUTO/LOCK mV/div scales,
+  RUN/HOLD, CLIPPED/OFF SCALE/NO REF flags. Buttons: OK opens/cycles
+  the focused setting (time → scale → run/hold), LEFT/RIGHT adjust it,
+  BACK closes; changing the timebase drops the hold (a held capture
+  cannot be re-timed), and a hold lasts only while the screen shows.
+- **Documented deviations** (hardware-forced): no AT32 PGA →
+  gain 1 (voltages are pin-referred and deliberately NOT
+  bus-calibrated, as in kws-x1); the AT32's 8 discrete sample windows
+  replace the HC32's free cycle count (rate math in half-cycles,
+  12.5-cycle conversion); the shared (not dedicated) ADC above.
+  Drawing deviations: 2-px envelope bars without connector segments,
+  and the numbered peak list replaces the per-bar digit markers. There
+  is no long-press, so kws-x1's long-OK reset-to-defaults is absent.
+- Console evidence: `[ripple] adc1+dma1c1 up` at boot, a
+  `[ripple] tb= pp= rms= mn= mx= tr=` line on the 2 s heartbeat while
+  the screen is shown (`mn`/`mx` are raw counts — the ~745 diode idle
+  proves the front end), and every failure path logs with a register
+  dump: `[ripple] fail <cause> c2= sts= ch= cnt=` + `sel= s0= s1023=`
+  (first failure and every 20th after), `ok fails=N` on recovery, and
+  `unwake salvage` if the DMA interrupt ever fails to wake a finished
+  transfer (the capture is salvaged by checking the flag).
+
 ## Build and flash
 
 ```sh
