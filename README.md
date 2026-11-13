@@ -88,7 +88,7 @@ pins have no known connection.
 | 36 | VDD_2 | Right | digital supply |
 | 37 | PA14 | Top | SWCLK (debug only — keep free) |
 | 38 | PA15 | Top | ✓ LEFT button (to GND, internal pull-up) |
-| 39 | PB3 | Top | ✓ LCD backlight |
+| 39 | PB3 | Top | ✓ LCD backlight — **TMR2 CH2 PWM** (IOMUX TMR2 remap 01; idle-dimmed to 20% after 60 s, r216) |
 | 40 | PB4 | Top | ✓ OK button (to GND, internal pull-up) |
 | 41 | PB5 | Top | ✓ load-bank MOSFET gate (FET SMD-marked 3400): HIGH = bank ON |
 | 42 | PB6 | Top | ✓ I2C1 SCL (TPA626, FUSB302, KXTJ3) |
@@ -160,7 +160,7 @@ the ADC1 pin block PA0..PA7 + VREF with forced long sample windows;
 ADC1+DMA1+analysis chain) followed by one on the PA6 pickup; `r2` =
 the 32-bit-wide variant; `m` = a DMA memory-to-memory copy (engine
 test); `af`/`ad`/`ap` = the AFC handshake-path commit, direct-entry
-commit, and ping-width sweep (see the AFC section).
+commit, and ping-width sweep (see the AFC section). `b` = toggle the idle dim (r216).
 
 ## PC link (r134/r135) — OpenFNB58 protocol, hardware-verified
 
@@ -340,6 +340,18 @@ chip allows:
   (first failure and every 20th after), `ok fails=N` on recovery, and
   `unwake salvage` if the DMA interrupt ever fails to wake a finished
   transfer (the capture is salvaged by checking the flag).
+
+## Backlight idle dim (r216)
+
+PB3 (the backlight gate, high = on) moved from a plain GPIO output to
+**TMR2 CH2 PWM** — the only timer function PB3 has (IOMUX TMR2 partial
+remap 01; PA15, CH1's remapped pin, is the LEFT button and unaffected).
+20 kHz (above audible/flicker), PWM mode A active-high with buffered
+compare, 192 MHz timer clock → 9600 ticks/period. After **60 s without
+a button press** the backlight dims to **20%**; any press restores 100%
+(`[bl] dim 20%` / `[bl] wake` on the console). Console `b` toggles the
+dim immediately (hardware check without waiting the minute). PC-link
+mode keeps full brightness.
 
 ## Build and flash
 

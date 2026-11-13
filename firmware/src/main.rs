@@ -21,6 +21,7 @@
 
 mod board;
 mod adc;
+mod backlight;
 mod console;
 mod dac;
 mod afc_phy;
@@ -42,10 +43,18 @@ pub(crate) use console::*;
 
 static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// r216: idle-dim state, module-level so the console 'b' toggle in
+/// `run_flash_command` stays consistent with the main loop's logic.
+/// Millis are boot-relative and the arithmetic wraps (the ui.rs
+/// qc_dyn_at pattern); BL_LAST_ACTIVITY starts at 0 so the first minute
+/// counts from boot.
+static BL_LAST_ACTIVITY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BL_DIMMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r215";
+const BUILD: &[u8] = b"r217";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -87,6 +96,31 @@ async fn main(spawner: Spawner) {
     // see adc.rs). Mode-independent: the PC-link reports and the console
     // heartbeat both read it. ---
     adc::init();
+
+    // --- r216: backlight PWM on PB3 (TMR2 CH2) before any screen work;
+    // starts at 100% — the main loop dims on idle (console mode), the
+    // PC-link mode keeps full brightness. r217: the TMR2_MUX readback
+    // lands in the boot ring (0b01 = the remap stuck; the r216 build
+    // wrote REMAP before the IOMUX clock was on and the backlight sat
+    // dead). ---
+    let bl_mux = unsafe { backlight::init(clocks.timer1_hz()) };
+    {
+        let mut d = [0u8; 40];
+        let mut n = 0;
+        for &b in b"[bl] mux=" {
+            d[n] = b;
+            n += 1;
+        }
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        d[n] = HEX[usize::from(bl_mux & 0xF)];
+        n += 1;
+        let verdict: &[u8] = if bl_mux == 1 { b" ok\r\n" } else { b" WRONG\r\n" };
+        for &b in verdict {
+            d[n] = b;
+            n += 1;
+        }
+        boot_log().push(&d[..n]);
+    }
 
     // --- r134: PC-link mode (OpenFNB58 protocol) ---
     // r180: hold BACK while plugging in. The bootloader (first 64 KiB of
@@ -185,7 +219,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r215 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r217 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -258,7 +292,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r215 " {
+                for &b in b"r217 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -365,7 +399,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r215: ping sweep\r\n");
+    say(b"[lcd] FNB58 r217: iomux clock fix\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -689,6 +723,8 @@ async fn main(spawner: Spawner) {
         MAIN_STAGE.store(2, Ordering::Relaxed); // loop body
         MAIN_SEQ.fetch_add(1, Ordering::Relaxed);
         tick = tick.wrapping_add(1);
+        // r216: this pass's boot-relative millis (idle-dim timestamping).
+        let now_ms = embassy_time::Instant::now().as_millis() as u32;
 
         for line in [4u8, 8, 9, 13, 15] {
             if !isr_seen[line as usize] && events & (1u32 << line) != 0 {
@@ -771,6 +807,12 @@ async fn main(spawner: Spawner) {
 
             if down {
                 held |= 1 << i;
+                // r216: any press is activity — wake the dimmed screen.
+                BL_LAST_ACTIVITY.store(now_ms, Ordering::Relaxed);
+                if BL_DIMMED.swap(false, Ordering::Relaxed) {
+                    backlight::set_percent(100);
+                    sender.push(b"[bl] wake\r\n");
+                }
                 // Click feedback: 500 Hz for 30 ms (r122, user-tuned).
                 // r176: NOT while a PD exchange is in flight — the buzz is
                 // a 30 ms busy-wait that blacks out the PD task's answer
@@ -918,6 +960,17 @@ async fn main(spawner: Spawner) {
             ui.screen == Screen::Ripple && !ui.ripple_hold,
             Ordering::Relaxed,
         );
+
+        // r216: idle dim — 60 s without a press drops the backlight to
+        // 20% (TMR2 CH2 PWM). Presses reset BL_LAST_ACTIVITY in the
+        // button loop; the console 'b' toggle writes both statics.
+        if !BL_DIMMED.load(Ordering::Relaxed)
+            && now_ms.wrapping_sub(BL_LAST_ACTIVITY.load(Ordering::Relaxed)) >= 60_000
+        {
+            BL_DIMMED.store(true, Ordering::Relaxed);
+            backlight::set_percent(20);
+            sender.push(b"[bl] dim 20%\r\n");
+        }
 
         // Orientation poll: 200 ms cadence; a flip must hold ~1 s before
         // the screen rotates (kws-x1's settle approach). r172: gated on
@@ -1272,6 +1325,23 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
         return;
     }
     match cmd[0] {
+        // r216: toggle the idle dim immediately (the same 20%/100% the
+        // idle logic applies) — hardware verification without waiting
+        // the 60 s. Also resets the idle clock so an undim sticks.
+        b'b' => {
+            let dimmed = !BL_DIMMED.load(Ordering::Relaxed);
+            BL_DIMMED.store(dimmed, Ordering::Relaxed);
+            backlight::set_percent(if dimmed { 20 } else { 100 });
+            BL_LAST_ACTIVITY.store(
+                embassy_time::Instant::now().as_millis() as u32,
+                Ordering::Relaxed,
+            );
+            if dimmed {
+                send_direct(b"[bl] dim 20% (toggle)\r\n");
+            } else {
+                send_direct(b"[bl] wake (toggle)\r\n");
+            }
+        }
         b'i' => {
             let mut d = [0u8; 32];
             let mut n = 0;

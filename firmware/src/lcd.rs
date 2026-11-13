@@ -26,8 +26,9 @@ pub struct Lcd {
     cs: OutputPin,
     #[allow(dead_code)]
     rst: OutputPin,
-    #[allow(dead_code)]
-    backlight: OutputPin,
+    // r216: the backlight (PB3) moved to backlight.rs — TMR2 CH2 PWM
+    // for idle dimming; a plain GPIO output would keep the pad off the
+    // timer. PB3 is no longer claimed here.
 }
 
 impl Lcd {
@@ -37,9 +38,9 @@ impl Lcd {
     ///
     /// # Safety
     ///
-    /// Exclusive-startup contract: claims SPI2, PB3/PB10-PB12/PB13/PB15 and
+    /// Exclusive-startup contract: claims SPI2, PB10-PB12/PB13/PB15 and
     /// the IOMUX remap register; call once, before anything touches those
-    /// pins.
+    /// pins. PB3 belongs to backlight.rs since r216 (TMR2 CH2 PWM).
     pub unsafe fn new(spi: Spi) -> Self {
         // SWJTAG remap = vendor gpio_pin_remap_config(SWJTAG_GMUX_010):
         // IOMUX_REMAP7.SWJTAG_GMUX = 010 (JTAG-DP disabled, SW-DP enabled).
@@ -52,15 +53,14 @@ impl Lcd {
         // never touches the SWD pins.
         iomux.remap7().modify(|_, w| unsafe { w.swjtag_gmux().bits(0x04) });
 
-        // Control pins: CS/DC/RST push-pull, idle high; backlight gate PB3.
+        // Control pins: CS/DC/RST push-pull, idle high. The backlight is
+        // backlight.rs's PWM (PB3, TMR2 CH2).
         let cs = unsafe { OutputPin::new_push_pull(Port::B, 12, true, Drive::Moderate) }
             .expect("PB12 claim");
         let dc = unsafe { OutputPin::new_push_pull(Port::B, 11, true, Drive::Moderate) }
             .expect("PB11 claim");
         let rst = unsafe { OutputPin::new_push_pull(Port::B, 10, true, Drive::Moderate) }
             .expect("PB10 claim");
-        let backlight = unsafe { OutputPin::new_push_pull(Port::B, 3, true, Drive::Moderate) }
-            .expect("PB3 claim");
         let _sck =
             unsafe { AlternatePin::new_push_pull(Port::B, 13, Drive::Moderate) }.expect("PB13");
         let _mosi =
@@ -74,7 +74,6 @@ impl Lcd {
             dc,
             cs,
             rst,
-            backlight,
         }
     }
 
