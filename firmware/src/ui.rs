@@ -868,13 +868,18 @@ impl Ui {
             }
             for (column, bin) in reading.trace.iter().enumerate() {
                 let x = LEFT + column as i32 * COLUMN_PITCH;
+                // y() maps LARGER counts to SMALLER pixel rows, so
+                // y(bin.max) < y(bin.min): the window wants (top, bottom)
+                // — reversed order underflows fill_window's height math
+                // and painted the whole screen green once real (non-flat)
+                // data arrived (the r208 hardware report).
                 let low = y(bin.min);
                 let high = y(bin.max);
                 lcd.fill_window(
                     x as u16,
-                    low as u16,
-                    (x + 1) as u16,
                     high as u16,
+                    (x + 1) as u16,
+                    low as u16,
                     GREEN,
                 )
                 .await;

@@ -50,6 +50,11 @@ pub fn level_mv(level: Level) -> u32 {
 /// comparator windows, and every driven level is ADC-verified anyway.
 static CODE_MID: AtomicU16 = AtomicU16::new(745); // 600 mV at 3.3 V
 static CODE_HIGH: AtomicU16 = AtomicU16::new(4095); // rail
+/// r214: the AFC wire's high level — the Samsung reference phone drives
+/// its AFC data GPIO at 1.8 V; our rail-level ping (3.2 V unloaded on
+/// this front end) may sit outside the adapter's input range. QC's High
+/// requests keep the rail code.
+static CODE_AFC: AtomicU16 = AtomicU16::new(2230); // 1.8 V at 3.3 V
 
 fn code_for(mv: u32, vdda_mv: u32) -> u16 {
     if vdda_mv == 0 {
@@ -75,6 +80,7 @@ pub fn init() {
     let vdda = crate::adc::vdda_mv().unwrap_or(3300);
     CODE_MID.store(code_for(600, vdda), Ordering::Relaxed);
     CODE_HIGH.store(code_for(3300, vdda), Ordering::Relaxed);
+    CODE_AFC.store(code_for(1800, vdda).min(CODE_HIGH.load(Ordering::Relaxed)), Ordering::Relaxed);
 
     let dac = unsafe { pac::at32f403a::DAC::steal() };
     dac.ctrl().modify(|_, w| {
@@ -109,6 +115,18 @@ pub fn drive(line: Line, level: Option<Level>) -> u32 {
 pub fn drive_fast(line: Line, high: bool) {
     let code = if high {
         CODE_HIGH.load(Ordering::Relaxed)
+    } else {
+        0
+    };
+    write_code(line, code);
+}
+
+/// r214: the AFC wire variant — high = the cached 1.8 V code (the
+/// reference phone's GPIO level; a rail-level ping read as out-of-range
+/// by the adapter on hardware).
+pub fn drive_afc(line: Line, high: bool) {
+    let code = if high {
+        CODE_AFC.load(Ordering::Relaxed)
     } else {
         0
     };

@@ -61,12 +61,12 @@ pins have no known connection.
 | 9 | VDDA / VREF+ | Left | analog supply |
 | 10 | PA0 / WKUP | Left | unclaimed |
 | 11 | PA1 | Left | unclaimed |
-| 12 | PA2 | Left | unclaimed |
-| 13 | PA3 | Bottom | unclaimed |
-| 14 | PA4 | Bottom | unclaimed |
-| 15 | PA5 | Bottom | unclaimed |
-| 16 | PA6 | Bottom | unclaimed |
-| 17 | PA7 | Bottom | unclaimed |
+| 12 | PA2 | Left | ✓ D− read tap — **ADC3**_IN2 (ADC123_IN2), 1 kΩ from D− (qc/afc line reads + AFC wire sampler) |
+| 13 | PA3 | Bottom | ✓ D+ read tap — **ADC3**_IN3 (ADC123_IN3), 1 kΩ from D+ |
+| 14 | PA4 | Bottom | ✓ D− drive — DAC1_OUT via 100 Ω (QC levels + AFC single-wire) |
+| 15 | PA5 | Bottom | ✓ D+ drive — DAC2_OUT via 100 Ω (QC levels, AFC holds 0.6 V) |
+| 16 | PA6 | Bottom | ✓ ripple pickup — ADC1_IN6, diode/~1.8 V clamp + 100 k pull-up node (idles ≈1.79 V) |
+| 17 | PA7 | Bottom | shorted to PA6 (same clamp node); otherwise unclaimed |
 | 18 | PB0 | Bottom | unclaimed |
 | 19 | PB1 | Bottom | unclaimed |
 | 20 | PB2 | Bottom | ✓ RS2228 USB-mux SELECT — DUT data lines: passthrough ↔ MCU measure path (polarity + landing pins unknown) |
@@ -151,6 +151,17 @@ interrupt line (buttons = the canary), `[diag rNNN] t= q= f= i= pd=…`
 heartbeats, and the PD lines above. The console queue is non-blocking;
 a slow host delays lines instead of losing them.
 
+Line commands (`<cmd>` + Enter; each is echoed as `[flash] cmd: …`
+first — echo seen = the bytes arrived): `i` = W25Q128 JEDEC ID,
+`f<sector>` = 4 KiB sector hex dump, `run-bootloader` = soft-reset
+into the update mode. Diagnostics (r204–r215): `a` = one-shot scan of
+the ADC1 pin block PA0..PA7 + VREF with forced long sample windows;
+`rs` = one DMA burst of CH17 (VREFINT, ≈1485 counts proves the whole
+ADC1+DMA1+analysis chain) followed by one on the PA6 pickup; `r2` =
+the 32-bit-wide variant; `m` = a DMA memory-to-memory copy (engine
+test); `af`/`ad`/`ap` = the AFC handshake-path commit, direct-entry
+commit, and ping-width sweep (see the AFC section).
+
 ## PC link (r134/r135) — OpenFNB58 protocol, hardware-verified
 
 **Hold OK while plugging in** and the device enumerates as the stock
@@ -196,16 +207,19 @@ mailbox — the vendor `custom_hid` class as a template), `fnb58_usb.c`
 picks the class at boot (`fnb58_usb_init_hid`), and the Rust
 main loop samples the meter and builds the reports.
 
-## QC2.0/QC3.0/AFC trigger (r189–r198)
+## QC2.0/QC3.0/AFC trigger (r189–r215)
 
 The QC screen (3rd in the LEFT/RIGHT cycle) triggers QC2 voltages
 5/9/12/20 V; the QC3 screen (4th) triggers continuous-mode targets in
 native 200 mV steps (3.6–20 V) — the charger steps one pulse at a time
 toward the target (`SET` on screen tracks it). Both work through the
 traced data-line front end: **PA5 (DAC2_OUT) drives D+ via 100 Ω, PA4
-(DAC1_OUT) drives D− via 100 Ω; PA3/PA2 (ADC12_IN3/IN2) read D+/D− via
-1 kΩ each**. The protocol state machines are the vendored `qc-protocol`
-crate (pure logic, host-tested); the board layer is `dac.rs`
+(DAC1_OUT) drives D− via 100 Ω; PA3/PA2 read D+/D− via 1 kΩ each on
+ADC3** (r201: the taps moved from ADC1 to ADC3 — PA2/PA3 are
+ADC123_IN2/IN3, which isolates the timing-critical reads from ADC1's
+ripple bursts; PA2/PA3 also sit in true analog mode since). The
+protocol state machines are the vendored `qc-protocol` crate (pure
+logic, host-tested); the board layer is `dac.rs`
 (drive/release) + `adc.rs` (`read_line_mv`) + `qc_task.rs` (the task).
 
 - **Levels are DAC codes** (0.6 V ≈ 745, 3.3 V = 4095, VDDA-ratiometric
@@ -226,13 +240,31 @@ crate (pure logic, host-tested); the board layer is `dac.rs`
   1 ms) moves the output 200 mV. Leaving continuous = the 5 V pair
   HELD (a sustained pair outlasts the pulse filter, so the charger
   reads it as a fixed request and exits) before the next request.
-- **AFC** (r198, the 5th screen): Samsung Adaptive Fast Charging over
-  the same front end — after the DCP handshake, D+ stays at 0.6 V and
-  a single-wire exchange runs on D− (the vendored
-  `single-wire-protocols` crate; 160 µs UI, DWT-cycle-counter timing,
-  cached DAC codes and a fast single-conversion tap read for the wire
-  budget). Requests: 5 V / 9 V only. Failures named: `SILENT` = the
-  charger has no AFC, `WIRE` = a damaged exchange.
+- **AFC** (r198–r215, the 5th screen): Samsung Adaptive Fast Charging
+  over the same front end — after the DCP handshake, D+ stays at 0.6 V
+  and a single-wire exchange runs on D− (the vendored
+  `single-wire-protocols` crate; 160 µs UI, DWT-cycle-counter timing —
+  start-relative since r210 — cached DAC codes, a 1.8 V ping level
+  since r214 matching the reference phone's GPIO, and a fast
+  single-conversion tap read for the wire budget). **Screen flow**:
+  LEFT/RIGHT in selection cycles the target (`TGT 5V/9V`,
+  `[afc] tgt=` on the console); OK commits — the task releases the
+  lines, runs the DCP entry, then the exchange. **Task states** (the
+  shared `STATE` atomic + the AFC screen's names): OFF → RELEASING →
+  ENTRY (DCP handshake, `[qc] entering`) → DETECT (the wire exchange)
+  → AFC (session active, requests followed on VBUS) with FAIL + a
+  reason (`SILENT` = the adapter never answered the wire, `WIRE` = a
+  damaged exchange, `NODCP`/`NOENTRY` = entry failed). A commit while
+  active retargets (9 V) or stops (5 V + the crate's 100-UI reset
+  pulse); a commit from another screen stops AFC first. A `SILENT`
+  result auto-retries once through the direct entry (no QC handshake,
+  r211). **Status on this charger** (r212–r215, partner-side verdict):
+  the adapter answers no D− single-wire ping at any width (1–60 ms),
+  level (1.8–3.2 V) or entry path — our side is verified against the
+  Samsung reference driver end to end (`afc_charger_intf.c`).
+  **Console probes**: `af` = full AFC commit (handshake path), `ad` =
+  direct entry (no handshake), `ap` = ping-width sweep — each logs the
+  wire envelope `[afc] wire ping= rx_lo= rx_hi= n=` (raw counts).
 - **Verification is closed-loop**: the request levels are read back on
   the taps (screen + diag `dp=`/`dm=`) and the output is followed on
   the published TPA626 bus voltage (`vb=`) — `FOLLOWED`/`IGNORED`
@@ -246,7 +278,7 @@ tester in log mode it sends `run-bootloader` itself, waits for the
 re-enumeration (rescanning if Windows renumbers the COM port) and
 flashes: one command from any state.
 
-## Ripple scope (r199–r200)
+## Ripple scope (r199–r209)
 
 The 6th screen is a port of kws-x1's ripple tab. Analysis is a 1:1
 port into the `ripple-core` workspace crate (host-tested, 11 tests) of

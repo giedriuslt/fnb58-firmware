@@ -117,10 +117,28 @@ pub fn cycle_afc_target(dir: i16) -> u16 {
     next
 }
 
+/// r211: direct AFC entry — skip the QC2 DCP handshake (plain D+ 0.6 V,
+/// the Samsung reference phone's BC1.2-shaped start). A QC+AFC combo
+/// charger parked in HVDCP-listen by our handshake may never look at
+/// AFC pings; this is the A/B experiment.
+pub static AFC_DIRECT: AtomicBool = AtomicBool::new(false);
+
+/// r214: console 'ap' — after the next DCP entry, sweep master-ping
+/// widths on D− and report whether the adapter ever answers (afc_phy's
+/// ping_sweep). The request rides a normal AFC commit.
+pub static PING_SWEEP: AtomicBool = AtomicBool::new(false);
+
 /// The AFC screen's OK in selection mode: a single-wire AFC request.
 pub fn commit_afc() {
     MODE.store(MODE_AFC, Ordering::Relaxed);
     COMMIT.store(true, Ordering::Relaxed);
+}
+
+/// r211: the direct-entry variant (console 'ad', and the automatic
+/// one-shot retry after a handshake-path SILENT).
+pub fn commit_afc_direct() {
+    AFC_DIRECT.store(true, Ordering::Relaxed);
+    commit_afc();
 }
 
 fn log(line: &[u8]) {
@@ -262,9 +280,16 @@ enum State {
     /// r198 (kws-x1's Promoting): D+ settled at the AFC data level
     /// (Mid) after the DCP entry, the 80 ms settle before the wire
     /// detection exchange, with the line levels verified.
-    AfcPromoting { since: u64, target: u16 },
+    AfcPromoting {
+        since: u64,
+        target: u16,
+        /// r211: entered directly (no QC2 handshake) — the D− idle may
+        /// legitimately sit at the charger's Apple divider, so the
+        /// promote verify does not gate on it.
+        direct: bool,
+    },
     /// The AFC identification exchange runs (one blocking exchange).
-    AfcDetecting { target: u16 },
+    AfcDetecting { target: u16, direct: bool },
     /// An AFC session: requests sent, output followed on VBUS.
     AfcActive {
         session: afc::Session,
@@ -318,6 +343,28 @@ fn update(
             if now.saturating_sub(since) < RELEASE_MS {
                 return State::Releasing(since);
             }
+            // r211: the direct AFC path skips the QC2 handshake —
+            // D+ at 0.6 V and straight to the promoting settle (the
+            // Samsung reference phone's charger-IC does plain BC1.2
+            // before afc_communication; a combo charger parked in
+            // QC-listen by our handshake may ignore AFC pings).
+            if AFC_DIRECT.swap(false, Ordering::Relaxed)
+                && matches!(request, Request::Afc(_))
+            {
+                let Request::Afc(target) = request else {
+                    unreachable!("matched above");
+                };
+                dac::drive(Line::Dp, Some(Level::Mid));
+                dac::drive(Line::Dm, None);
+                log(b"[afc] direct entry (no qc handshake)\r\n");
+                STATE.store(STATE_AFC_DETECT, Ordering::Relaxed);
+                FAILURE.store(0, Ordering::Relaxed);
+                return State::AfcPromoting {
+                    since: now,
+                    target,
+                    direct: true,
+                };
+            }
             // D+ held at 0.6 V, D− released — the charger drives it now
             // (shorts it to 0.6 V, then pulls it low after entry).
             dac::drive(Line::Dp, Some(Level::Mid));
@@ -355,6 +402,15 @@ fn update(
                 Progress::Waiting(handshake) => State::Entering(handshake, entry_request),
                 Progress::Ready(session) => {
                     log(b"[qc] entry ready\r\n");
+                    // r214: the ping-width sweep diverts here — the QC
+                    // session is discarded like the AFC takeover's.
+                    if PING_SWEEP.swap(false, Ordering::Relaxed) {
+                        drop(session);
+                        crate::afc_phy::ping_sweep(&mut |line| log(line));
+                        release_lines();
+                        STATE.store(STATE_OFF, Ordering::Relaxed);
+                        return State::Off;
+                    }
                     match entry_request {
                         // r198: the AFC wire flow takes over HERE (kws-x1
                         // discards the QC session the same way) — D+ stays
@@ -366,7 +422,11 @@ fn update(
                                 &[b"mV\r\n"],
                             );
                             STATE.store(STATE_AFC_DETECT, Ordering::Relaxed);
-                            State::AfcPromoting { since: now, target }
+                            State::AfcPromoting {
+                                since: now,
+                                target,
+                                direct: false,
+                            }
                         }
                         _ => dispatch(session, entry_request, now, vbus_mv),
                     }
@@ -535,16 +595,26 @@ fn update(
             State::Off
         }
         // --- r198: the AFC wire flow (kws-x1's Promoting/Detecting/Output) ---
-        State::AfcPromoting { since, target } => {
+        State::AfcPromoting {
+            since,
+            target,
+            direct,
+        } => {
             // kws-x1's DP_SETTLE_MS: the charger needs D+ stable at the
             // data level before the wire exchange.
             if now.saturating_sub(since) < DP_SETTLE_MS {
-                return State::AfcPromoting { since, target };
+                return State::AfcPromoting {
+                    since,
+                    target,
+                    direct,
+                };
             }
             // Verify like kws-x1: D+ in the AFC window, D− idle-low, and
-            // the output still at its default 5 V.
+            // the output still at its default 5 V. The DIRECT path does
+            // not gate on D−: without the handshake the charger's idle
+            // divider may hold it at its Apple level.
             let dp_ok = dp_mv.is_some_and(|v| (500..=700).contains(&v));
-            let dm_ok = dm_mv.is_some_and(|v| v <= 600);
+            let dm_ok = direct || dm_mv.is_some_and(|v| v <= 600);
             let in_window = ENTRY_VBUS_WINDOW.contains(&vbus_mv);
             if !dp_ok || !dm_ok || !in_window {
                 log_dec(
@@ -557,16 +627,26 @@ fn update(
                 release_lines();
                 return State::Off;
             }
+            if direct {
+                log(b"[afc] direct: dp settled, exchanging\r\n");
+            }
             STATE.store(STATE_AFC_DETECT, Ordering::Relaxed);
-            State::AfcDetecting { target }
+            State::AfcDetecting { target, direct }
         }
-        State::AfcDetecting { target } => {
+        State::AfcDetecting { target, direct } => {
             // One identification exchange (blocking; the crate's retry
             // policy bounds it, ~60 ms worst case).
-            let mut phy = DmWire;
+            let mut phy = DmWire::new();
             let mut detection = afc::Detection::new();
             match detection.poll(&mut phy) {
                 Ok(_) => {
+                    // r213: receive envelope split from the ping sample.
+                    let (samples, min, max, ping) = crate::afc_phy::take_envelope();
+                    log_dec(
+                        b"[afc] wire ping= rx_lo= rx_hi= n=",
+                        &[u32::from(ping), u32::from(min), u32::from(max), samples],
+                        &[b" ", b" ", b" ", b" "],
+                    );
                     log(b"[afc] adapter answered\r\n");
                     let session = afc::Session::start(afc::Adapter, afc_voltage(target));
                     STATE.store(STATE_AFC, Ordering::Relaxed);
@@ -578,6 +658,12 @@ fn update(
                     }
                 }
                 Err(error) => {
+                    let (samples, min, max, ping) = crate::afc_phy::take_envelope();
+                    log_dec(
+                        b"[afc] wire ping= rx_lo= rx_hi= n=",
+                        &[u32::from(ping), u32::from(min), u32::from(max), samples],
+                        &[b" ", b" ", b" ", b" "],
+                    );
                     // Timeout without ever answering = a silent (non-AFC)
                     // adapter; anything else is wire damage.
                     let silent = matches!(
@@ -598,6 +684,18 @@ fn update(
                         n += 1;
                     }
                     log(&d[..n]);
+                    // r211: a SILENT handshake-path attempt retries once
+                    // through the direct entry (no QC handshake) — the
+                    // combo-charger HVDCP-parking hypothesis. The retry
+                    // is bounded to one per user commit (the direct flag
+                    // consumes itself).
+                    if silent && !direct {
+                        log(b"[afc] silent - retry direct\r\n");
+                        release_lines();
+                        AFC_DIRECT.store(true, Ordering::Relaxed);
+                        COMMIT.store(true, Ordering::Relaxed);
+                        return State::Off;
+                    }
                     FAILURE.store(if silent { 3 } else { 4 }, Ordering::Relaxed);
                     STATE.store(STATE_FAILED, Ordering::Relaxed);
                     release_lines();
@@ -618,7 +716,7 @@ fn update(
                             // Stop: queue + send the 5 V request, then the
                             // crate's 100-UI reset pulse, then release.
                             session.stop();
-                            let mut phy = DmWire;
+                            let mut phy = DmWire::new();
                             let _ = session.poll(&mut phy);
                             let _ = afc::reset(&mut phy);
                             release_lines();
@@ -640,7 +738,7 @@ fn update(
                         // A commit from another screen: stop AFC first
                         // (a fresh entry is needed for any QC flow — the
                         // QC session was consumed at the wire takeover).
-                        let mut phy = DmWire;
+                        let mut phy = DmWire::new();
                         let _ = afc::reset(&mut phy);
                         release_lines();
                         log(b"[afc] switch: stopped (re-commit to enter QC)\r\n");
@@ -651,7 +749,7 @@ fn update(
             }
             // Send the pending request (the initial one or a retarget's).
             if session.busy() {
-                let mut phy = DmWire;
+                let mut phy = DmWire::new();
                 match session.poll(&mut phy) {
                     Ok(()) => {
                         log_dec(

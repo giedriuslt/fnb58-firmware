@@ -303,6 +303,24 @@ async fn capture(
     adc.osq3().modify(|_, w| unsafe { w.osn1().bits(adc_channel) });
     adc.ctrl1().modify(|_, w| w.sqen().set_bit());
     adc.sts().write(|w| w.occe().bit(true)); // write-1-to-clear
+    // PRIMING CONVERSION (r208, discarded): the pre-burst VREFINT read
+    // leaves the S/H cap holding ~1484 counts; this channel's first
+    // burst sample must slew to the node's own voltage (PA6 sits ~750
+    // counts away), which a 1.5-cycle window cannot do — the first
+    // sample(s) then land in between and max-min reads HUNDREDS of
+    // counts of phantom peak-to-peak (the r207 '~600 mV on a good
+    // supply' report). One thrown-away conversion of the burst's own
+    // channel, at its own window, slews the cap first. kws-x1 needs
+    // nothing like this — its ripple ADC is exclusive; ours shares
+    // ADC1 with the CH16/17 internal reads.
+    adc.ctrl2().modify(|_, w| w.ocswtrg().triggered());
+    for _ in 0..2_000_000 {
+        if adc.sts().read().occe().bit() {
+            let _ = adc.odt().read().odt().bits(); // discard
+            break;
+        }
+    }
+    adc.sts().write(|w| w.occe().bit(true));
     // Arm the DMA first, then start the burst — the vendor example's
     // order (dma_channel_enable before adc_ordinary_software_trigger).
     let odt = unsafe { (pac::at32f403a::ADC1::ptr() as *mut u8).add(ODT_OFFSET) as *mut u32 };

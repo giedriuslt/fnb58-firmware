@@ -45,7 +45,7 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r207";
+const BUILD: &[u8] = b"r215";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -185,7 +185,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r207 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r215 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot.
@@ -258,7 +258,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r207 " {
+                for &b in b"r215 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -365,7 +365,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r207: dtd direction fix\r\n");
+    say(b"[lcd] FNB58 r215: ping sweep\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -1312,6 +1312,25 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
                 sender.push(b"[flash] sector out of range (0..4095)
 ");
             }
+        }
+        // r212: the GUARDED 'a' commands must precede the bare 'a' arm —
+        // a plain `b'a'` match swallowed "af"/"ad" before their guards
+        // could run (match arms take the first that matches).
+        b'a' if cmd == b"af" => {
+            qc_task::commit_afc();
+            send_direct(b"[afc] console commit\r\n");
+        }
+        // r211: the DIRECT variant — no QC2 handshake, plain D+ 0.6 V
+        // then the wire exchange (the Samsung reference phone's shape).
+        b'a' if cmd == b"ad" => {
+            qc_task::commit_afc_direct();
+            send_direct(b"[afc] console direct commit\r\n");
+        }
+        // r214: ping-width sweep after the next DCP entry.
+        b'a' if cmd == b"ap" => {
+            qc_task::PING_SWEEP.store(true, Ordering::Relaxed);
+            qc_task::commit_afc();
+            send_direct(b"[afc] ping sweep armed\r\n");
         }
         // r204: one-shot diagnostic scan of the ADC1 pin block (PA0..PA7
         // = IN0..IN7) with forced long sample windows — read-only. With
