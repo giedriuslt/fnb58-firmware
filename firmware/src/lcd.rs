@@ -12,6 +12,7 @@
 //! polling, executor-blocking like the C driver was; 12 MHz SCK is
 //! ~0.7 us/byte).
 
+use crate::console;
 use embassy_at32::gpio::{AlternatePin, Drive, OutputPin, Port};
 use embassy_at32::spi::{Divider, Mode, Spi};
 use embassy_time::Timer;
@@ -26,6 +27,15 @@ pub struct Lcd {
     cs: OutputPin,
     #[allow(dead_code)]
     rst: OutputPin,
+    /// r223: the screenshot capture — when armed, every draw primitive
+    /// ALSO streams to the console as a line (tools/fnb58-shot.py
+    /// replays them into an image). The panel's data line is write-only
+    /// (no MISO, the r45 trace), so GRAM read-back is impossible and
+    /// the primitive stream IS the framebuffer. Consumed by the main
+    /// loop's 'shot' block: it forces a full repaint with this armed.
+    pub capture: bool,
+    /// Primitives streamed since the capture was armed (the done line).
+    pub capture_n: u32,
     // r216: the backlight (PB3) moved to backlight.rs — TMR2 CH2 PWM
     // for idle dimming; a plain GPIO output would keep the pad off the
     // timer. PB3 is no longer claimed here.
@@ -74,6 +84,200 @@ impl Lcd {
             dc,
             cs,
             rst,
+            capture: false,
+            capture_n: 0,
+        }
+    }
+
+    /// r223: stream one fill primitive (`F x0 y0 x1 y1 cccc`). Sent via
+    /// send_direct — the console queue's 20 slots drain one line per
+    /// tick and would drop a capture burst mid-draw; send_direct blocks
+    /// until the endpoint accepts, and a whole capture is well under
+    /// the stall watch's 2 s window.
+    fn capture_fill(&mut self, x0: u16, y0: u16, x1: u16, y1: u16, color: u16) {
+        if !self.capture {
+            return;
+        }
+        self.capture_n += 1;
+        let mut d = [0u8; 32];
+        let mut n = 0;
+        for &b in b"F " {
+            d[n] = b;
+            n += 1;
+        }
+        for v in [x0, y0, x1, y1] {
+            n = console::push_dec(&mut d, n, u32::from(v));
+            d[n] = b' ';
+            n += 1;
+        }
+        n = console::push_hex16(&mut d, n, u32::from(color));
+        d[n] = b'\r';
+        d[n + 1] = b'\n';
+        crate::console::send_direct(&d[..n + 2]);
+    }
+
+    /// r223: stream one glyph primitive (`C x y s <fg4> <bg4> <hh>`) —
+    /// the char itself as two hex digits, so any byte survives the
+    /// text-line console.
+    fn capture_char(&mut self, x: u16, y: u16, scale: u8, fg: u16, bg: u16, ch: u8) {
+        if !self.capture {
+            return;
+        }
+        self.capture_n += 1;
+        let mut d = [0u8; 32];
+        let mut n = 0;
+        for &b in b"C " {
+            d[n] = b;
+            n += 1;
+        }
+        for v in [x, y] {
+            n = console::push_dec(&mut d, n, u32::from(v));
+            d[n] = b' ';
+            n += 1;
+        }
+        n = console::push_dec(&mut d, n, u32::from(scale));
+        d[n] = b' ';
+        n += 1;
+        n = console::push_hex16(&mut d, n, u32::from(fg));
+        d[n] = b' ';
+        n += 1;
+        n = console::push_hex16(&mut d, n, u32::from(bg));
+        d[n] = b' ';
+        n += 1;
+        n = console::push_hex8(&mut d, n, u32::from(ch));
+        d[n] = b'\r';
+        d[n + 1] = b'\n';
+        crate::console::send_direct(&d[..n + 2]);
+    }
+
+    /// Integer square root (corner radii and dot radii are single
+    /// digits; Newton on u32, converges immediately at this size).
+    fn isqrt(v: u32) -> u32 {
+        if v == 0 {
+            return 0;
+        }
+        let mut g = v;
+        loop {
+            let n = (g + v / g) / 2;
+            if n >= g {
+                return g;
+            }
+            g = n;
+        }
+    }
+
+    /// The corner-row inset of a rounded shape's left boundary: the
+    /// quarter circle centered (x0+r, y0+r), one pixel-step per row —
+    /// at dy=0 the inset is r (the top edge starts at x0+r), at dy=r
+    /// it is 0 (the left edge begins). kws-x1's rounded_outline /
+    /// RoundedRectangle geometry.
+    fn corner_inset(r: u16, dy: u16) -> u16 {
+        let d = r - dy;
+        r - Self::isqrt(u32::from(r) * u32::from(r) - u32::from(d) * u32::from(d)) as u16
+    }
+
+    /// r224: a 1 px outline with rounded corners (kws-x1's
+    /// `rounded_outline` — the card look). Everything decomposes into
+    /// fill_window calls, so the screenshot capture sees it all.
+    pub async fn rounded_outline(
+        &mut self,
+        x0: u16,
+        y0: u16,
+        x1: u16,
+        y1: u16,
+        r: u16,
+        color: u16,
+    ) {
+        // Straight edges (the corner arcs end where these begin).
+        self.fill_window(x0 + r, y0, x1 - r, y0, color).await;
+        self.fill_window(x0 + r, y1, x1 - r, y1, color).await;
+        self.fill_window(x0, y0 + r, x0, y1 - r, color).await;
+        self.fill_window(x1, y0 + r, x1, y1 - r, color).await;
+        // Four corner arcs, one pixel per row/col.
+        for dy in 0..r {
+            let inset = Self::corner_inset(r, dy);
+            let ax = x0 + inset;
+            self.fill_window(ax, y0 + dy, ax, y0 + dy, color).await;
+            let ax = x1 - inset;
+            self.fill_window(ax, y0 + dy, ax, y0 + dy, color).await;
+            let ax = x0 + inset;
+            self.fill_window(ax, y1 - dy, ax, y1 - dy, color).await;
+            let ax = x1 - inset;
+            self.fill_window(ax, y1 - dy, ax, y1 - dy, color).await;
+        }
+        // The r-inset pixel where each arc meets an edge (dy = r is the
+        // edge start, already drawn; the column arcs between the last
+        // arc row and the straight edge need their own pixels).
+        self.fill_window(x0, y0 + r, x0, y0 + r, color).await;
+        self.fill_window(x1, y0 + r, x1, y0 + r, color).await;
+        self.fill_window(x0, y1 - r, x0, y1 - r, color).await;
+        self.fill_window(x1, y1 - r, x1, y1 - r, color).await;
+    }
+
+    /// r224: a filled rounded rectangle (row spans with corner insets) —
+    /// the header's tab bars and the strip's heartbeat square.
+    pub async fn rounded_fill(
+        &mut self,
+        x0: u16,
+        y0: u16,
+        x1: u16,
+        y1: u16,
+        r: u16,
+        color: u16,
+    ) {
+        for dy in 0..=(y1 - y0) {
+            let inset = if dy < r && y1 - y0 >= r {
+                Self::corner_inset(r, dy)
+            } else if y1 - dy < r && y1 - y0 >= r {
+                Self::corner_inset(r, y1 - dy)
+            } else {
+                0
+            };
+            self.fill_window(x0 + inset, y0 + dy, x1 - inset, y0 + dy, color)
+                .await;
+        }
+    }
+
+    /// r227: a 1 px line between two points (kws-x1's stroked Line),
+    /// drawn as one vertical span per column — a line is single-valued
+    /// in x, so each column's [y(x_left), y(x_right)] range covers all
+    /// its pixels with no gaps; a horizontal-ish line gets thin spans, a
+    /// steep one thick ones. Each span is a fill_window, so the
+    /// screenshot capture sees the whole line.
+    pub async fn line(&mut self, x0: u16, y0: u16, x1: u16, y1: u16, color: u16) {
+        let (x0, y0, x1, y1) = if x1 < x0 { (x1, y1, x0, y0) } else { (x0, y0, x1, y1) };
+        let dx = i32::from(x1) - i32::from(x0);
+        let dy = i32::from(y1) - i32::from(y0);
+        if dx == 0 {
+            // Vertical: one span.
+            let (a, b) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
+            self.fill_window(x0, a, x0, b, color).await;
+            return;
+        }
+        for x in x0..=x1 {
+            // The line's y over this column's 1-px x interval: y at the
+            // left and right edges, spanned (kws-x1's stroke, no gaps).
+            let ya = (i32::from(x) - i32::from(x0)) as i64 * dy as i64 / dx as i64;
+            let yb = (i32::from(x) + 1 - i32::from(x0)) as i64 * dy as i64 / dx as i64;
+            let (ya, yb) = (ya.min(yb), ya.max(yb));
+            let a = (i64::from(y0) + ya).max(0).min(239) as u16;
+            let b = (i64::from(y0) + yb).max(0).min(239) as u16;
+            self.fill_window(x, a, x, b, color).await;
+        }
+    }
+
+    /// r224: a filled circle via row spans (the header's page dots).
+    pub async fn dot(&mut self, cx: u16, cy: u16, r: u16, color: u16) {
+        for dy in 0..=r {
+            let half = Self::isqrt(
+                u32::from(r) * u32::from(r) - u32::from(dy) * u32::from(dy),
+            ) as u16;
+            self.fill_window(cx - half, cy + dy, cx + half, cy + dy, color)
+                .await;
+            if dy > 0 {
+                self.fill_window(cx - half, cy - dy, cx + half, cy - dy, color)
+                    .await;
+            }
         }
     }
 
@@ -164,6 +368,7 @@ impl Lcd {
 
     /// Fill the window with one RGB565 color (chunked busy-write).
     pub async fn fill_window(&mut self, x0: u16, y0: u16, x1: u16, y1: u16, color: u16) {
+        self.capture_fill(x0, y0, x1, y1, color);
         self.set_window(x0, y0, x1, y1).await;
         let n = (u32::from(x1 - x0 + 1)) * (u32::from(y1 - y0 + 1));
         let hi = (color >> 8) as u8;
@@ -215,12 +420,13 @@ impl Lcd {
     /// composed into a line buffer (max scale 3: 15x21x2 = 630 B) and
     /// streamed with one busy write.
     pub async fn draw_char(&mut self, x: u16, y: u16, ch: u8, scale: u8, fg: u16, bg: u16) -> u16 {
+        self.capture_char(x, y, scale, fg, bg, ch);
         // r189: Q and X appended (the QC screen title + the BK:EX hint);
         // r199: k s d i v p ~ appended (the ripple screen's kHz / us /
         // div / p-p / nominal-timebase labels); the blank fallback stays
         // at index 11 — append only at the end.
-        const FONT_CHARS: &[u8] = b"0123456789. VAWmu-PSCDBEFGHIKLMNORTUY:/QXksdivp~";
-        static FONT_5X7: [[u8; 5]; 48] = [
+        const FONT_CHARS: &[u8] = b"0123456789. VAWmu-PSCDBEFGHIKLMNORTUY:/QXksdivp~<>+h";
+        static FONT_5X7: [[u8; 5]; 52] = [
             [0x3E, 0x51, 0x49, 0x45, 0x3E], // 0
             [0x00, 0x42, 0x7F, 0x40, 0x00], // 1
             [0x62, 0x51, 0x49, 0x49, 0x46], // 2
@@ -269,6 +475,10 @@ impl Lcd {
             [0x0C, 0x1C, 0x70, 0x1C, 0x0C], // v (r199)
             [0x7F, 0x24, 0x24, 0x24, 0x3C], // p (r199, bowl no descender)
             [0x08, 0x04, 0x08, 0x10, 0x08], // ~ (r199, nominal-value mark)
+            [0x08, 0x14, 0x22, 0x00, 0x00], // < (r224, the overview hint)
+            [0x00, 0x00, 0x22, 0x14, 0x08], // > (r224)
+            [0x08, 0x08, 0x3E, 0x08, 0x08], // + (r225, the D+ card label)
+            [0x7C, 0x04, 0x04, 0x78, 0x00], // h (r226, the Ah/Wh units)
         ];
         let idx = FONT_CHARS
             .iter()
@@ -278,10 +488,10 @@ impl Lcd {
 
         let w = 5 * u16::from(scale);
         let h = 7 * u16::from(scale);
-        debug_assert!(scale >= 1 && scale <= 3, "glyph buffer is sized for scale 3");
+        debug_assert!(scale >= 1 && scale <= 4, "glyph buffer is sized for scale 4");
         self.set_window(x, y, x + w - 1, y + h - 1).await;
 
-        let mut buf = [0u8; 640];
+        let mut buf = [0u8; 1120];
         let mut i = 0;
         for r in 0..h {
             for c in 0..w {

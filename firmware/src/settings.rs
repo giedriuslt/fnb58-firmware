@@ -42,8 +42,10 @@
 //! sector starts with all of them").
 
 use settings_core::calibration::{Calibration, FIELDS, Found};
+use settings_core::energy_store::{self, Storage};
 use settings_core::{CLAIM, FIRST, FILLER, RECORD, BLANK};
-use settings_core::{dim_minutes_to_record, scan_records};
+use settings_core::{dim_minutes_to_record, energy_memory_from_record, scan_records};
+use settings_core::{settings_word, ScanState};
 
 use crate::flash::{self, Flash};
 
@@ -51,6 +53,11 @@ use crate::flash::{self, Flash};
 /// (0x000000..0x014000, 80 KiB). User directive; everything beyond
 /// stays the stock firmware's (untouched).
 pub const SECTORS: u32 = 20;
+
+/// r226: the energy journal's pair — the TOP of the settings area
+/// (kws-x1 reserves two sectors for their journal the same way). The
+/// settings claims must never reach them.
+pub const ENERGY_SECTORS: [u32; 2] = [SECTORS - 2, SECTORS - 1];
 
 /// The applied idle-dim timeout in minutes (0 = never) — the idle
 /// logic and the Settings screen both read this.
@@ -63,6 +70,60 @@ pub static DIM_MINUTES: core::sync::atomic::AtomicU32 =
 pub static CAL_ZERO_UA: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 pub static CAL_CURRENT_PPM: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 pub static CAL_VOLTAGE_PPM: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+/// r226: the applied energy checkpoint interval, as the EnergyMemory
+/// index (settings-core's ALL order: 0 = Off, then 5/10/30/60 s).
+pub static ENERGY_IDX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// r226: the applied interval in seconds, `None` = Off (the main
+/// loop's checkpoint cadence reads this).
+pub fn energy_interval() -> Option<u64> {
+    let idx = ENERGY_IDX.load(core::sync::atomic::Ordering::Relaxed);
+    settings_core::EnergyMemory::ALL
+        .get(idx)
+        .and_then(|&m| m.seconds())
+}
+
+/// r226: the journal's two-sector view of the board flash — a fresh
+/// borrow per operation (the store keeps only cursor state, so the
+/// flash stays shareable with the settings save and the console).
+pub struct EnergyFlash<'a>(pub &'a mut Flash);
+
+impl Storage for EnergyFlash<'_> {
+    fn read(&mut self, sector: usize, offset: usize) -> u32 {
+        let addr = ENERGY_SECTORS[sector] * flash::SECTOR_SIZE as u32 + offset as u32;
+        // An error reads as non-blank garbage: the scan skips it, the
+        // blank() checks fail, and nothing is ever written over it.
+        self.0.read_u32le(addr).unwrap_or(0)
+    }
+    fn write(&mut self, sector: usize, offset: usize, words: &[u32]) -> bool {
+        let addr = ENERGY_SECTORS[sector] * flash::SECTOR_SIZE as u32 + offset as u32;
+        // One word per page-program call: every word address is 4-aligned
+        // (record offsets are 60 B steps from 8), so no 4-byte program
+        // ever crosses the W25Q's 256-B page wrap.
+        for (i, word) in words.iter().enumerate() {
+            let b = word.to_le_bytes();
+            if self.0.page_program(addr + (i * 4) as u32, &b).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+    fn erase(&mut self, sector: usize) -> bool {
+        self.0.erase_sector(ENERGY_SECTORS[sector]).is_ok()
+    }
+}
+
+/// r226: prepare the journal pair (before any protocol task runs).
+pub fn prepare_energy(flash: &mut Flash) -> energy_store::Preparation {
+    energy_store::prepare(&mut EnergyFlash(flash))
+}
+
+/// r226: recover the journal's cursor state (read-only).
+pub fn open_energy(flash: &mut Flash) -> Option<energy_store::Store> {
+    energy_store::Store::open(&mut EnergyFlash(flash))
+}
 
 /// The calibration the meter readings currently go through.
 pub fn applied() -> Calibration {
@@ -119,17 +180,12 @@ fn claim_word(flash: &mut Flash, sector: u32) -> u32 {
 }
 
 /// Scan one claimed sector's records (one 4 KiB read, ~3 ms). Returns
-/// the newest dim value and calibration fields found so far (later
-/// records win, kws-x1's fold) and the sector's first free slot.
-fn scan(
-    flash: &mut Flash,
-    sector: u32,
-    dim: Option<u32>,
-    cal: Found,
-) -> (Option<u32>, Found, Option<(u32, usize)>) {
+/// the updated scan state (later records win, kws-x1's fold) and the
+/// sector's first free slot.
+fn scan(flash: &mut Flash, sector: u32, state: ScanState) -> (ScanState, Option<(u32, usize)>) {
     let mut buf = [0u8; flash::SECTOR_SIZE];
     if flash.read_sector(sector, &mut buf).is_err() {
-        return (dim, cal, None);
+        return (state, None);
     }
     let words = buf
         .chunks_exact(8)
@@ -141,14 +197,15 @@ fn scan(
         })
         .skip(FIRST / 8);
     let end = FIRST + (flash::SECTOR_SIZE - FIRST) / RECORD * RECORD;
-    let (dim, cal, slot) = scan_records(words, dim, cal, end);
-    (dim, cal, slot.map(|slot| (sector, slot)))
+    let (state, slot) = scan_records(words, state, end);
+    (state, slot.map(|slot| (sector, slot)))
 }
 
 /// Open the store: JEDEC-gated, candidates scanned oldest-claimed
-/// first (claims advance 0 → 19, r220). Applies the loaded dim timeout
-/// and calibration to their statics. Returns the store and the loaded
-/// dim value, `None` = nothing stored.
+/// first (claims advance 0 → 17, r226 — the top two sectors are the
+/// energy journal's pair). Applies the loaded settings to their
+/// statics. Returns the store and the loaded dim value, `None` =
+/// nothing stored.
 pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
     let store = Store {
         next: None,
@@ -162,23 +219,26 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
         }
     }
     let mut next = None;
-    let mut dim: Option<u32> = None;
-    let mut cal = Found::default();
-    // Claims advance 0 → 19 (r220): scan oldest-claimed first, and stop
-    // at the first unclaimed candidate — a claimed sector beyond the
-    // gap is a pre-r220 relic and must not override newer records.
+    let mut state = ScanState::default();
+    // Claims advance 0 → 17 (r226 reserves the top two sectors for the
+    // energy journal): scan oldest-claimed first, and stop at the first
+    // unclaimed candidate — a claimed sector beyond the gap is a
+    // pre-r220 relic and must not override newer records.
     for sector in 0..SECTORS {
         if claim_word(flash, sector) != CLAIM {
             break;
         }
-        let (newer_dim, newer_cal, room) = scan(flash, sector, dim, cal);
-        dim = newer_dim;
-        cal = newer_cal;
+        let (newer, room) = scan(flash, sector, state);
+        state = newer;
         next = next.or(room);
     }
+    let ScanState { dim, energy, cal } = state;
     match dim {
         Some(minutes) => {
             DIM_MINUTES.store(minutes, core::sync::atomic::Ordering::Relaxed);
+            if let Some(idx) = energy {
+                ENERGY_IDX.store(idx, core::sync::atomic::Ordering::Relaxed);
+            }
             store_cal(cal.calibration());
             let mut d = [0u8; 40];
             let mut n = 0;
@@ -192,11 +252,12 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
                 n += 1;
             }
             log(&d[..n]);
+            log_energy();
             log_cal(b"[set] stored cal", cal.calibration());
             (
                 Store {
                     next,
-                    saved: (dim_minutes_to_record(minutes).unwrap_or(0xFF), cal.calibration()),
+                    saved: (settings_word(minutes, energy.unwrap_or(0)), cal.calibration()),
                 },
                 Some(minutes),
             )
@@ -207,6 +268,10 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
             // ours cannot exist today, save() always writes the dim
             // word, but the fold is honored anyway).
             log(b"[set] no stored settings (default dim=1)\r\n");
+            if let Some(idx) = energy {
+                ENERGY_IDX.store(idx, core::sync::atomic::Ordering::Relaxed);
+                log_energy();
+            }
             if cal.any() {
                 store_cal(cal.calibration());
                 log_cal(b"[set] stored cal", cal.calibration());
@@ -220,6 +285,30 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
             )
         }
     }
+}
+
+/// r226: log the applied energy checkpoint interval.
+fn log_energy() {
+    let idx = ENERGY_IDX.load(core::sync::atomic::Ordering::Relaxed);
+    let label = settings_core::EnergyMemory::ALL
+        .get(idx)
+        .map(|&m| m.label())
+        .unwrap_or("OFF");
+    let mut d = [0u8; 32];
+    let mut n = 0;
+    for &b in b"[set] energy " {
+        d[n] = b;
+        n += 1;
+    }
+    for &b in label.as_bytes() {
+        d[n] = b;
+        n += 1;
+    }
+    for &b in b"\r\n" {
+        d[n] = b;
+        n += 1;
+    }
+    log(&d[..n]);
 }
 
 /// Log a calibration's fields after `prefix` (b"[set] stored cal" /
@@ -254,27 +343,35 @@ fn log_cal(prefix: &[u8], cal: Calibration) {
     log(&d[..n]);
 }
 
-/// The store's full record set: the dim word, then the calibration's
-/// one record per field (kws-x1's records[..] shape — a newly claimed
-/// sector starts with all of them, so it never depends on older ones).
-fn record_set(minutes: u32, cal: Calibration) -> [u32; 1 + FIELDS] {
+/// The store's full record set: the settings word (dim + energy), then
+/// the calibration's one record per field (kws-x1's records[..] shape —
+/// a newly claimed sector starts with all of them, so it never depends
+/// on older ones).
+fn record_set(minutes: u32, energy_idx: usize, cal: Calibration) -> [u32; 1 + FIELDS] {
     let mut records = [0u32; 1 + FIELDS];
-    records[0] = dim_minutes_to_record(minutes).unwrap_or(0xFF);
+    records[0] = settings_word(minutes, energy_idx);
     records[1..].copy_from_slice(&cal.records());
     records
 }
 
-/// Save the dim timeout and the calibration (append only the changed
-/// records unless the store is full — then a new sector is claimed with
-/// the FULL record set, kws-x1's save). Every outcome logs — no silent
-/// failure branches. The values are applied to their statics BEFORE the
-/// write (kws-x1: one attempt per change, a failed write is not
-/// retried, the values stay in RAM).
-pub fn save(flash: &mut Flash, store: &mut Store, minutes: u32, cal: Calibration) {
+/// Save the settings word (dim + energy index) and the calibration
+/// (append only the changed records unless the store is full — then a
+/// new sector is claimed with the FULL record set, kws-x1's save).
+/// Every outcome logs — no silent failure branches. The values are
+/// applied to their statics BEFORE the write (kws-x1: one attempt per
+/// change, a failed write is not retried, the values stay in RAM).
+pub fn save(
+    flash: &mut Flash,
+    store: &mut Store,
+    minutes: u32,
+    energy_idx: usize,
+    cal: Calibration,
+) {
     let Some(word) = dim_minutes_to_record(minutes) else {
         log(b"[set] save refused (bad value)\r\n");
         return;
     };
+    let word = settings_word(minutes, energy_idx);
     if word == store.saved.0 && cal == store.saved.1 {
         return;
     }
@@ -282,7 +379,7 @@ pub fn save(flash: &mut Flash, store: &mut Store, minutes: u32, cal: Calibration
     // dim word if it changed, all FIELDS calibration records if the
     // calibration as a whole changed) — compared against the OLD saved
     // set, which updates only after the fold.
-    let records = record_set(minutes, cal);
+    let records = record_set(minutes, energy_idx, cal);
     let mut changed = [0u32; 1 + FIELDS];
     let mut count = 0;
     for (record, keep) in records.iter().zip(
@@ -297,6 +394,7 @@ pub fn save(flash: &mut Flash, store: &mut Store, minutes: u32, cal: Calibration
     }
     let changed = &changed[..count];
     DIM_MINUTES.store(minutes, core::sync::atomic::Ordering::Relaxed);
+    ENERGY_IDX.store(energy_idx, core::sync::atomic::Ordering::Relaxed);
     store_cal(cal);
     store.saved = (word, cal);
     let result = match store.next {
@@ -321,6 +419,19 @@ pub fn save(flash: &mut Flash, store: &mut Store, minutes: u32, cal: Calibration
                 n += 1;
             }
             n = crate::push_dec(&mut d, n, minutes);
+            for &b in b" EN=" {
+                d[n] = b;
+                n += 1;
+            }
+            for &b in settings_core::EnergyMemory::ALL
+                .get(energy_idx)
+                .map(|&m| m.label())
+                .unwrap_or("OFF")
+                .as_bytes()
+            {
+                d[n] = b;
+                n += 1;
+            }
             for &b in b" saved s=" {
                 d[n] = b;
                 n += 1;
@@ -384,7 +495,7 @@ fn claim_next(flash: &mut Flash, store: &mut Store) -> Result<(u32, usize), ()> 
     // (0 → 19, r220 — kws-x1's direction; claims stay contiguous). The
     // erase is our littlefs deviation.
     let sector = (0..SECTORS)
-        .find(|&s| claim_word(flash, s) != CLAIM)
+        .find(|&s| claim_word(flash, s) != CLAIM && !ENERGY_SECTORS.contains(&s))
         .ok_or(())?;
     flash.erase_sector(sector)?;
     // The erase must leave the sector blank (a failed erase would let

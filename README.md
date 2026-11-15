@@ -162,7 +162,17 @@ the 32-bit-wide variant; `m` = a DMA memory-to-memory copy (engine
 test); `af`/`ad`/`ap` = the AFC handshake-path commit, direct-entry
 commit, and ping-width sweep (see the AFC section). `b` = toggle the idle dim (r216).
 `c` = the applied calibration fields + the meter's raw registers
-(r221: `[cal] z=… c=… v=… raw=<bus>/<cur> f=<fresh>`).
+(r221: `[cal] z=… c=… v=… raw=<bus>/<cur> f=<fresh>`). `x` = advance
+one screen forward (r225 — the remote navigation the screenshot
+workflow drives). `shot` =
+arm the screenshot capture — the next loop tick forces a full repaint
+of the CURRENT screen with the LCD's capture sink on, streaming one
+line per draw primitive (`F x0 y0 x1 y1 cccc` / `C x y s fg bg hh`);
+`tools/fnb58-shot.py COM6 out.png` collects the stream and replays it
+into a PNG (the panel's data line is write-only — no MISO — so the
+primitive stream is the framebuffer; a PD exchange in flight refuses
+with `[shot] refused: pd busy`, and the forced repaint never disturbs
+selection modes or the calibration wizard).
 
 ## PC link (r134/r135) — OpenFNB58 protocol, hardware-verified
 
@@ -371,32 +381,37 @@ W25Q128 carries the stock firmware's littlefs, so claiming ERASES the
 sector first — once per ~10,240 records, never during saves. The
 region boundary protects everything beyond sector 20.
 
-**Screen 7/8 (SET, r222)**: LEFT/RIGHT always navigate (the r218
-always-adjusting screen blocked reaching screen 8); **OK enters the
-adjust mode** (hint `OK:DIM` → `LR:DIM OK:SAVE BK:X`), LEFT/RIGHT cycle
-the idle-dim timeout (1/2/5/10/NEVER minutes), OK saves it
-(`[set] dim=N min saved s=<sect>` on the console) and leaves the
-adjust mode, BACK leaves without saving. The value applies immediately
-(the idle logic reads `settings::DIM_MINUTES`). Boot evidence:
-`[set] stored dim=N min` or `[set] no stored settings (default dim=1)`;
-a JEDEC mismatch logs `[set] flash JEDEC FAIL` and leaves defaults.
+**Screen 10/11 (SET, r226)**: kws-x1's two-level page — LEFT/RIGHT
+always navigate (the r218 always-adjusting screen blocked reaching the
+later screens; r222 gated the adjust, r226 grew the rows); **OK enters
+Row mode** (hint `OK:SET` → `LR:ROW OK:EDIT BK:X`), LEFT/RIGHT move the
+cursor over the two rows (DIM IDLE, ENERGY SAVE), **OK opens the row's
+editor** (`LR:ADJ OK:SAVE BK:X`), LEFT/RIGHT change that row's value,
+OK saves it (`[set] dim=N min EN=<interval> saved s=<sect>` on the
+console) and returns to Row mode, BACK steps back a level. The dim
+timeout applies immediately; the energy interval arms the journal's
+checkpoint cadence (previewing never checkpoints per arrow tap). Boot
+evidence: `[set] stored dim=N min` + `[set] energy <interval>` or
+`[set] no stored settings (default dim=1)`; a JEDEC mismatch logs
+`[set] flash JEDEC FAIL` and leaves defaults.
 
-## Calibration (r221/r221b)
+## Calibration (r221/r221b/r226)
 
-Screen 8/8 (CAL) — kws-x1's calibration wizard: a zero offset
-subtracted first, then gain corrections in ppm, found from
-**user-supplied reference values** (each entry starts at this meter's
-own averaged reading; walk it to what your reference meter shows — no
-fixed calibration points). Three steps, nothing applied until the
-last OK:
+Screen 11/11 (CAL, r226 landing) — the screen first shows the APPLIED
+card (the stored zero/gain fields) and **OK enters the wizard**:
+kws-x1's calibration steps — a zero offset subtracted first, then gain
+corrections in ppm, found from **user-supplied reference values** (each
+entry starts at this meter's own averaged reading; walk it to what your
+reference meter shows — no fixed calibration points). Inside the
+wizard LEFT/RIGHT adjust (±1 per press, hold for ±10), OK walks, BACK
+cancels to the landing. Three steps, nothing applied until the last OK:
 
 1. **0 CURRENT** — unplug the load, OK takes the zero (refused above
    20 mA: the message stays and the step repeats).
-2. **CURRENT** — a steady load ≥ 0.5 A: LEFT/RIGHT walk the entered
-   amps (±1 per press, hold for ±10), OK confirms; > ±5% off refuses.
+2. **CURRENT** — a steady load ≥ 0.5 A: walk the entered amps to your
+   reference, OK confirms; > ±5% off refuses.
 3. **VOLTAGE** — ≥ 4 V on the bus: same walk, OK applies and saves
-   (`[set] cal z=… c=… v=…` on the console); leaving the screen
-   abandons the wizard (kws-x1's cancel).
+   (`[set] cal z=… c=… v=…` on the console).
 
 Records ride the settings store (one per field, kws-x1's `0xCA` codec,
 later records win); the applied values feed the power screen, the
@@ -412,6 +427,58 @@ CAL=10240 (50 µA/count) capped the register at ±1.638 A through the
 5 mΩ/500 µA setup) = 250 µA/count, the register maps the shunt
 register 1:1, and the span is **±8.19 A** — the 0–7 A range with
 margin. Sub-0.25 mA resolution is traded away.
+
+## Graphical screens (r224–r227)
+
+kws-x1's screen designs ported onto the 320×240 panel, all built from
+rounded outlined cards with notched labels (r224's `card()` helper) so
+the screenshot capture sees every primitive:
+
+- **Screen 1/11 (OVERVIEW, r224)**: the header (title in the tab's
+  colour, four group-tab pills, page dots, rule), the VOLTAGE /
+  CURRENT / POWER cards, the MAX card (session peaks — OK resets them)
+  and the PROTOCOL strip (the live badge: PD contract, QC2/QC3/AFC
+  trigger, USB idle). The power register read is dropped — power
+  derives from the calibrated V×I.
+- **Screen 2/11 (GRAPH, r227)**: the NOW/MAX card (the latest second
+  and the window's highest V/A/W) over a plot of the per-second
+  history — one column per second (highest per pixel column when the
+  window outgrows the plot) in the trace's colour over its tint, the
+  auto-scaled full-scale label (peak +10% headroom on the
+  10/12/15/20/25/30/40/50/60/80 steps), OK walks the focus
+  None → trace → window → None, LEFT/RIGHT change the focused value.
+  RAM only — a restart clears it.
+- **Screen 3/11 (LINES, r225)**: kws-x1's Lines page with only the
+  D+/D− cards (this tester's CC lines are not wired to the MCU); live
+  20 Hz tap readings, "approximate" by design.
+- **Screen 4/11 (ENERGY, r226)**: the CHARGE / ENERGY / TIME totals in
+  stacked cards; OK resets them (and checkpoints the zeros).
+- The 5×7 font grew `<`, `>`, `+` and `h` (append-only; the shot
+  tool's table is kept in sync).
+- **Border lesson (r227b)**: padded text overdraws must be bounded by
+  the card interior, not the formatter's 12-char cap — the value rows'
+  padded trailing spaces were opaque black cells that erased the
+  cards' right borders every redraw (the flicker).
+
+## Energy journal (r226)
+
+The energy totals checkpoint to a two-sector journal (kws-x1's
+`energy_store` durability core: "EN02" pair on W25Q sectors 18/19 —
+the top of the settings region — sequence + word-complements + COMMIT
+records, power-cut recovery scanning past torn records,
+erase-partner-then-claim rollover; the flash backend is passed per
+call because the W25Q is shared, and no legacy-log migration exists
+here). The interval is the ENERGY SAVE setting: OFF never writes
+(RAM only), 5/10/30/60 s trade flash endurance for less power-loss
+lag. Boot evidence: `[en] pair ready`, `[en] loaded mah=… mwh=…`;
+failures log `[en] save FAIL`.
+
+## Screenshot tool (r223)
+
+`shot` arms a full repaint with the LCD's capture sink on (see the
+console list); **`x` advances one screen** — the two together let a
+host navigate and capture every screen without touching the buttons:
+`python tools/fnb58-shot.py COM6 out.png`.
 
 ## Build and flash
 

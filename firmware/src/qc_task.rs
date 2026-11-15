@@ -21,7 +21,7 @@
 //! Coordination (the pd_task convention): atomics + the executor only.
 //! No I2C here — the main loop's meter read publishes VBUS_MV.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicU16, Ordering};
 use embassy_time::{block_for, Duration, Instant, Timer};
 use qc_protocol::detect::{Follow, Outcome};
 use qc_protocol::qc2::{Failure, Handshake, Level, Progress, Session, Voltage, REQUEST_SETTLE_MS};
@@ -199,7 +199,39 @@ fn log_dec(prefix: &[u8], values: &[u32], infixes: &[&[u8]]) {
 const MODE_FIXED: u8 = 0;
 const MODE_CONTINUOUS: u8 = 1;
 const MODE_AFC: u8 = 2;
-static MODE: AtomicU8 = AtomicU8::new(MODE_FIXED);
+/// r224: which trigger owns the protocol-strip badge while a QC/AFC
+/// session is live (the overview reads it when STATE is Active/
+/// Stepping). Stored by every commit path before COMMIT.
+pub static MODE: AtomicU8 = AtomicU8::new(MODE_FIXED);
+
+/// r224: session peaks (kws-x1's meter.peaks — the overview's MAX
+/// card). Millivolts / microamperes (magnitude) / milliwatts; positive
+/// power only (the negative direction is the shunt's other side).
+pub static PEAK_MV: AtomicU32 = AtomicU32::new(0);
+pub static PEAK_UA: AtomicU32 = AtomicU32::new(0);
+pub static PEAK_MW: AtomicU32 = AtomicU32::new(0);
+
+/// Fold one calibrated meter sample into the peaks.
+pub fn observe_peak(mv: u32, ua: i32, mw: i32) {
+    let mva = ua.unsigned_abs();
+    if mv > PEAK_MV.load(Ordering::Relaxed) {
+        PEAK_MV.store(mv, Ordering::Relaxed);
+    }
+    if mva > PEAK_UA.load(Ordering::Relaxed) {
+        PEAK_UA.store(mva, Ordering::Relaxed);
+    }
+    if mw > 0 && (mw as u32) > PEAK_MW.load(Ordering::Relaxed) {
+        PEAK_MW.store(mw as u32, Ordering::Relaxed);
+    }
+}
+
+/// Reset the peaks (kws-x1's long-OK reset; the FNB58's plain OK on
+/// the overview screen).
+pub fn reset_peaks() {
+    PEAK_MV.store(0, Ordering::Relaxed);
+    PEAK_UA.store(0, Ordering::Relaxed);
+    PEAK_MW.store(0, Ordering::Relaxed);
+}
 
 /// What the handshake is FOR, captured at the starting commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

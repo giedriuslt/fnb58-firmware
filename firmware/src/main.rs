@@ -52,13 +52,22 @@ static TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 static BL_LAST_ACTIVITY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static BL_DIMMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// r223: console 'shot' armed — the main loop's consume block forces a
+/// full repaint of the current screen with the LCD's capture sink on,
+/// streaming the draw primitives to the host (tools/fnb58-shot.py).
+static SHOT_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// r225: console 'x' armed — advance one screen forward (the remote
+/// navigation the screenshot workflow drives: 'x' then 'shot').
+static NEXT_SCREEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r222";
+const BUILD: &[u8] = b"r227";
 
 use crate::ui::Press;
 use crate::ui::Screen;
+use crate::ui::SetMode;
 use crate::ui::Ui;
 use core::sync::atomic::Ordering;
 use embassy_executor::Spawner;
@@ -224,7 +233,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r222 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r227 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot, through the
@@ -305,10 +314,11 @@ async fn main(spawner: Spawner) {
                 let mv = (uv / 1000) as u32;
                 let ua = ia as i32;
                 let mw = ((mv as i64 * ua as i64) / 1_000_000) as i32;
+                qc_task::observe_peak(mv, ua, mw);
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r222 " {
+                for &b in b"r227 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -415,7 +425,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r222: claim from sector 0\r\n");
+    say(b"[lcd] FNB58 r227: claim from sector 0\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -439,6 +449,53 @@ async fn main(spawner: Spawner) {
     // r218: the settings store — loads the stored dim timeout (or the
     // 1-minute default) from the external flash's first 20 sectors.
     let (mut store, _stored) = settings::open(&mut flash);
+    // r226: the energy journal — prepare the pair, recover the newest
+    // checkpoint read-only, and start the tracker from it (kws-x1
+    // main.rs:1052). The journal keeps only cursor state; the flash is
+    // passed per save.
+    let mut energy_journal = match settings::prepare_energy(&mut flash) {
+        settings_core::energy_store::Preparation::Ready => {
+            say(b"[en] pair ready
+");
+            settings::open_energy(&mut flash)
+        }
+        _ => {
+            say(b"[en] prepare FAIL
+");
+            None
+        }
+    };
+    let mut energy = settings_core::energy::Tracker::new(
+        energy_journal
+            .as_ref()
+            .map(|s| s.totals())
+            .unwrap_or_default(),
+    );
+    let mut energy_save_ok = energy_journal.is_some();
+    let mut next_energy_save: Option<u64> = None;
+    // r227: the graph's per-second history (RAM only, kws-x1
+    // main.rs:1084 — no flash wear, a restart clears it).
+    let mut power_history = settings_core::power_history::History::default();
+    if let Some(t) = energy_journal.as_ref().map(|s| s.totals()) {
+        let mut d = [0u8; 64];
+        let mut n = 0;
+        for &b in b"[en] loaded mah=" {
+            d[n] = b;
+            n += 1;
+        }
+        n = push_dec(&mut d, n, t.milliamp_hours() as u32);
+        for &b in b" mwh=" {
+            d[n] = b;
+            n += 1;
+        }
+        n = push_dec(&mut d, n, t.milliwatt_hours() as u32);
+        for &b in b"
+" {
+            d[n] = b;
+            n += 1;
+        }
+        say(&d[..n]);
+    }
     lcd.init().await;
     say(b"[lcd] init done, drawing bars\r\n");
     lcd.test_pattern().await;
@@ -810,6 +867,24 @@ async fn main(spawner: Spawner) {
             ui.draw_ripple(&mut lcd, ripple_reading.as_ref(), reference)
                 .await;
         }
+        // r225: the lines screen — same BUSY gate (the D± values are
+        // the QC task's published taps, refreshed at 20 Hz).
+        if ui.screen == Screen::Lines && !pd_task::BUSY.load(Ordering::Relaxed) {
+            ui.draw_lines(&mut lcd).await;
+        }
+
+        // r226: the energy screen — same BUSY gate (the totals come
+        // from this loop's tracker).
+        if ui.screen == Screen::Energy && !pd_task::BUSY.load(Ordering::Relaxed) {
+            ui.draw_energy(&mut lcd, energy.totals, energy_save_ok).await;
+        }
+
+        // r227: the graph screen — same gate (the plot redraws per
+        // second-average; ~600 fills is well within the 200 ms budget).
+        if ui.screen == Screen::Graph && !pd_task::BUSY.load(Ordering::Relaxed) {
+            ui.draw_graph(&mut lcd, &power_history).await;
+        }
+
         // r218: the settings screen — same BUSY gate (only the draw
         // blocks; the save on OK does its own bounded blocking).
         if ui.screen == Screen::Settings && !pd_task::BUSY.load(Ordering::Relaxed) {
@@ -821,6 +896,74 @@ async fn main(spawner: Spawner) {
         // both self-cache inside draw_cal).
         if ui.screen == Screen::Cal && !pd_task::BUSY.load(Ordering::Relaxed) {
             ui.draw_cal(&mut lcd).await;
+        }
+
+        // r225: console 'x' — advance one screen forward (the remote
+        // navigation the screenshot workflow drives: 'x' then 'shot').
+        if NEXT_SCREEN.swap(false, Ordering::Relaxed) {
+            ui.enter(&mut lcd, crate::ui::next_screen(ui.screen, 1)).await;
+            sender.push(b"[ui] advanced\r\n");
+        }
+
+        // r223: console 'shot' — force a full repaint of the CURRENT
+        // screen with the LCD's capture sink armed: every draw primitive
+        // streams to the console (tools/fnb58-shot.py replays them into
+        // a PNG). force_repaint() resets only the draw caches, so a shot
+        // never exits a selection mode or abandons the calibration
+        // wizard; the chrome comes from draw_chrome. The capture runs
+        // with the real SPI writes too, so the panel keeps matching the
+        // captured image. Refused during a PD exchange (the draws block
+        // the executor exactly like the gates allow them otherwise).
+        if SHOT_ARMED.swap(false, Ordering::Relaxed) {
+            if pd_task::BUSY.load(Ordering::Relaxed) {
+                sender.push(b"[shot] refused: pd busy\r\n");
+            } else {
+                ui.force_repaint();
+                lcd.capture = true;
+                lcd.capture_n = 0;
+                lcd.fill(0x0000).await; // BLACK (ui.rs's palette const)
+                ui.draw_chrome(&mut lcd, ui.screen).await;
+                match ui.screen {
+                    Screen::Power => {
+                        // The meter block's exact conversion (r221), from
+                        // the published raw registers.
+                        let cal = settings::applied();
+                        let bus = qc_task::METER_BUS_RAW.load(Ordering::Relaxed);
+                        let cur = qc_task::METER_CUR_RAW.load(Ordering::Relaxed);
+                        let mv = cal.millivolts(bus);
+                        let ua = cal.milliamps(cur);
+                        let mw = ((mv as i64 * ua as i64) / 1000) as i32;
+                        ui.draw_power(&mut lcd, mv, ua, mw).await;
+                    }
+                    Screen::Lines => ui.draw_lines(&mut lcd).await,
+                    Screen::Energy => ui.draw_energy(&mut lcd, energy.totals, energy_save_ok).await,
+                    Screen::Graph => ui.draw_graph(&mut lcd, &power_history).await,
+                    Screen::Pd => ui.draw_pd(&mut lcd, &pd_task::VIEW).await,
+                    Screen::Qc => ui.draw_qc(&mut lcd).await,
+                    Screen::Qc3 => ui.draw_qc3(&mut lcd).await,
+                    Screen::Afc => ui.draw_afc(&mut lcd).await,
+                    Screen::Ripple => {
+                        let reference = Some(ripple::REFERENCE.load(Ordering::Relaxed));
+                        ui.draw_ripple(&mut lcd, ripple_reading.as_ref(), reference)
+                            .await;
+                    }
+                    Screen::Settings => ui.draw_settings(&mut lcd).await,
+                    Screen::Cal => ui.draw_cal(&mut lcd).await,
+                }
+                lcd.capture = false;
+                let mut d = [0u8; 32];
+                let mut n = 0;
+                for &b in b"[shot] done n=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                n = push_dec(&mut d, n, lcd.capture_n);
+                for &b in b"\r\n" {
+                    d[n] = b;
+                    n += 1;
+                }
+                sender.push(&d[..n]);
+            }
         }
 
         // r221: the calibration entry's held-button repeat — the FNB58
@@ -880,9 +1023,15 @@ async fn main(spawner: Spawner) {
             match ui.on_press(i) {
                 Press::Switch(screen) => ui.enter(&mut lcd, screen).await,
                 Press::Commit => {
+                    // r224: the overview's OK resets the session peaks.
+                    if ui.screen == Screen::Power {
+                        qc_task::reset_peaks();
+                        sender.push(b"[meter] peaks reset\r\n");
+                        ui.force_repaint();
+                    }
                     // r189/r196: the QC screens' OK requests their target
                     // through the QC task (entry guard inside the task).
-                    if ui.screen == Screen::Qc {
+                    else if ui.screen == Screen::Qc {
                         qc_task::commit_fixed();
                         sender.push(b"[qc] commit\r\n");
                     } else if ui.screen == Screen::Qc3 {
@@ -892,18 +1041,36 @@ async fn main(spawner: Spawner) {
                         qc_task::commit_afc();
                         sender.push(b"[afc] commit\r\n");
                     } else if ui.screen == Screen::Settings {
-                        // r218: save the shown dim timeout to the store
-                        // (r221: the applied calibration rides along —
-                        // unchanged fields write nothing). r222: the
-                        // save also leaves the OK-gated adjust mode.
+                        // r226: save the edited row's value — the word
+                        // packs dim + energy, the calibration rides along
+                        // (unchanged fields write nothing); back to the
+                        // row cursor after the save.
                         let minutes = settings::DIM_CHOICES
                             .get(ui.set_sel)
                             .copied()
                             .unwrap_or(1);
-                        settings::save(&mut flash, &mut store, minutes, settings::applied());
-                        ui.selecting = false;
+                        settings::save(
+                            &mut flash,
+                            &mut store,
+                            minutes,
+                            ui.set_energy,
+                            settings::applied(),
+                        );
+                        ui.set_mode = SetMode::Row;
                         ui.set_drawn = -1; // redraw shows the applied value
                         ui.draw_hint(&mut lcd).await;
+                    } else if ui.screen == Screen::Energy {
+                        // r226: the energy page's OK resets the totals and
+                        // checkpoints the zeros (kws-x1's hold-OK reset;
+                        // no long-press here).
+                        energy.reset();
+                        energy_save_ok = energy_journal
+                            .as_mut()
+                            .map(|s| s.save(&mut settings::EnergyFlash(&mut flash), energy.totals))
+                            .unwrap_or(false);
+                        ui.force_repaint();
+                        sender.push(b"[en] reset
+");
                     } else if pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) {
                         pd_task::commit_desired();
                         sender.push(b"[pd] commit\r\n");
@@ -961,6 +1128,7 @@ async fn main(spawner: Spawner) {
                             &mut flash,
                             &mut store,
                             settings::DIM_MINUTES.load(Ordering::Relaxed),
+                            settings::ENERGY_IDX.load(Ordering::Relaxed),
                             cal,
                         );
                         ui.enter(&mut lcd, Screen::Settings).await;
@@ -987,10 +1155,105 @@ async fn main(spawner: Spawner) {
                         }
                     }
                 }
+                Press::SetRow(dir) => {
+                    // r226: the settings page's row cursor.
+                    ui.set_row = ((ui.set_row as i16 + dir).rem_euclid(2)) as usize;
+                    ui.set_drawn = -1;
+                    let mut d = [0u8; 24];
+                    let mut n = 0;
+                    for &b in b"[set] row=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    d[n] = b'0' + ui.set_row as u8;
+                    d[n + 1] = b'\r';
+                    d[n + 2] = b'\n';
+                    sender.push(&d[..n + 3]);
+                }
+                Press::GraphTrace(dir) => {
+                    // r227: the graph's focused trace (kws-x1
+                    // buttons.rs:1677).
+                    let all = settings_core::power_history::GraphTrace::ALL;
+                    let index = all
+                        .iter()
+                        .position(|&t| t == ui.graph_trace)
+                        .unwrap_or(0);
+                    ui.graph_trace = all[((index as i16 + dir).rem_euclid(all.len() as i16)) as usize];
+                    ui.set_drawn = -1; // n/a but keeps any cached body redraw honest
+                    let mut d = [0u8; 32];
+                    let mut n = 0;
+                    for &b in b"[graph] trace=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    for &b in ui.graph_trace.label().as_bytes() {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    for &b in b"
+" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    sender.push(&d[..n]);
+                }
+                Press::GraphWindow(dir) => {
+                    // r227: the graph's time window.
+                    let all = settings_core::power_history::GraphWindow::ALL;
+                    let index = all
+                        .iter()
+                        .position(|&w| w == ui.graph_window)
+                        .unwrap_or(0);
+                    ui.graph_window = all[((index as i16 + dir).rem_euclid(all.len() as i16)) as usize];
+                    let mut d = [0u8; 32];
+                    let mut n = 0;
+                    for &b in b"[graph] window=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    for &b in ui.graph_window.label().as_bytes() {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    for &b in b"
+" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    sender.push(&d[..n]);
+                }
                 Press::Voltage(dir) => {
                     // r171: the PPS screen's voltage selection. r189/r196:
-                    // the QC screens cycle their own targets. r218: the
-                    // settings screen cycles its dim choice in place.
+                    // the QC screens cycle their own targets. r226: the
+                    // settings page's Edit mode changes the CURSOR row's
+                    // value (dim, or the energy checkpoint interval).
+                    if ui.screen == Screen::Settings && ui.set_row == 1 {
+                        let all = settings_core::EnergyMemory::ALL;
+                        let idx = (ui.set_energy as i16 + dir)
+                            .rem_euclid(all.len() as i16) as usize;
+                        ui.set_energy = idx;
+                        ui.set_drawn = -1;
+                        // Previewing intervals must not write checkpoints
+                        // on every arrow tap (kws-x1): re-arm the deadline.
+                        next_energy_save = None;
+                        let mut d = [0u8; 32];
+                        let mut n = 0;
+                        for &b in b"[set] energy " {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        for &b in all[idx].label().as_bytes() {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        for &b in b"
+" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        sender.push(&d[..n]);
+                        continue;
+                    }
                     if ui.screen == Screen::Settings {
                         let len = settings::DIM_CHOICES.len() as i16;
                         ui.set_sel =
@@ -1200,6 +1463,48 @@ async fn main(spawner: Spawner) {
                     let mv = cal.millivolts(bus);
                     let ua = cal.milliamps(cur);
                     let mw = ((mv as i64 * ua as i64) / 1000) as i32;
+                    // r224: the overview's MAX card (session peaks).
+                    qc_task::observe_peak(mv, ua, mw);
+                    // r226: the energy integration (kws-x1's
+                    // energy.sample — calibrated values, both directions
+                    // as throughput; a u64 clock, not the wrapping u32).
+                    let now64 = embassy_time::Instant::now().as_millis();
+                    energy.sample(now64, Some((mv, ua)));
+                    // r227: the graph's per-second averages (kws-x1
+                    // main.rs:1225 — current as a mA magnitude).
+                    power_history.sample(
+                        now64,
+                        Some(settings_core::power_history::Sample {
+                            mv: mv.min(u16::MAX as u32) as u16,
+                            ma: ((ua.unsigned_abs() / 1000).min(u16::MAX as u32)) as u16,
+                            mw: mw.max(0) as u32,
+                        }),
+                    );
+                    // r226: the energy checkpoint on the interval (kws-x1
+                    // main.rs:1242). The meter block's !BUSY gate keeps
+                    // the slow flash erase off a PD exchange.
+                    if let Some(seconds) = settings::energy_interval() {
+                        let due = match next_energy_save {
+                            None => {
+                                next_energy_save = Some(now64 + seconds * 1000);
+                                false
+                            }
+                            Some(t) => now64 >= t,
+                        };
+                        if due {
+                            energy_save_ok = energy_journal
+                                .as_mut()
+                                .map(|s| s.save(&mut settings::EnergyFlash(&mut flash), energy.totals))
+                                .unwrap_or(false);
+                            if !energy_save_ok {
+                                sender.push(b"[en] save FAIL
+");
+                            }
+                            next_energy_save = Some(now64 + seconds * 1000);
+                        }
+                    } else {
+                        next_energy_save = None;
+                    }
                     // The RAW registers publish for the calibration
                     // screen (its rows calibrate at draw time, through
                     // the wizard's pending).
@@ -1509,6 +1814,19 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
         return;
     }
     match cmd[0] {
+        // r223: arm the screenshot capture — the main loop's next tick
+        // forces a full repaint of the CURRENT screen with the capture
+        // sink on (tools/fnb58-shot.py collects the primitive stream).
+        b's' if cmd == b"shot" => {
+            SHOT_ARMED.store(true, Ordering::Relaxed);
+            send_direct(b"[shot] armed\r\n");
+        }
+        // r225: arm one screen advance (consumed by the main loop's
+        // next tick — remote navigation for the screenshot workflow).
+        b'x' => {
+            NEXT_SCREEN.store(true, Ordering::Relaxed);
+            send_direct(b"[ui] advance armed\r\n");
+        }
         // r221: the applied calibration + the meter's raw state (the
         // wizard's inputs) — hardware verification without navigating.
         b'c' => {

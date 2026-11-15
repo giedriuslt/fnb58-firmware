@@ -18,6 +18,9 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod calibration;
+pub mod energy;
+pub mod energy_store;
+pub mod power_history;
 
 use calibration::Found;
 
@@ -53,57 +56,120 @@ pub fn dim_minutes_to_record(minutes: u32) -> Option<u32> {
     }
 }
 
-/// Decode a record word's dim-minutes setting. Bits above the low byte
-/// must be zero (reserved for future settings); an unknown low byte is
-/// not a dim record.
+/// Decode a record word's dim-minutes setting: the low byte, valid
+/// values only. r226: the bits above now carry the energy-memory index
+/// (the r218 reservation taken) — they are ignored here.
 pub fn dim_minutes_from_record(word: u32) -> Option<u32> {
-    if word >> 8 != 0 {
-        return None;
-    }
     match word & 0xFF {
         0 | 1 | 2 | 5 | 10 => Some(word & 0xFF),
         _ => None,
     }
 }
 
+/// r226: energy checkpoint interval (kws-x1's EnergyMemory). Off never
+/// writes totals and starts each boot from zero; the other choices
+/// trade flash endurance for less power-loss lag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EnergyMemory {
+    #[default]
+    Off,
+    Seconds5,
+    Seconds10,
+    Seconds30,
+    Seconds60,
+}
+
+impl EnergyMemory {
+    pub const ALL: [Self; 5] = [
+        Self::Off,
+        Self::Seconds5,
+        Self::Seconds10,
+        Self::Seconds30,
+        Self::Seconds60,
+    ];
+
+    pub fn seconds(self) -> Option<u64> {
+        match self {
+            Self::Off => None,
+            Self::Seconds5 => Some(5),
+            Self::Seconds10 => Some(10),
+            Self::Seconds30 => Some(30),
+            Self::Seconds60 => Some(60),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Seconds5 => "5S",
+            Self::Seconds10 => "10S",
+            Self::Seconds30 => "30S",
+            Self::Seconds60 => "60S",
+        }
+    }
+}
+
+/// The settings record word: the dim minutes in the low byte, the
+/// energy-memory index in bits 8..10 (kws-x1 packs its settings word
+/// as bitfields; the r218 word's reserved bits were held for exactly
+/// this). Callers validate `minutes` via [`dim_minutes_to_record`].
+pub fn settings_word(minutes: u32, energy_idx: usize) -> u32 {
+    (minutes & 0xFF) | ((energy_idx as u32 & 0x7) << 8)
+}
+
+/// Decode a record word's energy-memory index (bits 8..10, valid
+/// indices only).
+pub fn energy_memory_from_record(word: u32) -> Option<usize> {
+    let idx = (word >> 8 & 0x7) as usize;
+    if idx < EnergyMemory::ALL.len() { Some(idx) } else { None }
+}
+
+/// The scan fold's carried findings: the newest dim minutes, the newest
+/// energy-memory index and the newest calibration fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanState {
+    pub dim: Option<u32>,
+    pub energy: Option<usize>,
+    pub cal: Found,
+}
+
 /// The scan fold over one claimed sector's record words (later records
-/// win). `dim` carries the newest dim value so far and `cal` the newest
-/// calibration fields (kws-x1's scan: a valid word feeds the calibration
-/// reader first, and only a non-calibration word decodes as the settings
-/// word); returns the updated pair and the byte offset of the next free
-/// record slot, or `None` when the sector is full (`slot + RECORD >
-/// end`). Blank pair = end of records.
+/// win). Every valid non-calibration word decodes BOTH settings fields
+/// (kws-x1's scan: the calibration reader first, then the settings
+/// word — one word is one settings snapshot); returns the updated state
+/// and the byte offset of the next free record slot, or `None` when the
+/// sector is full (`slot + RECORD > end`). Blank pair = end of records.
 pub fn scan_records(
     words: impl Iterator<Item = (u32, u32)>,
-    mut dim: Option<u32>,
-    mut cal: Found,
+    mut state: ScanState,
     end: usize,
-) -> (Option<u32>, Found, Option<usize>) {
+) -> (ScanState, Option<usize>) {
     let mut slot = FIRST;
     for (word, check) in words {
         if word == BLANK && check == BLANK {
-            return (dim, cal, Some(slot));
+            return (state, Some(slot));
         }
         if valid(word, check) {
-            if !cal.read(word) {
+            if !state.cal.read(word) {
+                // kws-x1's fold (settings_store.rs:67): the LATER record
+                // replaces — records iterate oldest-to-newest, and claims
+                // advance 0,1,... (r220) — a later-claimed (newer) sector
+                // scanned later overrides an earlier one, exactly the
+                // "only the newest claimed sector has room" invariant.
                 if let Some(minutes) = dim_minutes_from_record(word) {
-                    // kws-x1's fold (settings_store.rs:67): decode(word).or(found)
-                    // — the LATER record replaces, so the newest valid record
-                    // in the scan wins. Records iterate oldest-to-newest, and
-                    // claims advance 0,1,...,19 (kws-x1's
-                    // low-end-first direction, r220) — a later-claimed (newer)
-                    // sector scanned later overrides an earlier one, exactly
-                    // the "only the newest claimed sector has room" invariant.
-                    dim = Some(minutes);
+                    state.dim = Some(minutes);
+                }
+                if let Some(idx) = energy_memory_from_record(word) {
+                    state.energy = Some(idx);
                 }
             }
         }
         slot += RECORD;
         if slot + RECORD > end {
-            return (dim, cal, None);
+            return (state, None);
         }
     }
-    (dim, cal, None)
+    (state, None)
 }
 
 #[cfg(test)]
@@ -134,9 +200,25 @@ mod tests {
         }
         assert_eq!(dim_minutes_to_record(3), None);
         assert_eq!(dim_minutes_to_record(60), None);
-        // Unknown values and reserved bits are skipped by the scan.
+        // Unknown values are skipped by the scan; r226: the high bits now
+        // carry the energy index and no longer reject the word.
         assert_eq!(dim_minutes_from_record(3), None);
-        assert_eq!(dim_minutes_from_record(0x100), None);
+        assert_eq!(dim_minutes_from_record(0x100), Some(0));
+    }
+
+    /// r226: the settings word packs dim + energy; both decode from one
+    /// record (one word = one settings snapshot, later records win).
+    #[test]
+    fn settings_word_packs_dim_and_energy() {
+        for (minutes, idx) in [(0u32, 0usize), (10, 4), (5, 2)] {
+            let word = settings_word(minutes, idx);
+            assert_eq!(dim_minutes_from_record(word), Some(minutes));
+            assert_eq!(energy_memory_from_record(word), Some(idx));
+        }
+        // An invalid energy index decodes as nothing; dim survives.
+        assert_eq!(energy_memory_from_record(settings_word(5, 6)), None);
+        // The old single-field words read as energy=Off (index 0).
+        assert_eq!(energy_memory_from_record(5), Some(0));
     }
 
     #[test]
@@ -152,32 +234,39 @@ mod tests {
             (BLANK, BLANK),
             (BLANK, BLANK),
         ];
-        let (found, _, next) =
-            scan_records(records.into_iter(), None, Found::default(), FIRST + records.len() * RECORD);
-        assert_eq!(found, Some(5));
+        let (state, next) =
+            scan_records(records.into_iter(), ScanState::default(), FIRST + records.len() * RECORD);
+        assert_eq!(state.dim, Some(5));
+        assert_eq!(state.energy, Some(0));
         assert_eq!(next, Some(FIRST + 3 * RECORD));
         // Full sector: no blank pair before the end.
         let records = [(dim, !dim), (dim5, !dim5)];
-        let (found, _, next) =
-            scan_records(records.into_iter(), None, Found::default(), FIRST + records.len() * RECORD);
-        assert_eq!(found, Some(5));
+        let (state, next) =
+            scan_records(records.into_iter(), ScanState::default(), FIRST + records.len() * RECORD);
+        assert_eq!(state.dim, Some(5));
         assert_eq!(next, None);
         // Empty sector: blank at the first slot.
-        let (found, _, next) =
-            scan_records([(BLANK, BLANK), (BLANK, BLANK)].into_iter(), None, Found::default(), 32);
-        assert_eq!(found, None);
+        let (state, next) =
+            scan_records([(BLANK, BLANK), (BLANK, BLANK)].into_iter(), ScanState::default(), 32);
+        assert_eq!(state.dim, None);
         assert_eq!(next, Some(FIRST));
         // Interrupted writes and garbage are skipped.
         let records = [(0xABCD, BLANK), (dim, !dim), (BLANK, BLANK)];
-        let (found, _, _) =
-            scan_records(records.into_iter(), None, Found::default(), FIRST + records.len() * RECORD);
-        assert_eq!(found, Some(2));
+        let (state, _) =
+            scan_records(records.into_iter(), ScanState::default(), FIRST + records.len() * RECORD);
+        assert_eq!(state.dim, Some(2));
         // Across sectors (claims advance 0,1,...: later-claimed sectors
         // hold newer records) — the accumulated fold lets the later scan
         // override: the r218 hardware bug was first-wins keeping the
         // stale record from the same sector.
-        let (found, _, _) = scan_records([(dim, !dim)].into_iter(), Some(10), Found::default(), 32);
-        assert_eq!(found, Some(2));
+        let (state, _) = scan_records([(dim, !dim)].into_iter(), ScanState { dim: Some(10), ..ScanState::default() }, 32);
+        assert_eq!(state.dim, Some(2));
+        // A packed dim+energy word updates both fields.
+        let word = settings_word(5, 3);
+        let (state, _) =
+            scan_records([(word, !word)].into_iter(), ScanState::default(), FIRST + RECORD);
+        assert_eq!(state.dim, Some(5));
+        assert_eq!(state.energy, Some(3));
     }
 
     /// r221: calibration records ride the same scan — a calibration word
@@ -198,10 +287,10 @@ mod tests {
             .map(|&w| (w, !w))
             .chain([(dim, !dim)])
             .collect();
-        let (dim_found, cal_found, _) =
-            scan_records(records.into_iter(), None, Found::default(), FIRST + 4 * RECORD);
-        assert_eq!(dim_found, Some(5));
-        assert_eq!(cal_found.calibration(), cal);
+        let (state, _) =
+            scan_records(records.into_iter(), ScanState::default(), FIRST + 4 * RECORD);
+        assert_eq!(state.dim, Some(5));
+        assert_eq!(state.cal.calibration(), cal);
         // A newer (later-scanned) calibration record overrides.
         let newer = Calibration {
             zero_ua: 100,
@@ -213,18 +302,17 @@ mod tests {
             .map(|&w| (w, !w))
             .chain(newer.records().iter().map(|&w| (w, !w)))
             .collect();
-        let (_, cal_found, _) =
-            scan_records(records.into_iter(), None, Found::default(), FIRST + 6 * RECORD);
-        assert_eq!(cal_found.calibration(), newer);
+        let (state, _) =
+            scan_records(records.into_iter(), ScanState::default(), FIRST + 6 * RECORD);
+        assert_eq!(state.cal.calibration(), newer);
         // Carried across sectors: a later scan merges over the earlier
         // findings (the zero field only in the older sector survives).
-        let (dim_found, cal_found, _) = scan_records(
+        let (state, _) = scan_records(
             [(dim, !dim)].into_iter(),
-            None,
-            cal_found,
+            state,
             FIRST + RECORD,
         );
-        assert_eq!(dim_found, Some(5));
-        assert_eq!(cal_found.calibration(), newer);
+        assert_eq!(state.dim, Some(5));
+        assert_eq!(state.cal.calibration(), newer);
     }
 }
