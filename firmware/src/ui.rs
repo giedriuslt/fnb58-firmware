@@ -7,6 +7,7 @@
 use crate::buttons;
 use crate::lcd::Lcd;
 use crate::pd_task::View;
+use settings_core::calibration::{Calibration, Quantity, Step, Wizard};
 
 const BLACK: u16 = 0x0000;
 const WHITE: u16 = 0xFFFF;
@@ -15,6 +16,8 @@ const GREEN: u16 = 0x07E0;
 const YELLOW: u16 = 0xFFE0;
 const CYAN: u16 = 0x07FF;
 const MAGENTA: u16 = 0xF81F;
+/// r221: the calibration refusal color (kws-x1's ORANGE).
+const ORANGE: u16 = 0xF9E0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -28,16 +31,25 @@ pub enum Screen {
     Afc,
     /// r199: the ripple scope screen (kws-x1's Ripple tab).
     Ripple,
+    /// r218: the settings screen (the stored settings; LR cycles the
+    /// shown value, OK saves it to the external-flash store).
+    Settings,
+    /// r221: the calibration wizard (kws-x1's Calibration page as a
+    /// screen of its own — zero current, then the current and voltage
+    /// entries; OK walks the steps, leaving abandons the wizard).
+    Cal,
 }
 
 /// The screen cycle order (LEFT/RIGHT walk it in both directions).
-const SCREEN_CYCLE: [Screen; 6] = [
+const SCREEN_CYCLE: [Screen; 8] = [
     Screen::Power,
     Screen::Pd,
     Screen::Qc,
     Screen::Qc3,
     Screen::Afc,
     Screen::Ripple,
+    Screen::Settings,
+    Screen::Cal,
 ];
 
 fn next_screen(screen: Screen, dir: i16) -> Screen {
@@ -66,6 +78,13 @@ pub enum Press {
     RippleScale(i16),
     /// r199: toggle the ripple run/hold (kws-x1 buttons.rs:1674).
     RippleHold,
+    /// r221: the calibration screen's entry adjust — Left/Right walk
+    /// the entered value toward the reference meter's reading (the
+    /// held-button repeat comes from the main loop).
+    CalAdjust(i16),
+    /// r221: the calibration screen's OK — take the zero / confirm the
+    /// entry / apply the finished calibration.
+    CalOk,
 }
 
 /// r199: what LEFT/RIGHT adjust on the open ripple screen, in OK's order
@@ -124,6 +143,21 @@ pub struct Ui {
     pub ripple_hold: bool,
     pub ripple_timebase: ripple_core::ripple::Timebase,
     pub ripple_scale: ripple_core::ripple::Scale,
+    /// r218: the settings screen's selection — an index into
+    /// `settings::DIM_CHOICES`, re-read from the applied value on
+    /// screen entry (enter()). Pub: the main loop's commit arm reads it.
+    pub set_sel: usize,
+    /// r218: the settings body's cache (a change redraws). Pub: the
+    /// commit arm forces a redraw after saving.
+    pub set_drawn: i16,
+    /// r221: the calibration wizard (re-created fresh on screen entry
+    /// from the applied calibration; nothing applies until the last OK).
+    pub cal_wizard: Wizard,
+    /// r221: the calibration body's identity (step + entry + refusal —
+    /// a change redraws the body) and the last-drawn live register pair
+    /// (a change updates the zero box / NOW row in place).
+    cal_ident: u32,
+    cal_live: (u16, u16, bool),
     /// r199: the ripple plot's last redraw (100 ms cadence like the
     /// capture) and the chrome identity at it (focus/hold/scale/timebase
     /// packed — a change redraws immediately, not on the next capture).
@@ -166,6 +200,11 @@ impl Ui {
             ripple_scale: ripple_core::ripple::Scale::default(),
             ripple_at: 0,
             ripple_tag: 0xFFFF,
+            set_sel: 0,
+            set_drawn: -1,
+            cal_wizard: Wizard::new(Calibration::default()),
+            cal_ident: u32::MAX,
+            cal_live: (0, 0, false),
         }
     }
 
@@ -174,6 +213,43 @@ impl Ui {
     /// the voltage, OK selects it (re-request), BACK returns to screen
     /// navigation. Only glyphs from lcd.rs FONT_CHARS (no '<'/'>'!).
     pub fn on_press(&mut self, i: usize) -> Press {
+        // r222: the settings screen's value adjust is OK-gated (user
+        // directive — the r218 always-adjusting screen blocked screen
+        // navigation past 7/8): LEFT/RIGHT always navigate; OK enters
+        // the dim-adjust mode, OK again saves, BACK leaves the mode
+        // (the PPS screen's selecting pattern).
+        if self.screen == Screen::Settings {
+            match i {
+                buttons::LEFT | buttons::RIGHT if self.selecting => {
+                    return Press::Voltage(if i == buttons::RIGHT { 1 } else { -1 });
+                }
+                buttons::OK => {
+                    if self.selecting {
+                        return Press::Commit;
+                    }
+                    self.selecting = true;
+                    return Press::Hint;
+                }
+                buttons::BACK if self.selecting => {
+                    self.selecting = false;
+                    return Press::Hint;
+                }
+                _ => {}
+            }
+        }
+        // r221: the calibration screen — LEFT/RIGHT adjust the entry
+        // (the held-button repeat is the main loop's), OK takes the
+        // zero or confirms the entry. BACK falls through to screen
+        // navigation: leaving the screen abandons the wizard (nothing
+        // has applied yet), kws-x1's cancel.
+        if self.screen == Screen::Cal {
+            match i {
+                buttons::LEFT => return Press::CalAdjust(-1),
+                buttons::RIGHT => return Press::CalAdjust(1),
+                buttons::OK => return Press::CalOk,
+                _ => {}
+            }
+        }
         // r199: the ripple screen's focus model (kws-x1 buttons.rs:1714
         // OK opens/cycles; 1657-1676 LEFT/RIGHT adjust the focused
         // setting). Unhandled presses fall through to the screen-level
@@ -257,6 +333,21 @@ impl Ui {
             self.ripple_focus = None;
             self.ripple_hold = false;
         }
+        // r218: the settings screen starts at the APPLIED value.
+        if screen == Screen::Settings {
+            self.set_sel = crate::settings::sel_of(
+                crate::settings::DIM_MINUTES.load(core::sync::atomic::Ordering::Relaxed),
+            );
+            self.set_drawn = -1;
+        }
+        // r221: a fresh wizard on calibration-screen entry, pending from
+        // the applied calibration (kws-x1's Wizard::new(input.settings.
+        // calibration)); leaving and coming back starts over.
+        if screen == Screen::Cal {
+            self.cal_wizard = Wizard::new(crate::settings::applied());
+            self.cal_ident = u32::MAX;
+            self.cal_live = (0, 0, false);
+        }
         self.screen = screen;
         self.selecting = false;
         // Force the next screen-specific redraw.
@@ -273,31 +364,41 @@ impl Ui {
         match screen {
             Screen::Power => {
                 text(lcd, 8, 8, b"POWER", 2, WHITE).await;
-                text(lcd, 272, 8, b"1/6", 2, GRAY).await;
+                text(lcd, 272, 8, b"1/8", 2, GRAY).await;
             }
             Screen::Pd => {
                 text(lcd, 8, 8, b"PPS", 2, WHITE).await;
-                text(lcd, 272, 8, b"2/6", 2, GRAY).await;
+                text(lcd, 272, 8, b"2/8", 2, GRAY).await;
                 self.draw_hint(lcd).await;
             }
             Screen::Qc => {
                 text(lcd, 8, 8, b"QC", 2, WHITE).await;
-                text(lcd, 272, 8, b"3/6", 2, GRAY).await;
+                text(lcd, 272, 8, b"3/8", 2, GRAY).await;
                 self.draw_hint(lcd).await;
             }
             Screen::Qc3 => {
                 text(lcd, 8, 8, b"QC3", 2, WHITE).await;
-                text(lcd, 272, 8, b"4/6", 2, GRAY).await;
+                text(lcd, 272, 8, b"4/8", 2, GRAY).await;
                 self.draw_hint(lcd).await;
             }
             Screen::Afc => {
                 text(lcd, 8, 8, b"AFC", 2, WHITE).await;
-                text(lcd, 272, 8, b"5/6", 2, GRAY).await;
+                text(lcd, 272, 8, b"5/8", 2, GRAY).await;
                 self.draw_hint(lcd).await;
             }
             Screen::Ripple => {
                 text(lcd, 8, 8, b"RIPPLE", 2, WHITE).await;
-                text(lcd, 272, 8, b"6/6", 2, GRAY).await;
+                text(lcd, 272, 8, b"6/8", 2, GRAY).await;
+                self.draw_hint(lcd).await;
+            }
+            Screen::Settings => {
+                text(lcd, 8, 8, b"SET", 2, WHITE).await;
+                text(lcd, 272, 8, b"7/8", 2, GRAY).await;
+                self.draw_hint(lcd).await;
+            }
+            Screen::Cal => {
+                text(lcd, 8, 8, b"CAL", 2, WHITE).await;
+                text(lcd, 272, 8, b"8/8", 2, GRAY).await;
                 self.draw_hint(lcd).await;
             }
         }
@@ -313,6 +414,23 @@ impl Ui {
     pub async fn draw_hint(&self, lcd: &mut Lcd) {
         lcd.draw_text(8, 216, &[b' '; 26], 2, GRAY, BLACK).await;
         let hint: &[u8] = match self.screen {
+            // r222: the settings screen's adjust mode is OK-gated.
+            Screen::Settings if self.selecting => b"LR:DIM OK:SAVE BK:X",
+            Screen::Settings => b"OK:DIM",
+            // r221: the calibration steps' gesture lines (kws-x1's
+            // hints; the FNB58 font has no '<'/'>' so LR:ADJ stands in
+            // for the angle brackets).
+            Screen::Cal => match self.cal_wizard.step {
+                Step::Zero => b"OK:0 BK:X",
+                Step::Entry {
+                    quantity: Quantity::Current,
+                    ..
+                } => b"LR:ADJ OK:SET BK:X",
+                Step::Entry {
+                    quantity: Quantity::Voltage,
+                    ..
+                } => b"LR:ADJ OK:SAVE BK:X",
+            },
             Screen::Ripple => match self.ripple_focus {
                 None => b"OK:SET",
                 Some(RippleFocus::Time) => b"LR:TIME OK:SCALE BK:X",
@@ -1102,6 +1220,188 @@ impl Ui {
         .await;
     }
 
+    /// r218: the settings screen's body — the dim timeout value, cycled
+    /// with LEFT/RIGHT (redrawn on change only; the save happens on OK
+    /// and the screen re-reads the applied value on entry).
+    pub async fn draw_settings(&mut self, lcd: &mut Lcd) {
+        let sel = self.set_sel as i16;
+        if sel == self.set_drawn {
+            return;
+        }
+        self.set_drawn = sel;
+        lcd.fill_window(0, 32, 319, 210, BLACK).await;
+        let minutes = crate::settings::DIM_CHOICES
+            .get(self.set_sel)
+            .copied()
+            .unwrap_or(1);
+        let value: &[u8] = if minutes == 0 {
+            b"NEVER"
+        } else {
+            match minutes {
+                1 => b"1 MIN",
+                2 => b"2 MIN",
+                5 => b"5 MIN",
+                _ => b"10 MIN",
+            }
+        };
+        let mut line = [0u8; 24];
+        let mut n = 0;
+        for &b in b"DIM IDLE" {
+            line[n] = b;
+            n += 1;
+        }
+        line[n] = 0;
+        text(lcd, 8, 48, &line, 2, GRAY).await;
+        let mut line = [0u8; 24];
+        line[..value.len()].copy_from_slice(value);
+        line[value.len()] = 0;
+        text(lcd, 8, 100, &line, 3, YELLOW).await;
+    }
+
+    /// r221: the calibration screen (kws-x1's draw_calibration): the
+    /// step's title and what to do, the entry box (zero step: this
+    /// meter's live current; entry steps: the entered value), the live
+    /// reading under it and a refusal in orange. The body redraws on
+    /// step/entry/refusal change; the zero box and the NOW row update
+    /// in place on a fresh meter read (fixed-width Line12 overdraws —
+    /// no fills at the 200 ms meter cadence, the r194 flicker class).
+    pub async fn draw_cal(&mut self, lcd: &mut Lcd) {
+        use core::sync::atomic::Ordering;
+        let bus = crate::qc_task::METER_BUS_RAW.load(Ordering::Relaxed);
+        let cur = crate::qc_task::METER_CUR_RAW.load(Ordering::Relaxed);
+        let fresh = crate::qc_task::METER_FRESH.load(Ordering::Relaxed);
+        let wizard = self.cal_wizard;
+        let entered = wizard.step.entered();
+        // Identity fields: the step in 0..8, the entry value in 8..26
+        // (a bus reading reaches 81919 mV — 17 bits), the refusal above
+        // bit 26 (no aliasing: 81919 << 8 < 2^25 <= 1 << 26).
+        let ident = match wizard.step {
+            Step::Zero => 0u32,
+            Step::Entry {
+                quantity: Quantity::Current,
+                ..
+            } => 1u32,
+            Step::Entry {
+                quantity: Quantity::Voltage,
+                ..
+            } => 2u32,
+        } | (entered.unwrap_or(0xFFFF)) << 8
+            | (wizard.refusal.map(|r| r as u32 + 1).unwrap_or(0)) << 26;
+        let live_changed = (bus, cur, fresh) != self.cal_live;
+        let zero = wizard.step == Step::Zero;
+        let voltage = matches!(
+            wizard.step,
+            Step::Entry {
+                quantity: Quantity::Voltage,
+                ..
+            }
+        );
+        if ident != self.cal_ident {
+            self.cal_ident = ident;
+            self.cal_live = (bus, cur, fresh);
+            lcd.fill_window(0, 32, 319, 210, BLACK).await;
+            let (title, detail): (&[u8], &[u8]) = if zero {
+                (b"1/3 0 CURRENT", b"UNPLUG LOAD KEEP PWR")
+            } else if voltage {
+                (b"3/3 VOLTAGE", b"ENTER METER VOLTS")
+            } else {
+                (b"2/3 CURRENT", b"STEADY LOAD: METER A")
+            };
+            text(lcd, 8, 48, title, 2, YELLOW).await;
+            text(lcd, 8, 78, detail, 2, WHITE).await;
+            text(lcd, 8, 112, if zero { b"THIS METER" } else { b"YOUR METER" }, 1, GRAY).await;
+            if let Some(refusal) = wizard.refusal {
+                text(lcd, 8, 192, refusal.message().as_bytes(), 2, ORANGE).await;
+            }
+            self.draw_hint(lcd).await;
+            // The value box and (entry steps) the NOW row, at the
+            // redraw's own live values.
+            self.draw_cal_value(lcd, wizard, entered, bus, cur, fresh).await;
+            if !zero {
+                self.draw_cal_now(lcd, wizard, bus, cur, fresh).await;
+            }
+        } else if live_changed {
+            self.cal_live = (bus, cur, fresh);
+            // Zero step: the box IS the live reading; entry steps: the
+            // NOW row moves instead (the box only follows the entry).
+            if zero {
+                self.draw_cal_value(lcd, wizard, entered, bus, cur, fresh).await;
+            } else {
+                self.draw_cal_now(lcd, wizard, bus, cur, fresh).await;
+            }
+        }
+    }
+
+    /// The calibration value box (y=126, scale 3): the zero step's live
+    /// current or the entry's entered value, "X.XXX A/V"; "-.---" when
+    /// nothing to show. Fixed-width overdraw (Line12::pad).
+    async fn draw_cal_value(
+        &self,
+        lcd: &mut Lcd,
+        wizard: Wizard,
+        entered: Option<u32>,
+        _bus: u16,
+        cur: u16,
+        fresh: bool,
+    ) {
+        let voltage = matches!(
+            wizard.step,
+            Step::Entry {
+                quantity: Quantity::Voltage,
+                ..
+            }
+        );
+        let unit: &[u8] = if voltage { b" V" } else { b" A" };
+        let mut line = Line12::new();
+        if let Some(value) = entered {
+            line.num_u32(value, 3);
+            line.push(unit);
+        } else if wizard.step == Step::Zero {
+            // This meter's live current through the pending calibration.
+            if fresh {
+                line.num_u32(wizard.pending.milliamps(cur).unsigned_abs(), 3);
+                line.push(b" A");
+            } else {
+                line.push(b"-.--- A");
+            }
+        } else {
+            line.push(b"-.---");
+            line.push(unit);
+        }
+        line.pad();
+        lcd.draw_text(20, 126, line.bytes(), 3, YELLOW, BLACK).await;
+    }
+
+    /// The calibration screen's live row (y=180, scale 2): "NOW X.XXX
+    /// A/V" — this meter's reading through the pending calibration, so
+    /// the user can see the entry and the meter at once (kws-x1's
+    /// "This meter now" line). Fixed-width overdraw.
+    async fn draw_cal_now(&self, lcd: &mut Lcd, wizard: Wizard, bus: u16, cur: u16, fresh: bool) {
+        let voltage = matches!(
+            wizard.step,
+            Step::Entry {
+                quantity: Quantity::Voltage,
+                ..
+            }
+        );
+        let mut line = Line12::new();
+        line.push(b"NOW ");
+        if fresh {
+            if voltage {
+                line.num_u32(wizard.pending.millivolts(bus), 3);
+                line.push(b" V");
+            } else {
+                line.num_u32(wizard.pending.milliamps(cur).unsigned_abs(), 3);
+                line.push(b" A");
+            }
+        } else {
+            line.push(b"-.---");
+            line.push(if voltage { b" V" } else { b" A" });
+        }
+        line.pad();
+        lcd.draw_text(20, 180, line.bytes(), 2, GRAY, BLACK).await;
+    }
+
     /// Show the reset-cause flags in the title bar so a reboot loop is
     /// visible standalone (no PC needed).
     pub async fn draw_rst(&self, lcd: &mut Lcd, flags: u8) {
@@ -1120,44 +1420,36 @@ impl Ui {
     }
 
     /// Power screen: the three big live values (12-char padded overdraws,
-    /// so shrinking values leave no ghosts).
+    /// so shrinking values leave no ghosts). r222 (user directive): all
+    /// three metrics ALWAYS show three decimal places in V / A / W —
+    /// the old A-or-mA / W-or-mW switches rendered small currents as
+    /// two-digit "X.X mA" values.
     pub async fn draw_power(&self, lcd: &mut Lcd, mv: u32, ua: i32, mw: i32) {
-        // Voltage: "20.000 V"
+        // Voltage: "20.000 V" (mV value, 3 decimals).
         let mut l1 = Line12::new();
         l1.num_u32(mv, 3);
         l1.push(b" V");
         l1.pad();
         lcd.draw_text(20, 50, l1.bytes(), 3, GREEN, BLACK).await;
 
-        // Current: A (>= 1 A) else mA.
+        // Current: "1.250 A" (mA value — µA/1000 — with 3 decimals;
+        // sub-mA currents show as 0.000 A, that is the resolution).
         let mut l2 = Line12::new();
         let neg = ua < 0;
-        let a = (if neg { -ua } else { ua }) as u32;
-        if a >= 1_000_000 {
-            l2.sign(neg);
-            l2.num_u32(a / 1_000, 3);
-            l2.push(b" A");
-        } else {
-            l2.sign(neg);
-            l2.num_u32(a / 100, 1);
-            l2.push(b" mA");
-        }
+        let ma = (if neg { -ua } else { ua }) as u32 / 1000;
+        l2.sign(neg);
+        l2.num_u32(ma, 3);
+        l2.push(b" A");
         l2.pad();
         lcd.draw_text(20, 110, l2.bytes(), 3, YELLOW, BLACK).await;
 
-        // Power: W (>= 1 W) else mW.
+        // Power: "140.000 W" (mW value with 3 decimals).
         let mut l3 = Line12::new();
         let negp = mw < 0;
         let p = (if negp { -mw } else { mw }) as u32;
-        if p >= 1000 {
-            l3.sign(negp);
-            l3.num_u32(p, 3);
-            l3.push(b" W");
-        } else {
-            l3.sign(negp);
-            l3.num_u32(p, 0);
-            l3.push(b" mW");
-        }
+        l3.sign(negp);
+        l3.num_u32(p, 3);
+        l3.push(b" W");
         l3.pad();
         lcd.draw_text(20, 170, l3.bytes(), 3, CYAN, BLACK).await;
 

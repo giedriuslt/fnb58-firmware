@@ -29,6 +29,7 @@ mod pd_phy;
 mod pd_task;
 mod qc_task;
 mod ripple;
+mod settings;
 mod buttons;
 mod buzzer;
 mod flash;
@@ -54,7 +55,7 @@ static BL_DIMMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r217";
+const BUILD: &[u8] = b"r222";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -194,7 +195,11 @@ async fn main(spawner: Spawner) {
             let mut guard = pd_task::BUS.lock().await;
             if let Some(bus) = guard.0.as_mut() {
                 let _ = tpa_write(bus, 0x00, 0x0337).await; // AVG=1, 588us+588us, cont
-                let cal: u16 = (5_120_000u32 / 500u32) as u16; // 10 mOhm shunt, 50 uA LSB
+                // r221b: CAL=2048 — one current-register count = 2.5 uV of
+                // shunt = 250 uA through the user-confirmed 10 mOhm (2x20
+                // mOhm parallel), so the register spans +/-8.19 A = the
+                // 0-7 A range (r46's CAL=10240 capped it at 1.638 A).
+                let cal: u16 = (5_120_000u32 / 2500u32) as u16; // 10 mOhm, 250 uA LSB
                 let _ = tpa_write(bus, 0x05, cal).await;
             }
         }
@@ -219,25 +224,30 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r217 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r222 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
-            // One meter sample into the next report slot.
-            let (mv, ua) = {
+            // One meter sample into the next report slot, through the
+            // applied calibration at the register's native resolution
+            // (r221; the display conversions truncate 1.25 mV steps to
+            // 1 mV and 50 µA steps to 1 mA — the report keeps 10 µV /
+            // 100 µA fields).
+            let (uv, ia) = {
                 let mut guard = pd_task::BUS.lock().await;
                 match guard.0.as_mut() {
-                    Some(bus) => {
-                        match (tpa_read(bus, 0x02).await, tpa_read(bus, 0x04).await) {
-                            (Ok(v), Ok(i)) => ((v as u32 * 5) / 4, (i as i16 as i32) * 50),
-                            _ => (0, 0),
+                    Some(bus) => match (tpa_read(bus, 0x02).await, tpa_read(bus, 0x04).await) {
+                        (Ok(v), Ok(i)) => {
+                            let cal = settings::applied();
+                            (cal.microvolts(v), cal.microamps(i))
                         }
-                    }
+                        _ => (0, 0),
+                    },
                     None => (0, 0),
                 }
             };
             let off = 2 + slot * 15;
-            report[off..off + 4].copy_from_slice(&(mv * 100).to_le_bytes()); // V * 100000
-            let amps_100k = if ua > 0 { (ua / 10) as u32 } else { 0 };
+            report[off..off + 4].copy_from_slice(&((uv / 10) as u32).to_le_bytes()); // V * 100000
+            let amps_100k = if ia > 0 { (ia / 10) as u32 } else { 0 };
             report[off + 4..off + 8].copy_from_slice(&amps_100k.to_le_bytes()); // A * 100000
             // D+ / D- (off+8..off+12) and the unknown byte (off+12):
             // 0 sentinels; the buffer starts zeroed and only the first
@@ -288,11 +298,17 @@ async fn main(spawner: Spawner) {
             // and every overdraw erases ghosts, like ui.rs Line12::pad.
             lcd_tick += 1;
             if lcd_tick % 25 == 0 {
-                let mw = (mv as i32 * ua) / 1000;
+                // Live LCD values from the calibrated sample: mV, µA and
+                // mW = mV x µA / 1e6 (the old `mv * ua / 1000` was the
+                // µA-units mistake AND overflowed i32 past ~2 W —
+                // display-only bug, fixed by this rewrite).
+                let mv = (uv / 1000) as u32;
+                let ua = ia as i32;
+                let mw = ((mv as i64 * ua as i64) / 1_000_000) as i32;
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r217 " {
+                for &b in b"r222 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -399,7 +415,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r217: iomux clock fix\r\n");
+    say(b"[lcd] FNB58 r222: claim from sector 0\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -420,6 +436,9 @@ async fn main(spawner: Spawner) {
     };
     let mut lcd = unsafe { lcd::Lcd::new(spi) };
     let mut flash = unsafe { flash::Flash::new(spi) };
+    // r218: the settings store — loads the stored dim timeout (or the
+    // 1-minute default) from the external flash's first 20 sectors.
+    let (mut store, _stored) = settings::open(&mut flash);
     lcd.init().await;
     say(b"[lcd] init done, drawing bars\r\n");
     lcd.test_pattern().await;
@@ -473,7 +492,9 @@ async fn main(spawner: Spawner) {
                 Err(_) => say(b"[meter] rust i2c read FAIL\r\n"),
             }
             let _ = tpa_write(bus, 0x00, 0x4897).await; // AVG=64, cont
-            let cal: u16 = (5_120_000u32 / 500u32) as u16; // 10 mOhm shunt, 50 uA LSB
+            // r221b: CAL=2048 — see the PC-link write above; the register
+            // spans +/-8.19 A through the confirmed 10 mOhm (0-7 A range).
+            let cal: u16 = (5_120_000u32 / 2500u32) as u16; // 10 mOhm, 250 uA LSB
             let _ = tpa_write(bus, 0x05, cal).await;
         }
     }
@@ -585,6 +606,12 @@ async fn main(spawner: Spawner) {
     // consumes (kws-x1 main.rs:1066-1069's receiver + held reading).
     let mut ripple_updates = ripple::RIPPLE.anon_receiver();
     let mut ripple_reading: Option<ripple_core::ripple::Reading> = None;
+    // r221: the calibration wizard's raw-reading window (kws-x1's
+    // Average, fed by the meter read below; the wizard's OK steps take
+    // its mean) and the held-button repeat state for the entry steps
+    // (button bit, direction, next-repeat ms).
+    let mut cal_average = settings_core::calibration::Average::default();
+    let mut cal_repeat: Option<(u8, i16, u32)> = None;
     // LEXT probe: enable the 32.768 kHz crystal oscillator on PC14/PC15
     // and wait for its stable flag. If the board has the RTC crystal
     // footprint populated, lextstblf sets within a second; with nothing
@@ -772,8 +799,7 @@ async fn main(spawner: Spawner) {
         }
         // r199: the ripple screen — same BUSY gate (the capture itself
         // is DMA-driven and needs no executor; only the draw blocks).
-        if ui.screen == Screen::Ripple && !pd_task::BUSY.load(Ordering::Relaxed) {
-            // kws-x1 main.rs:1282-1286: take the latest capture unless
+        if ui.screen == Screen::Ripple && !pd_task::BUSY.load(Ordering::Relaxed) {            // kws-x1 main.rs:1282-1286: take the latest capture unless
             // held (the task stops publishing while held anyway).
             if let Some(update) = ripple_updates.try_changed() {
                 if !ui.ripple_hold {
@@ -783,6 +809,31 @@ async fn main(spawner: Spawner) {
             let reference = Some(ripple::REFERENCE.load(Ordering::Relaxed));
             ui.draw_ripple(&mut lcd, ripple_reading.as_ref(), reference)
                 .await;
+        }
+        // r218: the settings screen — same BUSY gate (only the draw
+        // blocks; the save on OK does its own bounded blocking).
+        if ui.screen == Screen::Settings && !pd_task::BUSY.load(Ordering::Relaxed) {
+            ui.draw_settings(&mut lcd).await;
+        }
+
+        // r221: the calibration screen — same gate (the body redraws on
+        // wizard-identity change, the live rows on fresh meter reads;
+        // both self-cache inside draw_cal).
+        if ui.screen == Screen::Cal && !pd_task::BUSY.load(Ordering::Relaxed) {
+            ui.draw_cal(&mut lcd).await;
+        }
+
+        // r221: the calibration entry's held-button repeat — the FNB58
+        // has no button-repeat of its own, so the main loop supplies
+        // kws-x1's ENTRY_REPEAT: while the adjusted button stays held,
+        // ±10 (one display decade) every 150 ms after a 500 ms delay.
+        if let Some((bit, dir, next_ms)) = cal_repeat {
+            if ui.screen != Screen::Cal || held & bit == 0 {
+                cal_repeat = None;
+            } else if (now_ms.wrapping_sub(next_ms) as i32) >= 0 {
+                ui.cal_wizard.step(dir > 0, true);
+                cal_repeat = Some((bit, dir, now_ms.wrapping_add(150)));
+            }
         }
 
         // Buttons: debounced active-low (50 ms at this cadence); events
@@ -840,6 +891,19 @@ async fn main(spawner: Spawner) {
                     } else if ui.screen == Screen::Afc {
                         qc_task::commit_afc();
                         sender.push(b"[afc] commit\r\n");
+                    } else if ui.screen == Screen::Settings {
+                        // r218: save the shown dim timeout to the store
+                        // (r221: the applied calibration rides along —
+                        // unchanged fields write nothing). r222: the
+                        // save also leaves the OK-gated adjust mode.
+                        let minutes = settings::DIM_CHOICES
+                            .get(ui.set_sel)
+                            .copied()
+                            .unwrap_or(1);
+                        settings::save(&mut flash, &mut store, minutes, settings::applied());
+                        ui.selecting = false;
+                        ui.set_drawn = -1; // redraw shows the applied value
+                        ui.draw_hint(&mut lcd).await;
                     } else if pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) {
                         pd_task::commit_desired();
                         sender.push(b"[pd] commit\r\n");
@@ -852,9 +916,100 @@ async fn main(spawner: Spawner) {
                     // r172: the PPS screen's selection mode toggled.
                     ui.draw_hint(&mut lcd).await;
                 }
+                Press::CalAdjust(dir) => {
+                    // r221: walk the calibration entry toward the
+                    // reference meter's value (±1 per press; the held
+                    // repeat above adds ±10). The entered value logs.
+                    ui.cal_wizard.step(dir > 0, false);
+                    let bit = if dir > 0 {
+                        1u8 << buttons::RIGHT
+                    } else {
+                        1u8 << buttons::LEFT
+                    };
+                    cal_repeat = Some((bit, dir, now_ms.wrapping_add(500)));
+                    let mut d = [0u8; 24];
+                    let mut n = 0;
+                    for &b in b"[cal] adj=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    match ui.cal_wizard.step.entered() {
+                        Some(v) => n = push_dec(&mut d, n, v),
+                        None => {
+                            for &b in b"-" {
+                                d[n] = b;
+                                n += 1;
+                            }
+                        }
+                    }
+                    for &b in b"\r\n" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    sender.push(&d[..n]);
+                }
+                Press::CalOk => {
+                    // r221: the wizard's OK — take the zero, confirm the
+                    // entry, or (the last step) apply and save the
+                    // finished calibration (kws-x1's
+                    // input.settings.calibration = calibration plus this
+                    // firmware's save-on-OK convention; the dim value
+                    // passes unchanged so only changed records append).
+                    let mean = cal_average.mean();
+                    if let Some(cal) = ui.cal_wizard.ok(mean) {
+                        settings::save(
+                            &mut flash,
+                            &mut store,
+                            settings::DIM_MINUTES.load(Ordering::Relaxed),
+                            cal,
+                        );
+                        ui.enter(&mut lcd, Screen::Settings).await;
+                    } else {
+                        // Every outcome logs (no silent branches): the
+                        // refusal's own message, or the step advance.
+                        match ui.cal_wizard.refusal {
+                            Some(refusal) => {
+                                let mut d = [0u8; 40];
+                                let mut n = 0;
+                                for &b in b"[cal] refused " {
+                                    d[n] = b;
+                                    n += 1;
+                                }
+                                let msg = refusal.message().as_bytes();
+                                let take = msg.len().min(d.len() - n - 2);
+                                d[n..n + take].copy_from_slice(&msg[..take]);
+                                n += take;
+                                d[n] = b'\r';
+                                d[n + 1] = b'\n';
+                                sender.push(&d[..n + 2]);
+                            }
+                            None => sender.push(b"[cal] ok\r\n"),
+                        }
+                    }
+                }
                 Press::Voltage(dir) => {
                     // r171: the PPS screen's voltage selection. r189/r196:
-                    // the QC screens cycle their own targets.
+                    // the QC screens cycle their own targets. r218: the
+                    // settings screen cycles its dim choice in place.
+                    if ui.screen == Screen::Settings {
+                        let len = settings::DIM_CHOICES.len() as i16;
+                        ui.set_sel =
+                            ((ui.set_sel as i16 + dir).rem_euclid(len)) as usize;
+                        let minutes = settings::DIM_CHOICES[ui.set_sel];
+                        let mut d = [0u8; 32];
+                        let mut n = 0;
+                        for &b in b"[set] sel dim=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        n = push_dec(&mut d, n, minutes);
+                        for &b in b"\r\n" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        sender.push(&d[..n]);
+                        continue;
+                    }
                     let (prefix, mv): (&[u8], u32) = match ui.screen {
                         Screen::Qc => (b"[qc] tgt=", u32::from(qc_task::cycle_target(dir))),
                         Screen::Qc3 => (
@@ -961,11 +1116,16 @@ async fn main(spawner: Spawner) {
             Ordering::Relaxed,
         );
 
-        // r216: idle dim — 60 s without a press drops the backlight to
-        // 20% (TMR2 CH2 PWM). Presses reset BL_LAST_ACTIVITY in the
-        // button loop; the console 'b' toggle writes both statics.
-        if !BL_DIMMED.load(Ordering::Relaxed)
-            && now_ms.wrapping_sub(BL_LAST_ACTIVITY.load(Ordering::Relaxed)) >= 60_000
+        // r216: idle dim — the settings timeout without a press drops
+        // the backlight to 20% (TMR2 CH2 PWM). Presses reset
+        // BL_LAST_ACTIVITY in the button loop; the console 'b' toggle
+        // writes both statics. r218: the timeout comes from the store
+        // (1/2/5/10 minutes, 0 = never).
+        let dim_minutes = settings::DIM_MINUTES.load(Ordering::Relaxed);
+        if dim_minutes != 0
+            && !BL_DIMMED.load(Ordering::Relaxed)
+            && now_ms.wrapping_sub(BL_LAST_ACTIVITY.load(Ordering::Relaxed))
+                >= dim_minutes * 60_000
         {
             BL_DIMMED.store(true, Ordering::Relaxed);
             backlight::set_percent(20);
@@ -1025,24 +1185,48 @@ async fn main(spawner: Spawner) {
             let Some(bus) = guard.0.as_mut() else {
                 continue;
             };
-            let ok = match (
-                tpa_read(bus, 0x02).await,
-                tpa_read(bus, 0x04).await,
-                tpa_read(bus, 0x03).await,
-            ) {
-                (Ok(bus), Ok(cur), Ok(pwr)) => {
-                    let mv = (bus as u32 * 5) / 4; // 1.25 mV/LSB
-                    let ua = (cur as i16 as i32) * 50; // 50 uA/LSB
-                    let mw = ((pwr as i16 as i32) * 5) / 4; // 1.25 mW/LSB
+            // r221: the power register read dropped — the displayed
+            // power derives from the calibrated V/I (kws-x1 reads bus +
+            // current only), one bus transaction less per read.
+            let ok = match (tpa_read(bus, 0x02).await, tpa_read(bus, 0x04).await) {
+                (Ok(bus), Ok(cur)) => {
+                    // r221: readings go through the applied calibration
+                    // (kws-x1's reading(); the default changes nothing —
+                    // settings-core's tested invariant). Power derives
+                    // from the calibrated values (mV x mA / 1000 = mW),
+                    // not the power register, so the three displayed
+                    // units agree (kws-x1's Reading::mw).
+                    let cal = settings::applied();
+                    let mv = cal.millivolts(bus);
+                    let ua = cal.milliamps(cur);
+                    let mw = ((mv as i64 * ua as i64) / 1000) as i32;
+                    // The RAW registers publish for the calibration
+                    // screen (its rows calibrate at draw time, through
+                    // the wizard's pending).
+                    qc_task::METER_BUS_RAW.store(bus, Ordering::Relaxed);
+                    qc_task::METER_CUR_RAW.store(cur, Ordering::Relaxed);
+                    qc_task::METER_FRESH.store(true, Ordering::Relaxed);
+                    // The calibration steps take the raw readings'
+                    // average (kws-x1 main.rs:1215-1222).
+                    cal_average.add(bus, cur);
                     // r189: the QC task follows the output through this
-                    // published value (no I2C access of its own).
-                    qc_task::VBUS_MV.store(mv as u16, Ordering::Relaxed);
+                    // published value (no I2C access of its own) — the
+                    // RAW conversion: the QC thresholds were tuned on
+                    // it, and kws-x1's calibration is display-path only.
+                    qc_task::VBUS_MV.store((bus as u32 * 5 / 4) as u16, Ordering::Relaxed);
                     if ui.screen == Screen::Power {
                         ui.draw_power(&mut lcd, mv, ua, mw).await;
                     }
                     true
                 }
-                _ => false,
+                _ => {
+                    // A failed read leaves no stale live rows: the
+                    // calibration screen shows "-.---" and the window
+                    // forgets what went before (kws-x1's average.clear).
+                    qc_task::METER_FRESH.store(false, Ordering::Relaxed);
+                    cal_average.clear();
+                    false
+                }
             };
             let _ = ok;
         }
@@ -1325,6 +1509,61 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
         return;
     }
     match cmd[0] {
+        // r221: the applied calibration + the meter's raw state (the
+        // wizard's inputs) — hardware verification without navigating.
+        b'c' => {
+            let cal = settings::applied();
+            let bus = qc_task::METER_BUS_RAW.load(Ordering::Relaxed);
+            let cur = qc_task::METER_CUR_RAW.load(Ordering::Relaxed);
+            let fresh = qc_task::METER_FRESH.load(Ordering::Relaxed);
+            let mut d = [0u8; 64];
+            let mut n = 0;
+            for &b in b"[cal] z=" {
+                d[n] = b;
+                n += 1;
+            }
+            if cal.zero_ua < 0 {
+                d[n] = b'-';
+                n += 1;
+            }
+            n = push_dec(&mut d, n, cal.zero_ua.unsigned_abs() as u32);
+            for &b in b" c=" {
+                d[n] = b;
+                n += 1;
+            }
+            if cal.current_ppm < 0 {
+                d[n] = b'-';
+                n += 1;
+            }
+            n = push_dec(&mut d, n, cal.current_ppm.unsigned_abs() as u32);
+            for &b in b" v=" {
+                d[n] = b;
+                n += 1;
+            }
+            if cal.voltage_ppm < 0 {
+                d[n] = b'-';
+                n += 1;
+            }
+            n = push_dec(&mut d, n, cal.voltage_ppm.unsigned_abs() as u32);
+            for &b in b" raw=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, u32::from(bus));
+            d[n] = b'/';
+            n += 1;
+            n = push_dec(&mut d, n, u32::from(cur));
+            for &b in b" f=" {
+                d[n] = b;
+                n += 1;
+            }
+            d[n] = b'0' + u8::from(fresh);
+            n += 1;
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            n += 2;
+            send_direct(&d[..n]);
+        }
         // r216: toggle the idle dim immediately (the same 20%/100% the
         // idle logic applies) — hardware verification without waiting
         // the 60 s. Also resets the idle clock so an undim sticks.

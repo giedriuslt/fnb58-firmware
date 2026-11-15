@@ -161,6 +161,8 @@ ADC1+DMA1+analysis chain) followed by one on the PA6 pickup; `r2` =
 the 32-bit-wide variant; `m` = a DMA memory-to-memory copy (engine
 test); `af`/`ad`/`ap` = the AFC handshake-path commit, direct-entry
 commit, and ping-width sweep (see the AFC section). `b` = toggle the idle dim (r216).
+`c` = the applied calibration fields + the meter's raw registers
+(r221: `[cal] z=… c=… v=… raw=<bus>/<cur> f=<fresh>`).
 
 ## PC link (r134/r135) — OpenFNB58 protocol, hardware-verified
 
@@ -352,6 +354,64 @@ a button press** the backlight dims to **20%**; any press restores 100%
 (`[bl] dim 20%` / `[bl] wake` on the console). Console `b` toggles the
 dim immediately (hardware check without waiting the minute). PC-link
 mode keeps full brightness.
+
+## Settings store (r218)
+
+The first 20 sectors of the external W25Q128 (0x000000..0x014000) are
+the settings area — a port of kws-x1's rotating-record scheme
+(settings_store.rs, the record format lives in the host-tested
+`settings-core` crate): a sector is claimed with "KWST" (0x4b57_5354)
+at its base, 8-byte `[word, !word]` records append after the claim,
+claims advance from sector 0 upward (r220 — kws-x1's direction; the
+r218 build had it inverted), the scan walks claims oldest-first with
+the later record winning, a nearly-full sector is padded with (0, 0)
+pairs, and only the newest claimed sector ever has room. **Deviation**
+(hardware-forced): kws-x1 never erases (blank internal flash); the
+W25Q128 carries the stock firmware's littlefs, so claiming ERASES the
+sector first — once per ~10,240 records, never during saves. The
+region boundary protects everything beyond sector 20.
+
+**Screen 7/8 (SET, r222)**: LEFT/RIGHT always navigate (the r218
+always-adjusting screen blocked reaching screen 8); **OK enters the
+adjust mode** (hint `OK:DIM` → `LR:DIM OK:SAVE BK:X`), LEFT/RIGHT cycle
+the idle-dim timeout (1/2/5/10/NEVER minutes), OK saves it
+(`[set] dim=N min saved s=<sect>` on the console) and leaves the
+adjust mode, BACK leaves without saving. The value applies immediately
+(the idle logic reads `settings::DIM_MINUTES`). Boot evidence:
+`[set] stored dim=N min` or `[set] no stored settings (default dim=1)`;
+a JEDEC mismatch logs `[set] flash JEDEC FAIL` and leaves defaults.
+
+## Calibration (r221/r221b)
+
+Screen 8/8 (CAL) — kws-x1's calibration wizard: a zero offset
+subtracted first, then gain corrections in ppm, found from
+**user-supplied reference values** (each entry starts at this meter's
+own averaged reading; walk it to what your reference meter shows — no
+fixed calibration points). Three steps, nothing applied until the
+last OK:
+
+1. **0 CURRENT** — unplug the load, OK takes the zero (refused above
+   20 mA: the message stays and the step repeats).
+2. **CURRENT** — a steady load ≥ 0.5 A: LEFT/RIGHT walk the entered
+   amps (±1 per press, hold for ±10), OK confirms; > ±5% off refuses.
+3. **VOLTAGE** — ≥ 4 V on the bus: same walk, OK applies and saves
+   (`[set] cal z=… c=… v=…` on the console); leaving the screen
+   abandons the wizard (kws-x1's cancel).
+
+Records ride the settings store (one per field, kws-x1's `0xCA` codec,
+later records win); the applied values feed the power screen, the
+PC-link report (at native 10 µV/100 µA resolution) and console `c` —
+the protocol paths stay raw. Refusal messages: `NO STEADY READ YET`,
+`CURRENT FLOWS: UNPLUG`, `NEEDS 0.5A OR MORE`, `NEEDS 4V OR MORE`,
+`OVER 5 OUT OF RANGE`.
+
+**Current range (r221b)**: the TPA626's CAL register sets the current
+register's span — one count = (2048/CAL) × 2.5 µV of shunt. r46's
+CAL=10240 (50 µA/count) capped the register at ±1.638 A through the
+10 mΩ shunt; r222 programs **CAL=2048** (kws-x1's own value for their
+5 mΩ/500 µA setup) = 250 µA/count, the register maps the shunt
+register 1:1, and the span is **±8.19 A** — the 0–7 A range with
+margin. Sub-0.25 mA resolution is traded away.
 
 ## Build and flash
 

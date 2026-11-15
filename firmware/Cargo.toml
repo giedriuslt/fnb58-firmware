@@ -36,3 +36,5 @@ usbpd-traits.workspace = true
 heapless = "0.9"
 # r199: the ripple analysis crate (kws-x1's firmware-core split, ported).
 ripple-core.workspace = true
+# r218: the settings-store record format (kws-x1 rotating records, ported).
+settings-core.workspace = true

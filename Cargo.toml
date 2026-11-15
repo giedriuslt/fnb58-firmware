@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["firmware", "fusb302-pd", "bootloader", "ripple-core"]
+members = ["firmware", "fusb302-pd", "bootloader", "ripple-core", "settings-core"]
 exclude = ["pd-protocol-debug"]
 
 [workspace.dependencies]
@@ -14,6 +14,8 @@ embedded-hal-async = "1.0.0"
 fusb302-pd = { path = "fusb302-pd" }
 # r199: ripple-capture analysis (kws-x1 firmware-core port)
 ripple-core = { path = "ripple-core" }
+# r218: settings-store record format (kws-x1 rotating KWST records port)
+settings-core = { path = "settings-core" }
 # r189: the QC2.0 trigger consumes the vendored pure-logic crate
 # (handshake/requests/follow — the same one kws-x1 drives).
 qc-protocol = { path = "pd-protocol-debug/qc-protocol" }

@@ -45,6 +45,14 @@ pub static AFC_TARGET: AtomicU16 = AtomicU16::new(9000);
 pub static COMMIT: AtomicBool = AtomicBool::new(false);
 /// TPA626 bus voltage in mV, published by the main loop's meter read.
 pub static VBUS_MV: AtomicU16 = AtomicU16::new(0);
+/// r221: the last meter read's RAW registers (Bus Voltage, Current) and
+/// whether the read succeeded — the calibration screen's live rows read
+/// them (calibration applies at draw time, the wizard's pending one).
+/// The protocol paths (VBUS_MV here, pd_phy) stay RAW: kws-x1's
+/// calibration is display-path only.
+pub static METER_BUS_RAW: AtomicU16 = AtomicU16::new(0);
+pub static METER_CUR_RAW: AtomicU16 = AtomicU16::new(0);
+pub static METER_FRESH: AtomicBool = AtomicBool::new(false);
 /// Measured line taps in mV (PA3 = D+, PA2 = D−), for the QC screens.
 pub static DP_MV: AtomicU16 = AtomicU16::new(0);
 pub static DM_MV: AtomicU16 = AtomicU16::new(0);
