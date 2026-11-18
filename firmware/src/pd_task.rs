@@ -9,13 +9,15 @@
 //! session's SenderResponseTimer survives even a 31-byte FIFO read).
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicUsize, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
+use embassy_time::Timer;
 use fusb302_pd::observation::{Observation, Phase};
 use fusb302_pd::startup::Report;
+use pd_protocol::pd_sniff as _pd_sniff_types;
 use pd_protocol::pd_spr;
 
 use crate::console::PD_STAGE as STAGE;
@@ -53,6 +55,28 @@ pub static BTN: AtomicU8 = AtomicU8::new(0);
 /// PPS screen (pd_task::CHOICES_MV). The boot session arms it as-is, so
 /// the boot contract is whatever was last chosen (default 5 V).
 pub static DESIRED_MV: AtomicU16 = AtomicU16::new(5000);
+
+/// r229: the advertised FIXED profiles of the last caps (the PD
+/// PROFILES screen's rows — the PD-native equivalents of the QC
+/// target list). Populated at the caps receive site below; the fixed
+/// objects only (PPS/APB objects have no `fixed` pair and are skipped).
+pub static CAPS_N: AtomicUsize = AtomicUsize::new(0);
+pub static CAPS_MV: [AtomicU16; 6] = [
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+];
+pub static CAPS_MA: [AtomicU16; 6] = [
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+];
 /// The selectable fixed targets (the PD screen cycles through these).
 pub const CHOICES_MV: [u16; 5] = [5000, 9000, 12000, 15000, 20000];
 
@@ -356,6 +380,271 @@ pub fn request_restart() {
 
 fn restart_requested() -> bool {
     RESTART.load(Ordering::Relaxed)
+}
+
+// r233: the passthrough publish — the SNIFF screen's head line ("SNIFF
+// CC1 RP3.0A M:9") and the message rows (pd_protocol's describe() renders
+// each entry to 24 chars), plus the message count the screen's redraw
+// gate watches. All behind embassy mutexes (the pd_task writes, the UI
+// reads).
+pub static SNIFF_HEAD: Mutex<CriticalSectionRawMutex, [u8; 24]> = Mutex::new([0u8; 24]);
+pub static SNIFF_ROWS: Mutex<CriticalSectionRawMutex, [[u8; 24]; 7]> =
+    Mutex::new([[0u8; 24]; 7]);
+pub static SNIFF_MESSAGES: AtomicU16 = AtomicU16::new(0);
+
+/// The Rp label bytes (kws-x1's pd.rs head).
+fn rp_label(rp: Option<pd_protocol::pd_sniff::Rp>) -> &'static [u8] {
+    match rp {
+        Some(pd_protocol::pd_sniff::Rp::Default) => b" RPDEF ",
+        Some(pd_protocol::pd_sniff::Rp::Current1A5) => b" RP1.5A",
+        Some(pd_protocol::pd_sniff::Rp::Current3A0) => b" RP3.0A",
+        None => b" RP--  ",
+    }
+}
+
+/// Render + publish the sniff state (the head and the message rows,
+/// oldest first).
+async fn publish_sniff(
+    log: &pd_protocol::pd_sniff::Log,
+    cc: Option<u8>,
+    rp: Option<pd_protocol::pd_sniff::Rp>,
+) {
+    let mut head = [0u8; 24];
+    let mut n = 0;
+    for &b in b"SNIFF CC" {
+        head[n] = b;
+        n += 1;
+    }
+    match cc {
+        Some(c) => {
+            head[n] = b'0' + c;
+            n += 1;
+        }
+        None => {
+            head[n] = b'-';
+            n += 1;
+        }
+    }
+    for &b in rp_label(rp) {
+        head[n] = b;
+        n += 1;
+    }
+    for &b in b" M:" {
+        head[n] = b;
+        n += 1;
+    }
+    n = crate::push_dec(&mut head, n, log.messages.min(9999));
+    head[n] = 0;
+    let mut rows = [[0u8; 24]; 7];
+    let len = log.entries().len();
+    let skip = len.saturating_sub(7);
+    for (i, entry) in log.entries().enumerate() {
+        if i < skip {
+            continue;
+        }
+        rows[i - skip] = pd_protocol::pd_sniff::describe(entry);
+    }
+    *SNIFF_HEAD.lock().await = head;
+    *SNIFF_ROWS.lock().await = rows;
+    SNIFF_MESSAGES.store(log.messages.min(u16::MAX as u32) as u16, Ordering::Relaxed);
+}
+
+/// The PPS heuristic (kws-x1's uncaptured_request): a Request seen before
+/// any Source_Capabilities is a re-request (the meter booted from the same
+/// VBUS after the negotiation); a second one for the same object is PPS
+/// (a fixed sink only answers new capabilities, which the sniffer would
+/// have captured).
+fn uncaptured_request(uncaptured: &mut Option<usize>, rdo: u32) -> pd_protocol::pd_sniff::Supply {
+    use pd_protocol::pd_sniff::Supply;
+    const RDO_POSITION_SHIFT: u32 = 28;
+    const PPS_RDO_VOLTAGE_SHIFT: u32 = 9;
+    const PPS_RDO_VOLTAGE_MASK: u32 = 0xfff;
+    const PPS_RDO_VOLTAGE_UNIT_MV: u32 = 20;
+    const PPS_RDO_CURRENT_MASK: u32 = 0x7f;
+    const PPS_RDO_CURRENT_UNIT_MA: u32 = 50;
+    let position = (rdo >> RDO_POSITION_SHIFT) as usize;
+    let repeated = *uncaptured == Some(position);
+    *uncaptured = Some(position);
+    if repeated {
+        Supply::Pps {
+            mv: ((rdo >> PPS_RDO_VOLTAGE_SHIFT) & PPS_RDO_VOLTAGE_MASK)
+                * PPS_RDO_VOLTAGE_UNIT_MV,
+            ma: (rdo & PPS_RDO_CURRENT_MASK) * PPS_RDO_CURRENT_UNIT_MA,
+        }
+    } else {
+        Supply::Raw
+    }
+}
+
+/// r233: the passthrough sniff loop (kws-x1's sniff()): the CC pull-downs
+/// come off in the sniffer's listening configuration within milliseconds
+/// of boot (before the charger's PD negotiation), the RX stays on and
+/// auto-CRC stays off — the meter never sends, never acknowledges, never
+/// resets. Every heard frame lands in the Log for the SNIFF screen. Any
+/// error stops it for good (parked; the screen keeps the last state).
+async fn sniff() {
+    const SNIFF_FULL_POLL: embassy_time::Duration = embassy_time::Duration::from_millis(10);
+    crate::pd_log(b"[pd] passthrough: listen only\r\n");
+    let mut log = pd_protocol::pd_sniff::Log::new();
+    let mut caps = [0u32; 7];
+    let mut caps_n = 0usize;
+    let mut uncaptured: Option<usize> = None;
+    let mut rp: Option<pd_protocol::pd_sniff::Rp> = None;
+    let mut cc: Option<u8> = None;
+    loop {
+        STAGE.store(2, Ordering::Relaxed);
+        crate::dbg_stage(11);
+        SESSION_ACTIVE.store(false, Ordering::Relaxed);
+        BUSY.store(false, Ordering::Relaxed);
+        // The released snapshot: the power-on configuration restored and
+        // verified (the sniffer's start removes the CC pull-downs).
+        let started: Option<fusb302_pd::sniffer::ActiveSniffer> = {
+            let mut guard = BUS.lock().await;
+            let started_inner = match guard.0.as_mut() {
+                Some(bus) => {
+                    if restore_baseline(bus).await.is_err() {
+                        crate::pd_log(b"[pd] baseline FAIL\r\n");
+                        None
+                    } else {
+                        match fusb302_pd::snapshot::snapshot(bus).await {
+                            Err(failure) => {
+                                let mut d = [0u8; 24];
+                                let mut n = 0;
+                                for &b in b"[pd] snapshot FAIL reg=" {
+                                    d[n] = b;
+                                    n += 1;
+                                }
+                                n = crate::push_hex8(&mut d, n, u32::from(failure.register));
+                                d[n] = b'\r';
+                                d[n + 1] = b'\n';
+                                crate::pd_log(&d[..n + 2]);
+                                None
+                            }
+                            Ok(snapshot) => {
+                                let mut delay = embassy_time::Delay;
+                                match fusb302_pd::sniffer::Sniffer::once(
+                                    <crate::pd_phy::FnbPlatform
+                                        as fusb302_pd::phy::Platform>::BASELINE,
+                                    MEASURE,
+                                )
+                                .start(bus, &mut delay, snapshot)
+                                .await
+                                {
+                                    Ok(sniffer) => {
+                                        cc = Some(sniffer.selected());
+                                        Some(sniffer)
+                                    }
+                                    Err(_) => {
+                                        crate::pd_log(b"[pd] sniff start FAIL\r\n");
+                                        None
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    crate::pd_log(b"[pd] no bus\r\n");
+                    None
+                }
+            };
+            started_inner
+        };
+        let Some(mut sniffer) = started else {
+            // The sniffer is once-per-boot (kws-x1's semantics): park.
+            crate::pd_log(b"[pd] sniff parked\r\n");
+            loop {
+                Timer::after_secs(3600).await;
+            }
+        };
+        publish_sniff(&log, cc, rp).await;
+        let mut next_check =
+            embassy_time::Instant::now() + embassy_time::Duration::from_secs(1);
+        let mut next_poll = embassy_time::Instant::now();
+        loop {
+            Timer::after_millis(1).await;
+            let mut guard = BUS.lock().await;
+            let Some(bus) = guard.0.as_mut() else {
+                continue;
+            };
+            let now = embassy_time::Instant::now();
+            // kws-x1's poll cadence: the full FIFO poll every 10 ms,
+            // a STATUS1 pending check between, the config check 1/s.
+            let result = if now >= next_check {
+                next_check += embassy_time::Duration::from_secs(1);
+                sniffer.check(bus).await.map(|()| None)
+            } else {
+                let due = if now >= next_poll {
+                    Ok(true)
+                } else {
+                    sniffer.pending(bus).await
+                };
+                match due {
+                    Ok(true) => {
+                        next_poll = now + SNIFF_FULL_POLL;
+                        sniffer.poll(bus).await.map(Some)
+                    }
+                    Ok(false) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            };
+            let mut changed = false;
+            match result {
+                Ok(Some((outcome, status0))) => {
+                    // BC_LVL is only meaningful between BMC transmissions.
+                    if fusb302_pd::pd_sniff::quiet(status0)
+                        && let Some(new_rp) = fusb302_pd::pd_sniff::rp(status0)
+                        && Some(new_rp) != rp
+                    {
+                        rp = Some(new_rp);
+                        changed = true;
+                    }
+                    if let fusb302_pd::service::Outcome::Packet(packet) = outcome {
+                        let frame = packet.frame();
+                        // Source_Capabilities replace the stored PDOs
+                        // first, so a later Request decodes against the
+                        // newest offer (kws-x1's record()).
+                        if frame.header() & fusb302_pd::header::EXTENDED == 0
+                            && let Ok(objects) = frame.source_capabilities()
+                        {
+                            caps_n = objects.len().min(7);
+                            for (slot, raw) in caps[..caps_n].iter_mut().zip(objects) {
+                                *slot = raw;
+                            }
+                        }
+                        let entry = pd_protocol::pd_sniff::Entry::classify(
+                            frame.header(),
+                            frame.data(),
+                            &caps[..caps_n],
+                        );
+                        if let Some(supply) = entry.supply {
+                            let supply = match supply {
+                                pd_protocol::pd_sniff::Supply::Raw if caps_n == 0 => {
+                                    uncaptured_request(&mut uncaptured, entry.word)
+                                }
+                                supply => supply,
+                            };
+                            let _ = supply;
+                        }
+                        log.push(entry);
+                        changed = true;
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    crate::pd_log(b"[pd] sniff stop\r\n");
+                    // Parked for good: any error ends the sniffer without
+                    // cleanup writes (kws-x1's semantics).
+                    loop {
+                        Timer::after_secs(3600).await;
+                    }
+                }
+            }
+            if changed {
+                publish_sniff(&log, cc, rp).await;
+            }
+        }
+    }
 }
 
 #[embassy_executor::task]

@@ -63,7 +63,7 @@ static NEXT_SCREEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r227";
+const BUILD: &[u8] = b"r233";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -233,7 +233,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r227 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r233 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot, through the
@@ -318,7 +318,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r227 " {
+                for &b in b"r233 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -425,7 +425,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r227: claim from sector 0\r\n");
+    say(b"[lcd] FNB58 r233: claim from sector 0\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -840,6 +840,18 @@ async fn main(spawner: Spawner) {
         if ui.screen == Screen::Pd && !pd_task::BUSY.load(Ordering::Relaxed) {
             ui.draw_pd(&mut lcd, &pd_task::VIEW).await;
         }
+        // r229: the PD PROFILES screen — same gate (the rows are cheap;
+        // the identity gate inside redraws on edit/sel/caps/contract).
+        if ui.screen == Screen::Profiles && !pd_task::BUSY.load(Ordering::Relaxed) {
+            ui.draw_profiles(&mut lcd).await;
+        }
+
+        // r233: the PD SNIFF screen — same gate (the rows come from the
+        // pd_task's sniffer log; the identity gates the redraw).
+        if ui.screen == Screen::Sniff && !pd_task::BUSY.load(Ordering::Relaxed) {
+            ui.draw_sniff(&mut lcd).await;
+        }
+
         // r189: the QC screen draws under the same BUSY gate (the QC
         // task's own blocking work is microseconds-scale ADC reads).
         if ui.screen == Screen::Qc && !pd_task::BUSY.load(Ordering::Relaxed) {
@@ -858,13 +870,17 @@ async fn main(spawner: Spawner) {
         // is DMA-driven and needs no executor; only the draw blocks).
         if ui.screen == Screen::Ripple && !pd_task::BUSY.load(Ordering::Relaxed) {            // kws-x1 main.rs:1282-1286: take the latest capture unless
             // held (the task stops publishing while held anyway).
+            // r228: a fresh capture gates the graphical redraw (~500
+            // fills at the capture rate, not per loop tick).
+            let mut fresh = false;
             if let Some(update) = ripple_updates.try_changed() {
                 if !ui.ripple_hold {
                     ripple_reading = update;
+                    fresh = true;
                 }
             }
             let reference = Some(ripple::REFERENCE.load(Ordering::Relaxed));
-            ui.draw_ripple(&mut lcd, ripple_reading.as_ref(), reference)
+            ui.draw_ripple(&mut lcd, ripple_reading.as_ref(), reference, fresh)
                 .await;
         }
         // r225: the lines screen — same BUSY gate (the D± values are
@@ -939,12 +955,15 @@ async fn main(spawner: Spawner) {
                     Screen::Energy => ui.draw_energy(&mut lcd, energy.totals, energy_save_ok).await,
                     Screen::Graph => ui.draw_graph(&mut lcd, &power_history).await,
                     Screen::Pd => ui.draw_pd(&mut lcd, &pd_task::VIEW).await,
+                    Screen::Sniff => ui.draw_sniff(&mut lcd).await,
+                    Screen::Profiles => ui.draw_profiles(&mut lcd).await,
                     Screen::Qc => ui.draw_qc(&mut lcd).await,
                     Screen::Qc3 => ui.draw_qc3(&mut lcd).await,
                     Screen::Afc => ui.draw_afc(&mut lcd).await,
                     Screen::Ripple => {
                         let reference = Some(ripple::REFERENCE.load(Ordering::Relaxed));
-                        ui.draw_ripple(&mut lcd, ripple_reading.as_ref(), reference)
+                        // fresh=true: the shot forces the plot redraw.
+                        ui.draw_ripple(&mut lcd, ripple_reading.as_ref(), reference, true)
                             .await;
                     }
                     Screen::Settings => ui.draw_settings(&mut lcd).await,
@@ -1040,6 +1059,22 @@ async fn main(spawner: Spawner) {
                     } else if ui.screen == Screen::Afc {
                         qc_task::commit_afc();
                         sender.push(b"[afc] commit\r\n");
+                    } else if ui.screen == Screen::Profiles {
+                        // r229: request the previewed profile through the
+                        // r173 PD-native re-request (a session re-requests
+                        // in place; without one the restart's fresh caps
+                        // request DESIRED_MV).
+                        let mv = pd_task::CAPS_MV[ui.profiles_sel].load(Ordering::Relaxed);
+                        pd_task::DESIRED_MV.store(mv, Ordering::Relaxed);
+                        if pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) {
+                            pd_task::commit_desired();
+                            sender.push(b"[pd] profile re-request
+");
+                        } else {
+                            sender.push(b"[pd] session start
+");
+                            pd_task::request_restart();
+                        }
                     } else if ui.screen == Screen::Settings {
                         // r226: save the edited row's value — the word
                         // packs dim + energy, the calibration rides along
@@ -1054,6 +1089,7 @@ async fn main(spawner: Spawner) {
                             &mut store,
                             minutes,
                             ui.set_energy,
+                            ui.set_passthrough,
                             settings::applied(),
                         );
                         ui.set_mode = SetMode::Row;
@@ -1129,6 +1165,7 @@ async fn main(spawner: Spawner) {
                             &mut store,
                             settings::DIM_MINUTES.load(Ordering::Relaxed),
                             settings::ENERGY_IDX.load(Ordering::Relaxed),
+                            settings::PASSTHROUGH.load(Ordering::Relaxed),
                             cal,
                         );
                         ui.enter(&mut lcd, Screen::Settings).await;
@@ -1157,7 +1194,7 @@ async fn main(spawner: Spawner) {
                 }
                 Press::SetRow(dir) => {
                     // r226: the settings page's row cursor.
-                    ui.set_row = ((ui.set_row as i16 + dir).rem_euclid(2)) as usize;
+                    ui.set_row = ((ui.set_row as i16 + dir).rem_euclid(3)) as usize;
                     ui.set_drawn = -1;
                     let mut d = [0u8; 24];
                     let mut n = 0;
@@ -1222,11 +1259,60 @@ async fn main(spawner: Spawner) {
                     }
                     sender.push(&d[..n]);
                 }
+                Press::Profile(dir) => {
+                    // r229: the profiles selector's previewed row.
+                    let n = pd_task::CAPS_N.load(Ordering::Relaxed);
+                    if n == 0 {
+                        continue;
+                    }
+                    ui.profiles_sel =
+                        ((ui.profiles_sel as i16 + dir).rem_euclid(n as i16)) as usize;
+                    ui.profiles_drawn = (true, usize::MAX, 0, 0); // force redraw
+                    let mv = pd_task::CAPS_MV[ui.profiles_sel].load(Ordering::Relaxed);
+                    let mut d = [0u8; 24];
+                    let mut n2 = 0;
+                    for &b in b"[pd] sel=" {
+                        d[n2] = b;
+                        n2 += 1;
+                    }
+                    n2 = push_dec(&mut d, n2, u32::from(mv));
+                    for &b in b"mV
+" {
+                        d[n2] = b;
+                        n2 += 1;
+                    }
+                    sender.push(&d[..n2]);
+                }
                 Press::Voltage(dir) => {
                     // r171: the PPS screen's voltage selection. r189/r196:
                     // the QC screens cycle their own targets. r226: the
                     // settings page's Edit mode changes the CURSOR row's
                     // value (dim, or the energy checkpoint interval).
+                    if ui.screen == Screen::Settings && ui.set_row == 2 {
+                        // r233: the PD PASS row toggles (OFF <-> ON);
+                        // the mode applies at the next boot (kws-x1's
+                        // boot-chosen passthrough).
+                        ui.set_passthrough = !ui.set_passthrough;
+                        ui.set_drawn = -1;
+                        let mut d = [0u8; 24];
+                        let mut n = 0;
+                        for &b in b"[set] pd pass=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        let label: &[u8] = if ui.set_passthrough { b"ON" } else { b"OFF" };
+                        for &b in label {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        for &b in b"
+" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        sender.push(&d[..n]);
+                        continue;
+                    }
                     if ui.screen == Screen::Settings && ui.set_row == 1 {
                         let all = settings_core::EnergyMemory::ALL;
                         let idx = (ui.set_energy as i16 + dir)

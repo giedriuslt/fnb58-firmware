@@ -45,7 +45,7 @@ use settings_core::calibration::{Calibration, FIELDS, Found};
 use settings_core::energy_store::{self, Storage};
 use settings_core::{CLAIM, FIRST, FILLER, RECORD, BLANK};
 use settings_core::{dim_minutes_to_record, energy_memory_from_record, scan_records};
-use settings_core::{settings_word, ScanState};
+use settings_core::{passthrough_from_record, settings_word, ScanState};
 
 use crate::flash::{self, Flash};
 
@@ -75,6 +75,17 @@ pub static CAL_VOLTAGE_PPM: core::sync::atomic::AtomicI32 = core::sync::atomic::
 /// index (settings-core's ALL order: 0 = Off, then 5/10/30/60 s).
 pub static ENERGY_IDX: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+
+/// r233: the applied PD passthrough flag (default off; ON removes the
+/// FUSB302's CC pull-downs after boot and starts the receive-only
+/// sniffer instead of the sink session).
+pub static PASSTHROUGH: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// r233: the applied passthrough flag for the pd_task's boot branch.
+pub fn passthrough() -> bool {
+    PASSTHROUGH.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// r226: the applied interval in seconds, `None` = Off (the main
 /// loop's checkpoint cadence reads this).
@@ -232,13 +243,19 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
         state = newer;
         next = next.or(room);
     }
-    let ScanState { dim, energy, cal } = state;
+    let ScanState {
+        dim,
+        energy,
+        passthrough,
+        cal,
+    } = state;
     match dim {
         Some(minutes) => {
             DIM_MINUTES.store(minutes, core::sync::atomic::Ordering::Relaxed);
             if let Some(idx) = energy {
                 ENERGY_IDX.store(idx, core::sync::atomic::Ordering::Relaxed);
             }
+            PASSTHROUGH.store(passthrough, core::sync::atomic::Ordering::Relaxed);
             store_cal(cal.calibration());
             let mut d = [0u8; 40];
             let mut n = 0;
@@ -253,11 +270,15 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
             }
             log(&d[..n]);
             log_energy();
+            log_passthrough();
             log_cal(b"[set] stored cal", cal.calibration());
             (
                 Store {
                     next,
-                    saved: (settings_word(minutes, energy.unwrap_or(0)), cal.calibration()),
+                    saved: (
+                        settings_word(minutes, energy.unwrap_or(0), passthrough),
+                        cal.calibration(),
+                    ),
                 },
                 Some(minutes),
             )
@@ -272,6 +293,8 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
                 ENERGY_IDX.store(idx, core::sync::atomic::Ordering::Relaxed);
                 log_energy();
             }
+            log_passthrough();
+            PASSTHROUGH.store(passthrough, core::sync::atomic::Ordering::Relaxed);
             if cal.any() {
                 store_cal(cal.calibration());
                 log_cal(b"[set] stored cal", cal.calibration());
@@ -285,6 +308,29 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
             )
         }
     }
+}
+
+/// r233: log the applied passthrough flag (the boot evidence — without
+/// it a passthrough boot is indistinguishable from a dead sniffer).
+fn log_passthrough() {
+    let on = PASSTHROUGH.load(core::sync::atomic::Ordering::Relaxed);
+    let mut d = [0u8; 32];
+    let mut n = 0;
+    for &b in b"[set] pd pass=" {
+        d[n] = b;
+        n += 1;
+    }
+    let label: &[u8] = if on { b"ON" } else { b"OFF" };
+    for &b in label {
+        d[n] = b;
+        n += 1;
+    }
+    for &b in b"
+" {
+        d[n] = b;
+        n += 1;
+    }
+    log(&d[..n]);
 }
 
 /// r226: log the applied energy checkpoint interval.
@@ -347,9 +393,14 @@ fn log_cal(prefix: &[u8], cal: Calibration) {
 /// the calibration's one record per field (kws-x1's records[..] shape —
 /// a newly claimed sector starts with all of them, so it never depends
 /// on older ones).
-fn record_set(minutes: u32, energy_idx: usize, cal: Calibration) -> [u32; 1 + FIELDS] {
+fn record_set(
+    minutes: u32,
+    energy_idx: usize,
+    passthrough: bool,
+    cal: Calibration,
+) -> [u32; 1 + FIELDS] {
     let mut records = [0u32; 1 + FIELDS];
-    records[0] = settings_word(minutes, energy_idx);
+    records[0] = settings_word(minutes, energy_idx, passthrough);
     records[1..].copy_from_slice(&cal.records());
     records
 }
@@ -365,13 +416,14 @@ pub fn save(
     store: &mut Store,
     minutes: u32,
     energy_idx: usize,
+    passthrough: bool,
     cal: Calibration,
 ) {
     let Some(word) = dim_minutes_to_record(minutes) else {
         log(b"[set] save refused (bad value)\r\n");
         return;
     };
-    let word = settings_word(minutes, energy_idx);
+    let word = settings_word(minutes, energy_idx, passthrough);
     if word == store.saved.0 && cal == store.saved.1 {
         return;
     }
@@ -379,7 +431,7 @@ pub fn save(
     // dim word if it changed, all FIELDS calibration records if the
     // calibration as a whole changed) — compared against the OLD saved
     // set, which updates only after the fold.
-    let records = record_set(minutes, energy_idx, cal);
+    let records = record_set(minutes, energy_idx, passthrough, cal);
     let mut changed = [0u32; 1 + FIELDS];
     let mut count = 0;
     for (record, keep) in records.iter().zip(
@@ -395,6 +447,7 @@ pub fn save(
     let changed = &changed[..count];
     DIM_MINUTES.store(minutes, core::sync::atomic::Ordering::Relaxed);
     ENERGY_IDX.store(energy_idx, core::sync::atomic::Ordering::Relaxed);
+    PASSTHROUGH.store(passthrough, core::sync::atomic::Ordering::Relaxed);
     store_cal(cal);
     store.saved = (word, cal);
     let result = match store.next {

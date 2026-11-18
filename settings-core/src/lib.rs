@@ -112,9 +112,10 @@ impl EnergyMemory {
 /// The settings record word: the dim minutes in the low byte, the
 /// energy-memory index in bits 8..10 (kws-x1 packs its settings word
 /// as bitfields; the r218 word's reserved bits were held for exactly
-/// this). Callers validate `minutes` via [`dim_minutes_to_record`].
-pub fn settings_word(minutes: u32, energy_idx: usize) -> u32 {
-    (minutes & 0xFF) | ((energy_idx as u32 & 0x7) << 8)
+/// this) and the PD passthrough flag in bit 11 (r233). Callers validate
+/// `minutes` via [`dim_minutes_to_record`].
+pub fn settings_word(minutes: u32, energy_idx: usize, passthrough: bool) -> u32 {
+    (minutes & 0xFF) | ((energy_idx as u32 & 0x7) << 8) | (u32::from(passthrough) << 11)
 }
 
 /// Decode a record word's energy-memory index (bits 8..10, valid
@@ -124,12 +125,18 @@ pub fn energy_memory_from_record(word: u32) -> Option<usize> {
     if idx < EnergyMemory::ALL.len() { Some(idx) } else { None }
 }
 
+/// Decode a record word's PD passthrough flag (bit 11).
+pub fn passthrough_from_record(word: u32) -> bool {
+    word >> 11 & 1 == 1
+}
+
 /// The scan fold's carried findings: the newest dim minutes, the newest
 /// energy-memory index and the newest calibration fields.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanState {
     pub dim: Option<u32>,
     pub energy: Option<usize>,
+    pub passthrough: bool,
     pub cal: Found,
 }
 
@@ -162,6 +169,7 @@ pub fn scan_records(
                 if let Some(idx) = energy_memory_from_record(word) {
                     state.energy = Some(idx);
                 }
+                state.passthrough = passthrough_from_record(word);
             }
         }
         slot += RECORD;
@@ -211,12 +219,12 @@ mod tests {
     #[test]
     fn settings_word_packs_dim_and_energy() {
         for (minutes, idx) in [(0u32, 0usize), (10, 4), (5, 2)] {
-            let word = settings_word(minutes, idx);
+            let word = settings_word(minutes, idx, false);
             assert_eq!(dim_minutes_from_record(word), Some(minutes));
             assert_eq!(energy_memory_from_record(word), Some(idx));
         }
         // An invalid energy index decodes as nothing; dim survives.
-        assert_eq!(energy_memory_from_record(settings_word(5, 6)), None);
+        assert_eq!(energy_memory_from_record(settings_word(5, 6, false)), None);
         // The old single-field words read as energy=Off (index 0).
         assert_eq!(energy_memory_from_record(5), Some(0));
     }
@@ -262,11 +270,12 @@ mod tests {
         let (state, _) = scan_records([(dim, !dim)].into_iter(), ScanState { dim: Some(10), ..ScanState::default() }, 32);
         assert_eq!(state.dim, Some(2));
         // A packed dim+energy word updates both fields.
-        let word = settings_word(5, 3);
+        let word = settings_word(5, 3, true);
         let (state, _) =
             scan_records([(word, !word)].into_iter(), ScanState::default(), FIRST + RECORD);
         assert_eq!(state.dim, Some(5));
         assert_eq!(state.energy, Some(3));
+        assert!(state.passthrough);
     }
 
     /// r221: calibration records ride the same scan — a calibration word

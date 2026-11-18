@@ -35,6 +35,13 @@ pub enum Screen {
     /// energy / time totals, checkpointed to the journal).
     Energy,
     Pd,
+    /// r233: the PD SNIFF screen (kws-x1's PD Sniff — the messages the
+    /// passthrough sniffer hears between the charger and the device).
+    Sniff,
+    /// r229: the PD PROFILES screen (kws-x1's draw_fixed — the
+    /// advertised fixed PDOs as a selector; OK requests the previewed
+    /// profile through the r173 PD-native re-request).
+    Profiles,
     /// r189: the QC2.0 trigger screen (targets 5/9/12/20 V, OK = REQ).
     Qc,
     /// r196: the QC3.0 continuous screen (target in mV, 200 mV steps).
@@ -53,12 +60,14 @@ pub enum Screen {
 }
 
 /// The screen cycle order (LEFT/RIGHT walk it in both directions).
-const SCREEN_CYCLE: [Screen; 11] = [
+const SCREEN_CYCLE: [Screen; 13] = [
     Screen::Power,
     Screen::Graph,
     Screen::Lines,
     Screen::Energy,
     Screen::Pd,
+    Screen::Sniff,
+    Screen::Profiles,
     Screen::Qc,
     Screen::Qc3,
     Screen::Afc,
@@ -107,6 +116,8 @@ pub enum Press {
     /// r227: the graph's focused value (trace, or the time window).
     GraphTrace(i16),
     GraphWindow(i16),
+    /// r229: the profiles selector's previewed row (editing mode).
+    Profile(i16),
 }
 
 /// r199: what LEFT/RIGHT adjust on the open ripple screen, in OK's order
@@ -135,6 +146,18 @@ impl RippleFocus {
 pub enum GraphFocus {
     Trace,
     Window,
+}
+
+/// r229: the overview's palette per voltage level (kws-x1's
+/// level_color) — the PD PROFILES and QC2 rows use it for the volts.
+fn level_color(mv: u16) -> u16 {
+    match mv {
+        0..=5_500 => WHITE,
+        5_501..=9_500 => CYAN,
+        9_501..=12_500 => GREEN,
+        12_501..=15_500 => YELLOW,
+        _ => ORANGE,
+    }
 }
 
 /// r227: the graph's full scale is the peak plus 10% headroom, rounded
@@ -244,6 +267,13 @@ pub struct Ui {
     afc_state: u8,
     afc_tgt: u16,
     afc_dyn_at: u32,
+    /// r229: the profiles selector's state (kws-x1's editing flag and
+    /// the previewed row) plus the body's identity cache.
+    pub profiles_edit: bool,
+    pub profiles_sel: usize,
+    pub profiles_drawn: (bool, usize, usize, u16),
+    /// r233: the sniff body's identity (the message count).
+    sniff_drawn: u16,
     /// r227: the graph screen's state (kws-x1 Input's graph fields —
     /// the trace/window are view prefs that persist; the focus closes
     /// on leaving, like the ripple's).
@@ -273,10 +303,12 @@ pub struct Ui {
     /// commit arm forces a redraw after saving.
     pub set_drawn: i16,
     /// r226: the settings page's mode and row cursor, plus the edited
-    /// energy-interval index (settings-core's ALL order).
+    /// energy-interval index (settings-core's ALL order) and the r233
+    /// PD passthrough toggle.
     pub set_mode: SetMode,
     pub set_row: usize,
     pub set_energy: usize,
+    pub set_passthrough: bool,
     /// r221: the calibration wizard (created fresh on the OK that
     /// enters it, from the applied calibration; nothing applies until
     /// the last OK). r226: `cal_active` gates the wizard — without it
@@ -476,6 +508,10 @@ impl Ui {
             afc_state: 0xFF,
             afc_tgt: 0xFFFF,
             afc_dyn_at: 0,
+            profiles_edit: false,
+            profiles_sel: 0,
+            profiles_drawn: (true, usize::MAX, 0, 0),
+            sniff_drawn: u16::MAX,
             graph_focus: None,
             graph_trace: settings_core::power_history::GraphTrace::default(),
             graph_window: settings_core::power_history::GraphWindow::default(),
@@ -496,6 +532,7 @@ impl Ui {
             set_mode: SetMode::Idle,
             set_row: 0,
             set_energy: 0,
+            set_passthrough: false,
             cal_wizard: Wizard::new(Calibration::default()),
             cal_active: false,
             cal_ident: u32::MAX,
@@ -570,6 +607,41 @@ impl Ui {
                     self.cal_active = false;
                     self.cal_ident = u32::MAX;
                     return Press::Hint;
+                }
+                _ => {}
+            }
+        }
+        // r229: the profiles selector (kws-x1's draw_fixed flow): OK
+        // enters, LEFT/RIGHT move the preview, OK requests the
+        // previewed profile through the r173 PD-native re-request, BACK
+        // cancels. Unfocused LEFT/RIGHT navigate.
+        if self.screen == Screen::Profiles {
+            match i {
+                buttons::OK => {
+                    if self.profiles_edit {
+                        return Press::Commit;
+                    }
+                    self.profiles_edit = true;
+                    // Seed the preview at the ACTIVE row (kws-x1 seeds
+                    // the preview from the contract in force).
+                    let n = crate::pd_task::CAPS_N.load(core::sync::atomic::Ordering::Relaxed);
+                    let active = crate::pd_task::VIEW.selected_mv
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    self.profiles_sel = (0..n)
+                        .find(|&i| {
+                            crate::pd_task::CAPS_MV[i]
+                                .load(core::sync::atomic::Ordering::Relaxed)
+                                == active
+                        })
+                        .unwrap_or(0);
+                    return Press::Hint;
+                }
+                buttons::BACK if self.profiles_edit => {
+                    self.profiles_edit = false;
+                    return Press::Hint;
+                }
+                buttons::LEFT | buttons::RIGHT if self.profiles_edit => {
+                    return Press::Profile(if i == buttons::RIGHT { 1 } else { -1 });
                 }
                 _ => {}
             }
@@ -711,111 +783,53 @@ impl Ui {
         self.cal_live = (0, 0, false);
         // r227: the graph redraws its whole plot after a forced repaint.
         self.graph_drawn = (None, self.graph_trace, self.graph_window, self.graph_focus);
+        // r229/r233: the profiles and sniff bodies too (the notice and
+        // the message list re-arm on a forced repaint).
+        self.profiles_drawn = (true, usize::MAX, 0, 0);
+        self.sniff_drawn = u16::MAX;
     }
 
-    /// r223: the title, page tag and hint — enter()'s draw half without
-    /// its state resets, so the screenshot's forced repaint re-draws
-    /// the chrome without touching navigation/selection/wizard state.
+    /// r230c: the per-screen header, uniform across all screens —
+    /// kws-x1's style: the title in the tab's accent with its underline
+    /// bar over the rule, the four group-tab pills and the page dots
+    /// (decorative — fnb58's screens aren't grouped), then the screen's
+    /// hint. The ripple title is plain magenta on black (user request —
+    /// the r228 filled box read badly).
     pub(crate) async fn draw_chrome(&mut self, lcd: &mut Lcd, screen: Screen) {
-        match screen {
-            Screen::Power => {
-                // r224: kws-x1's header — the title in the tab's color,
-                // the group-tab bars and page dots, a rule under all of
-                // it. The bars/dots are decorative (fnb58's screens
-                // aren't grouped; they carry the kws-x1 look).
-                text(lcd, 8, 2, b"OVERVIEW", 3, CYAN).await;
-                for (i, &c) in [YELLOW, GREEN, ORANGE, MAGENTA].iter().enumerate() {
-                    let x = 180 + i as u16 * 20;
-                    lcd.rounded_fill(x, 2, x + 14, 22, 6, c).await;
-                }
-                lcd.dot(290, 12, 5, CYAN).await;
-                lcd.dot(302, 12, 5, RULE).await;
-                lcd.dot(314, 12, 5, RULE).await;
-                lcd.fill_window(4, 27, 315, 27, RULE).await;
-                self.draw_hint(lcd).await;
-            }
-            Screen::Graph => {
-                // r227: kws-x1's graph header (the accent + underline
-                // bar over the rule, like the lines page's).
-                text(lcd, 8, 2, b"GRAPH", 3, ORANGE).await;
-                for (i, &c) in [YELLOW, GREEN, ORANGE, MAGENTA].iter().enumerate() {
-                    let x = 180 + i as u16 * 20;
-                    lcd.rounded_fill(x, 2, x + 14, 22, 6, c).await;
-                }
-                lcd.dot(290, 12, 5, RULE).await;
-                lcd.dot(302, 12, 5, RULE).await;
-                lcd.dot(314, 12, 5, RULE).await;
-                lcd.fill_window(4, 27, 315, 27, RULE).await;
-                lcd.fill_window(8, 25, 108, 27, ORANGE).await;
-                self.draw_hint(lcd).await;
-            }
-            Screen::Lines => {
-                // r225: kws-x1's lines header — the title in the screen's
-                // accent with its underline bar over the rule; all page
-                // dots dim (this page's picture).
-                text(lcd, 8, 2, b"LINES", 3, YELLOW).await;
-                for (i, &c) in [YELLOW, GREEN, ORANGE, MAGENTA].iter().enumerate() {
-                    let x = 180 + i as u16 * 20;
-                    lcd.rounded_fill(x, 2, x + 14, 22, 6, c).await;
-                }
-                lcd.dot(290, 12, 5, RULE).await;
-                lcd.dot(302, 12, 5, RULE).await;
-                lcd.dot(314, 12, 5, RULE).await;
-                lcd.fill_window(4, 27, 315, 27, RULE).await;
-                lcd.fill_window(8, 25, 100, 27, YELLOW).await;
-                self.draw_hint(lcd).await;
-            }
-            Screen::Energy => {
-                // r226: kws-x1's energy header (the accent + underline
-                // bar over the rule, like the lines page's).
-                text(lcd, 8, 2, b"ENERGY", 3, GREEN).await;
-                for (i, &c) in [YELLOW, GREEN, ORANGE, MAGENTA].iter().enumerate() {
-                    let x = 180 + i as u16 * 20;
-                    lcd.rounded_fill(x, 2, x + 14, 22, 6, c).await;
-                }
-                lcd.dot(290, 12, 5, RULE).await;
-                lcd.dot(302, 12, 5, RULE).await;
-                lcd.dot(314, 12, 5, RULE).await;
-                lcd.fill_window(4, 27, 315, 27, RULE).await;
-                lcd.fill_window(8, 25, 116, 27, GREEN).await;
-                self.draw_hint(lcd).await;
-            }
-            Screen::Pd => {
-                text(lcd, 8, 8, b"PPS", 2, WHITE).await;
-                text(lcd, 248, 8, b"5/11", 2, GRAY).await;
-                self.draw_hint(lcd).await;
-            }
-            Screen::Qc => {
-                text(lcd, 8, 8, b"QC", 2, WHITE).await;
-                text(lcd, 248, 8, b"6/11", 2, GRAY).await;
-                self.draw_hint(lcd).await;
-            }
-            Screen::Qc3 => {
-                text(lcd, 8, 8, b"QC3", 2, WHITE).await;
-                text(lcd, 248, 8, b"7/11", 2, GRAY).await;
-                self.draw_hint(lcd).await;
-            }
-            Screen::Afc => {
-                text(lcd, 8, 8, b"AFC", 2, WHITE).await;
-                text(lcd, 248, 8, b"8/11", 2, GRAY).await;
-                self.draw_hint(lcd).await;
-            }
-            Screen::Ripple => {
-                text(lcd, 8, 8, b"RIPPLE", 2, WHITE).await;
-                text(lcd, 248, 8, b"9/11", 2, GRAY).await;
-                self.draw_hint(lcd).await;
-            }
-            Screen::Settings => {
-                text(lcd, 8, 8, b"SET", 2, WHITE).await;
-                text(lcd, 248, 8, b"10/11", 2, GRAY).await;
-                self.draw_hint(lcd).await;
-            }
-            Screen::Cal => {
-                text(lcd, 8, 8, b"CAL", 2, WHITE).await;
-                text(lcd, 248, 8, b"11/11", 2, GRAY).await;
-                self.draw_hint(lcd).await;
-            }
+        let (title, accent): (&[u8], u16) = match screen {
+            Screen::Power => (b"OVERVIEW", CYAN),
+            Screen::Graph => (b"GRAPH", ORANGE),
+            Screen::Lines => (b"LINES", YELLOW),
+            Screen::Energy => (b"ENERGY", GREEN),
+            Screen::Pd => (b"PPS", CYAN),
+            Screen::Sniff => (b"PD SNIFF", GREEN),
+            Screen::Profiles => (b"PD PROFILES", GREEN),
+            Screen::Qc => (b"QC 2.0", ORANGE),
+            Screen::Qc3 => (b"QC 3.0", ORANGE),
+            Screen::Afc => (b"AFC", CYAN),
+            Screen::Ripple => (b"RIPPLE", MAGENTA),
+            Screen::Settings => (b"SET", CYAN),
+            Screen::Cal => (b"CAL", MAGENTA),
+        };
+        text(lcd, 8, 2, title, 3, accent).await;
+        // The pills sit clear of the longest title ("PD PROFILES" is 11
+        // chars = 198 px); the dots follow them.
+        let (pill_x, dots): (u16, [u16; 3]) = if title.len() >= 10 {
+            (212, [292, 303, 314])
+        } else {
+            (180, [290, 302, 314])
+        };
+        for (i, &c) in [YELLOW, GREEN, ORANGE, MAGENTA].iter().enumerate() {
+            let x = pill_x + i as u16 * 20;
+            lcd.rounded_fill(x, 2, x + 14, 22, 6, c).await;
         }
+        for (i, &d) in dots.iter().enumerate() {
+            lcd.dot(d, 12, 5, if i == 0 && screen == Screen::Power { CYAN } else { RULE })
+                .await;
+        }
+        lcd.fill_window(4, 27, 315, 27, RULE).await;
+        lcd.fill_window(8, 25, 8 + title.len() as u16 * 18 + 4, 27, accent).await;
+        self.draw_hint(lcd).await;
     }
 
     /// Switch screens: full clear, title and static chrome. Any switch
@@ -832,6 +846,11 @@ impl Ui {
         if screen != Screen::Graph {
             self.graph_focus = None;
         }
+        // r229: the profiles selector resets on leaving (kws-x1's
+        // editing flag is page state).
+        if screen != Screen::Profiles {
+            self.profiles_edit = false;
+        }
         // r218: the settings screen starts at the APPLIED value.
         if screen == Screen::Settings {
             self.set_sel = crate::settings::sel_of(
@@ -839,6 +858,8 @@ impl Ui {
             );
             self.set_energy =
                 crate::settings::ENERGY_IDX.load(core::sync::atomic::Ordering::Relaxed);
+            self.set_passthrough =
+                crate::settings::PASSTHROUGH.load(core::sync::atomic::Ordering::Relaxed);
             self.set_mode = SetMode::Idle;
             self.set_drawn = -1;
         }
@@ -874,6 +895,12 @@ impl Ui {
             // r226: the energy page's reset (the save note is drawn in
             // the body — it is dynamic).
             Screen::Energy => b"OK:RST",
+            // r229: the profiles selector's two states (kws-x1's
+            // "< > choose OK request BACK cancel").
+            Screen::Profiles if self.profiles_edit => b"LR:SEL OK:REQ BK:X",
+            Screen::Profiles => b"OK:SEL",
+            // r233: the sniff screen's scroll hint.
+            Screen::Sniff => b"OK:SCROLL",
             // r227: the graph's focus model (kws-x1's hints; no hold-OK
             // reset — the history is RAM-only and clears on reboot).
             Screen::Graph => match self.graph_focus {
@@ -924,6 +951,11 @@ impl Ui {
     /// at a 200 ms cadence — the r194 full fill re-fired on every 50 ms
     /// tap swing (released lines float by hundreds of mV) and the screen
     /// never stopped flashing.
+    /// r230: the QC2 screen — kws-x1's draw_qc2 laid out as the fixed PD
+    /// profiles: one row per target, the pending request framed in the
+    /// accent, ACTIVE badging the target the charger is holding, and the
+    /// failure/follow verdict on a status row. The DP/DM/VBUS numbers
+    /// moved to the lines and ripple screens (r225/r228).
     pub async fn draw_qc(&mut self, lcd: &mut Lcd) {
         use core::sync::atomic::Ordering;
         let state = crate::qc_task::STATE.load(Ordering::Relaxed);
@@ -934,254 +966,183 @@ impl Ui {
             .get(tgt_idx)
             .copied()
             .unwrap_or(5000);
+        // r230b: the identity compares the target VALUE, not the index —
+        // index-vs-value was never equal, so the whole body (a full
+        // black fill + every row) redrew at the 100 Hz tick rate and the
+        // screen flickered (the r189 code compared value-vs-value).
         let statics_changed = state != self.qc_state
             || outcome != self.qc_outcome
             || failure != self.qc_failure
             || tgt != self.qc_tgt;
-        let now = embassy_time::Instant::now().as_millis() as u32;
-        let dyn_due = now.wrapping_sub(self.qc_dyn_at) >= 200;
-        if !statics_changed && !dyn_due {
+        if !statics_changed {
             return;
         }
-        if statics_changed {
-            self.qc_state = state;
-            self.qc_outcome = outcome;
-            self.qc_failure = failure;
-            self.qc_tgt = tgt;
-            lcd.fill_window(0, 32, 319, 210, BLACK).await;
-
-            // The next OK requests exactly this target.
-            let mut line = [0u8; 24];
-            let mut n = 0;
-            for &b in b"TGT " {
-                line[n] = b;
-                n += 1;
+        self.qc_state = state;
+        self.qc_outcome = outcome;
+        self.qc_failure = failure;
+        self.qc_tgt = tgt;
+        lcd.fill_window(0, 32, 319, 210, BLACK).await;
+        for (i, &mv) in crate::qc_task::TARGETS_MV.iter().enumerate() {
+            let y = 40 + i as u16 * 34;
+            let selected = tgt_idx == i;
+            if selected {
+                // The pending request framed in the accent (kws-x1's
+                // choice frame).
+                lcd.rounded_outline(4, y - 6, 315, y + 22, 5, ORANGE).await;
             }
-            n = crate::push_dec(&mut line, n, u32::from(tgt / 1000));
-            line[n] = b'V';
-            n += 1;
-            line[n] = 0;
-            text(lcd, 8, 48, &line, 2, YELLOW).await;
-
-        // State row.
+            let mut l = Line12::new();
+            // kws-x1's row label: whole volts ("5V", "20V").
+            l.num_u32(u32::from(mv) / 1000, 0);
+            l.push(b"V");
+            l.pad();
+            lcd.draw_text(12, y, l.bytes(), 2, level_color(mv), BLACK).await;
+            if state == 3 && selected {
+                // ACTIVE: the charger is holding this target.
+                lcd.rounded_outline(258, y - 2, 312, y + 16, 5, GREEN).await;
+                text(lcd, 265, y + 2, b"ACTIVE", 1, GREEN).await;
+            }
+        }
+        // The status row: the failure reason, or the follow verdict
+        // (kws-x1's per-row status, kept as one row here).
         const STATES: [&[u8]; 6] = [
-            b"OFF",
-            b"RELEASE",
-            b"ENTRY",
-            b"ACTIVE",
-            b"FAIL",
-            b"STEP",
+            b"OFF", b"RELEASE", b"ENTRY", b"ACTIVE", b"FAIL", b"STEP",
         ];
-            let name = STATES.get(state as usize).copied().unwrap_or(b"?");
-            let mut line = [0u8; 24];
-            let mut n = 0;
-            for &b in b"QC " {
-                line[n] = b;
-                n += 1;
-            }
-            line[n..n + name.len()].copy_from_slice(name);
-            n += name.len();
-            line[n] = 0;
-            text(lcd, 8, 88, &line, 3, WHITE).await;
-
-            // Detail row: the failure reason, or the output-follow verdict.
-            let detail: &[u8] = match (state, failure, outcome) {
-                (4, 1, _) => b"FAIL NODCP",
-                (4, 2, _) => b"FAIL NOENTRY",
-                (3, _, 1) => b"WAIT",
-                (3, _, 2) => b"FOLLOWED",
-                (3, _, 3) => b"IGNORED",
-                _ => b"",
-            };
-            if !detail.is_empty() {
-                let mut line = [0u8; 24];
-                line[..detail.len()].copy_from_slice(detail);
-                line[detail.len()] = 0;
-                text(lcd, 8, 132, &line, 2, CYAN).await;
-            }
-        }
-        if !(statics_changed || dyn_due) {
-            return;
-        }
-        self.qc_dyn_at = now;
-        // The dynamic rows, in place: space-padded fixed-width numbers so
-        // a redraw erases stale digits — no fill, no flicker.
-        let dp = crate::qc_task::DP_MV.load(Ordering::Relaxed);
-        let dm = crate::qc_task::DM_MV.load(Ordering::Relaxed);
-        let vb = crate::qc_task::VBUS_MV.load(Ordering::Relaxed);
+        let name = STATES.get(state as usize).copied().unwrap_or(b"?");
+        let detail: &[u8] = match (state, failure, outcome) {
+            (4, 1, _) => b"FAIL NODCP",
+            (4, 2, _) => b"FAIL NOENTRY",
+            (3, _, 1) => b"OUTPUT WAIT",
+            (3, _, 2) => b"OUTPUT FOLLOWED",
+            (3, _, 3) => b"OUTPUT IGNORED",
+            _ => b"",
+        };
         let mut line = [0u8; 24];
         let mut n = 0;
-        for &b in b"DP " {
+        for &b in b"QC " {
             line[n] = b;
             n += 1;
         }
-        n = crate::push_dec(&mut line, n, u32::from(dp));
-        while n < 7 {
+        line[n..n + name.len()].copy_from_slice(name);
+        n += name.len();
+        if !detail.is_empty() {
             line[n] = b' ';
             n += 1;
-        }
-        for &b in b" DM " {
-            line[n] = b;
-            n += 1;
-        }
-        n = crate::push_dec(&mut line, n, u32::from(dm));
-        while n < 15 {
-            line[n] = b' ';
-            n += 1;
+            line[n..n + detail.len()].copy_from_slice(detail);
+            n += detail.len();
         }
         line[n] = 0;
-        lcd.draw_text(8, 168, &line, 2, GREEN, BLACK).await;
-
-        let mut line = [0u8; 24];
-        let mut n = 0;
-        for &b in b"VB " {
-            line[n] = b;
-            n += 1;
-        }
-        n = crate::push_dec(&mut line, n, u32::from(vb));
-        while n < 8 {
-            line[n] = b' ';
-            n += 1;
-        }
-        for &b in b"mV" {
-            line[n] = b;
-            n += 1;
-        }
-        line[n] = 0;
-        lcd.draw_text(8, 196, &line, 2, WHITE, BLACK).await;
+        text(
+            lcd,
+            8,
+            184,
+            &line,
+            2,
+            if state == 4 { ORANGE } else { CYAN },
+        )
+        .await;
     }
 
     /// r196: the QC3 screen — target (mV), state, the crate's tracked
     /// continuous set point, and the taps/output. Same split as draw_qc:
     /// the static rows (fill + TGT + state) redraw only on state/target
     /// changes; the fast numbers update in place at 200 ms.
+    /// r230: the QC3 screen — kws-x1's card layout: the STEPS card (the
+    /// continuous range), the SET VOLTAGE and VBUS cards side by side
+    /// (the tracked set point and the live calibrated bus, big in the
+    /// trace's colour), and the LINES card with the D± taps and the
+    /// ACTIVE badge (or the failure, in orange). Redraws on state or
+    /// set-point change; the VBUS card rides the meter's 200 ms values.
     pub async fn draw_qc3(&mut self, lcd: &mut Lcd) {
         use core::sync::atomic::Ordering;
         let state = crate::qc_task::STATE.load(Ordering::Relaxed);
         let failure = crate::qc_task::FAILURE.load(Ordering::Relaxed);
-        let tgt = crate::qc_task::M3_TARGET.load(Ordering::Relaxed);
         let set = crate::qc_task::SET_MV.load(Ordering::Relaxed);
+        let statics_changed = state != self.qc3_state
+            || set != self.qc3_tgt
+            || self.qc3_dyn_at != 1;
+        self.qc3_state = state;
+        self.qc3_tgt = set;
+        self.qc3_dyn_at = 1;
+        if !statics_changed {
+            return;
+        }
+        lcd.fill_window(0, 32, 319, 210, BLACK).await;
+        // The STEPS card: the continuous range (qc3's own constants).
+        card(lcd, 4, 34, 315, 66, b"STEPS", ORANGE).await;
+        let mut steps = [0u8; 24];
+        let mut n = 0;
+        // "3.6-12V BY 0.2V" from the crate's milli-volt constants.
+        n = fixed(&mut steps, n, u32::from(crate::qc_task::M3_MIN_MV), 3);
+        steps[n] = b'-';
+        n += 1;
+        n = fixed(&mut steps, n, u32::from(crate::qc_task::M3_MAX_MV), 3);
+        for &b in b"V BY " {
+            steps[n] = b;
+            n += 1;
+        }
+        n = fixed(&mut steps, n, u32::from(qc_protocol::qc3::STEP_MV), 3);
+        for &b in b"V" {
+            steps[n] = b;
+            n += 1;
+        }
+        steps[n] = 0;
+        text(lcd, 12, 42, &steps, 2, WHITE).await;
+
+        // The SET VOLTAGE and VBUS cards side by side.
+        card(lcd, 4, 72, 156, 146, b"SET VOLTAGE", YELLOW).await;
+        card(lcd, 164, 72, 315, 146, b"VBUS", YELLOW).await;
+        let mut l = Line12::new();
+        if set > 0 {
+            l.num_u32(u32::from(set), 3);
+        } else {
+            l.num_u32(u32::from(crate::qc_task::M3_TARGET.load(Ordering::Relaxed)), 3);
+        }
+        l.push(b"V");
+        l.pad();
+        lcd.draw_text(12, 86, l.bytes(), 3, YELLOW, BLACK).await;
+        let cal = crate::settings::applied();
+        let bus_raw = crate::qc_task::METER_BUS_RAW.load(Ordering::Relaxed);
+        let bus_fresh = crate::qc_task::METER_FRESH.load(Ordering::Relaxed);
+        let mut v = Line12::new();
+        if bus_fresh {
+            v.num_u32(cal.millivolts(bus_raw), 3);
+        } else {
+            v.push(b"--.---");
+        }
+        v.push(b"V");
+        v.pad();
+        lcd.draw_text(172, 86, v.bytes(), 3, YELLOW, BLACK).await;
+
+        // The LINES card: the D± taps left, ACTIVE or the failure right.
+        card(lcd, 4, 152, 315, 190, b"LINES", GREEN).await;
+        // Two fixed cells — the joined line is 19 chars and Line12 caps
+        // at 12 (the D- value clipped, caught by the screenshot).
         let dp = crate::qc_task::DP_MV.load(Ordering::Relaxed);
         let dm = crate::qc_task::DM_MV.load(Ordering::Relaxed);
-        let vb = crate::qc_task::VBUS_MV.load(Ordering::Relaxed);
-        let statics_changed = state != self.qc3_state || tgt != self.qc3_tgt;
-        let now = embassy_time::Instant::now().as_millis() as u32;
-        let dyn_due = now.wrapping_sub(self.qc3_dyn_at) >= 200;
-        if !statics_changed && !dyn_due {
-            return;
+        let mut ldp = Line12::new();
+        ldp.push(b"D+ ");
+        ldp.num_u32(u32::from(dp), 3);
+        ldp.push(b"V");
+        ldp.pad();
+        lcd.draw_text(12, 162, ldp.bytes(), 2, WHITE, BLACK).await;
+        let mut ldm = Line12::new();
+        ldm.push(b"D- ");
+        ldm.num_u32(u32::from(dm), 3);
+        ldm.push(b"V");
+        ldm.pad();
+        lcd.draw_text(150, 162, ldm.bytes(), 2, WHITE, BLACK).await;
+        let (badge, color): (&[u8], u16) = match (state as u32, failure as u32) {
+            (4, 1) => (b"FAIL NODCP", ORANGE),
+            (4, 2) => (b"FAIL NOENTRY", ORANGE),
+            (3, _) | (5, _) => (b"ACTIVE", GREEN),
+            _ => (b"", GRAY),
+        };
+        if !badge.is_empty() {
+            text(lcd, 313 - badge.len() as u16 * 6, 164, badge, 2, color).await;
         }
-        if statics_changed {
-            self.qc3_state = state;
-            self.qc3_tgt = tgt;
-            lcd.fill_window(0, 32, 319, 210, BLACK).await;
-
-            // The next OK steps to exactly this target.
-            let mut line = [0u8; 24];
-            let mut n = 0;
-            for &b in b"TGT " {
-                line[n] = b;
-                n += 1;
-            }
-            n = crate::push_dec(&mut line, n, u32::from(tgt));
-            for &b in b"mV" {
-                line[n] = b;
-                n += 1;
-            }
-            line[n] = 0;
-            text(lcd, 8, 48, &line, 2, YELLOW).await;
-
-            const STATES: [&[u8]; 6] = [
-                b"OFF",
-                b"RELEASE",
-                b"ENTRY",
-                b"ACTIVE",
-                b"FAIL",
-                b"STEP",
-            ];
-            let name = STATES.get(state as usize).copied().unwrap_or(b"?");
-            let mut line = [0u8; 24];
-            let mut n = 0;
-            for &b in b"QC3 " {
-                line[n] = b;
-                n += 1;
-            }
-            line[n..n + name.len()].copy_from_slice(name);
-            n += name.len();
-            line[n] = 0;
-            text(lcd, 8, 88, &line, 3, WHITE).await;
-
-            let detail: &[u8] = match (state, failure) {
-                (4, 1) => b"FAIL NODCP",
-                (4, 2) => b"FAIL NOENTRY",
-                _ => b"",
-            };
-            if !detail.is_empty() {
-                let mut line = [0u8; 24];
-                line[..detail.len()].copy_from_slice(detail);
-                line[detail.len()] = 0;
-                text(lcd, 8, 132, &line, 2, CYAN).await;
-            }
-        }
-        if !(statics_changed || dyn_due) {
-            return;
-        }
-        self.qc3_dyn_at = now;
-
-        // SET row (the crate's tracked continuous set point) + the taps,
-        // in place: space-padded fixed-width blocks erase stale digits.
-        let mut line = [0u8; 32];
-        let mut n = 0;
-        for &b in b"SET " {
-            line[n] = b;
-            n += 1;
-        }
-        n = crate::push_dec(&mut line, n, u32::from(set));
-        while n < 12 {
-            line[n] = b' ';
-            n += 1;
-        }
-        for &b in b"DP " {
-            line[n] = b;
-            n += 1;
-        }
-        n = crate::push_dec(&mut line, n, u32::from(dp));
-        while n < 20 {
-            line[n] = b' ';
-            n += 1;
-        }
-        for &b in b"DM " {
-            line[n] = b;
-            n += 1;
-        }
-        n = crate::push_dec(&mut line, n, u32::from(dm));
-        while n < 28 {
-            line[n] = b' ';
-            n += 1;
-        }
-        line[n] = 0;
-        lcd.draw_text(8, 168, &line, 2, GREEN, BLACK).await;
-
-        let mut line = [0u8; 24];
-        let mut n = 0;
-        for &b in b"VB " {
-            line[n] = b;
-            n += 1;
-        }
-        n = crate::push_dec(&mut line, n, u32::from(vb));
-        while n < 8 {
-            line[n] = b' ';
-            n += 1;
-        }
-        for &b in b"mV" {
-            line[n] = b;
-            n += 1;
-        }
-        line[n] = 0;
-        lcd.draw_text(8, 196, &line, 2, WHITE, BLACK).await;
     }
 
-    /// r198: the AFC screen — target (5 V/9 V), state, failure reason,
-    /// the line taps and the output. Same flicker-free split.
+
     pub async fn draw_afc(&mut self, lcd: &mut Lcd) {
         use core::sync::atomic::Ordering;
         let state = crate::qc_task::STATE.load(Ordering::Relaxed);
@@ -1302,35 +1263,38 @@ impl Ui {
     /// segments (no arbitrary-line primitive on this LCD driver), and
     /// the per-bar digit markers at the bar feet are dropped in favour
     /// of the numbered peak list alone.
+    /// r228: the ripple screen — kws-x1's draw_ripple layout: the big
+    /// p-p value with the RMS at right, the gridded plot with the
+    /// spectrum bars behind the yellow envelope trace (peak frequencies
+    /// listed top right, digits at the bar feet), the live bus + scale
+    /// row, then run/hold + status + the nominal timebase. Redraws on a
+    /// fresh capture or a chrome change (`fresh` = the watch's
+    /// try_changed — the ~500-fill plot must not run per loop tick).
     pub async fn draw_ripple(
         &mut self,
         lcd: &mut Lcd,
         reading: Option<&ripple_core::ripple::Reading>,
         reference: Option<u16>,
+        fresh: bool,
     ) {
         use ripple_core::ripple::{
-            FULL_SCALE, HORIZONTAL_DIVISIONS, VERTICAL_DIVISIONS, Scale, Timebase,
+            FULL_SCALE, HORIZONTAL_DIVISIONS, Scale, TRACE_COLUMNS, Timebase, VERTICAL_DIVISIONS,
         };
         use ripple_core::spectrum::{self, FULL_HEIGHT};
 
-        // Colors: the grid dim gray, bars dim purple (kws-x1's RULE /
-        // SPECTRUM / SPECTRUM_LABEL roles).
-        const RULE: u16 = 0x3186;
         const SPECTRUM: u16 = 0x200A;
         const SPECTRUM_LABEL: u16 = 0x60D4;
-        const ORANGE: u16 = 0xFD20;
-        // Pixels: metrics above the plot, live bus + scale below it,
-        // then run/hold + status and the timebase (kws-x1 layout rows).
-        const VALUE_Y: u16 = 34;
-        const TOP: i32 = 56;
-        const BOTTOM: i32 = 151;
-        const LEFT: i32 = 8;
-        const PLOT_W: i32 = 224;
-        const BUS_Y: u16 = 160;
-        const STATUS_Y: u16 = 188;
-        const COLUMN_PITCH: i32 = 2;
+        // Pixels: metrics above the full-width plot, live bus + scale
+        // below it, then run/hold + status and the timebase (kws-x1's
+        // rows, widened for 320 px).
+        const PLOT_TOP: u16 = 60;
+        const PLOT_BOTTOM: u16 = 184;
+        const PLOT_LEFT: u16 = 4;
+        const PLOT_RIGHT: u16 = 315;
+        const BUS_Y: u16 = 188;
+        const STATUS_Y: u16 = 204;
 
-        // Redraw on the capture cadence or when the chrome changed.
+        // Redraw on a fresh capture or a chrome change.
         let scale_index = Scale::ALL
             .iter()
             .position(|&s| s == self.ripple_scale)
@@ -1340,143 +1304,106 @@ impl Ui {
             .position(|&t| t == self.ripple_timebase)
             .unwrap_or(0);
         let tag = (match self.ripple_focus {
-            None => 0,
+            None => 0u16,
             Some(RippleFocus::Time) => 1,
             Some(RippleFocus::Scale) => 2,
             Some(RippleFocus::Capture) => 3,
         } | (u16::from(self.ripple_hold) << 2)
             | ((scale_index as u16) << 3)
-            | ((tb_index as u16) << 7)) as u16;
-        let now = embassy_time::Instant::now().as_millis() as u32;
-        if tag == self.ripple_tag && now.wrapping_sub(self.ripple_at) < 100 {
+            | ((tb_index as u16) << 7));
+        if !fresh && tag == self.ripple_tag {
             return;
         }
         self.ripple_tag = tag;
-        self.ripple_at = now;
 
         let reference_mv = crate::ripple::REFERENCE_MV;
         let reference = reference.filter(|&count| count > 0 && count < FULL_SCALE);
         let normalized = reading.zip(reference);
-        let mv = normalized
-            .and_then(|(r, reference)| r.peak_to_peak_mv(reference, reference_mv));
-        let rms = normalized
-            .and_then(|(r, reference)| r.rms_tenths_mv(reference, reference_mv));
+        let mv = normalized.and_then(|(r, reference)| r.peak_to_peak_mv(reference, reference_mv));
+        let rms = normalized.and_then(|(r, reference)| r.rms_tenths_mv(reference, reference_mv));
 
-        // p-p left, RMS right — EVERY row is a fixed-width cell (leading
-        // or trailing spaces painted at the same origin), so a shorter
-        // value erases the previous draw's tail (the r202 'rund' ghosts).
-        // The p-p cell is exactly 11 chars (4 value + " mV p-p").
-        let mut line = [b' '; 11];
-        let mut n = 0;
-        // Four value digits ("  12"), right-aligned in the cell.
-        let mut digits = [0u8; 8];
-        let dn = match mv {
-            Some(mv) => crate::push_dec(&mut digits, 0, u32::from(mv)),
+        // The p-p value, big in the trace's colour (kws-x1's BOLD row).
+        let mut line = [0u8; 24];
+        let mut n = match mv {
+            Some(mv) => crate::push_dec(&mut line, 0, u32::from(mv)),
             None => {
-                digits[..2].copy_from_slice(b"--");
+                line[..2].copy_from_slice(b"--");
                 2
             }
         };
-        for _ in dn..4 {
-            line[n] = b' ';
-            n += 1;
-        }
-        line[n..n + dn].copy_from_slice(&digits[..dn]);
-        n += dn;
         for &b in b" mV p-p" {
             line[n] = b;
             n += 1;
         }
-        text(lcd, 8, VALUE_Y, &line, 2, GREEN).await;
+        line[n] = 0;
+        text(lcd, 8, 34, &line, 3, YELLOW).await;
 
-        // "RMS 1650.0 mV": the number is 6 wide, the whole cell 13.
-        let mut line = [b' '; 16];
+        // RMS right-aligned on the same row (kws-x1's tenths format).
+        let mut line = [0u8; 24];
         let mut n = 0;
         for &b in b"RMS " {
             line[n] = b;
             n += 1;
         }
-        let mut digits = [0u8; 8];
-        let dn = match rms {
+        match rms {
             Some(tenths) => {
-                let mut dn = crate::push_dec(&mut digits, 0, u32::from(tenths / 10));
-                digits[dn] = b'.';
-                digits[dn + 1] = b'0' + (tenths % 10) as u8;
-                dn += 2;
-                dn
+                n = crate::push_dec(&mut line, n, u32::from(tenths / 10));
+                line[n] = b'.';
+                line[n + 1] = b'0' + (tenths % 10) as u8;
+                n += 2;
             }
             None => {
-                digits[..2].copy_from_slice(b"--");
-                2
+                line[n] = b'-';
+                line[n + 1] = b'-';
+                n += 2;
             }
-        };
-        for _ in dn..6 {
-            line[n] = b' ';
-            n += 1;
         }
-        line[n..n + dn].copy_from_slice(&digits[..dn]);
-        n += dn;
-        for &b in b" mV" {
+        for &b in b"mV" {
             line[n] = b;
             n += 1;
         }
-        // Scale-2 text advances 12 px per char; fixed 13-char cell.
-        text(lcd, 312 - 12 * 13, VALUE_Y, &line, 2, WHITE).await;
+        line[n] = 0;
+        text(lcd, PLOT_RIGHT - 2 - n as u16 * 6, 40, &line, 1, WHITE).await;
 
-        // The plot: grid, spectrum bars, envelope trace.
-        let plot = reading.map(|r| r.plot_scale(self.ripple_scale, reference, reference_mv));
-        lcd.fill_window(LEFT as u16, TOP as u16, (LEFT + PLOT_W - 1) as u16, BOTTOM as u16, BLACK)
-            .await;
-        if let (Some(reading), Some(plot)) = (reading, plot) {
+        // The plot: cleared per capture (the panel has no framebuffer —
+        // without the clear each capture's trace draws over the last
+        // one, oscilloscope-persistence style), then grid, spectrum
+        // bars behind, the envelope trace over.
+        lcd.fill_window(PLOT_LEFT, PLOT_TOP, PLOT_RIGHT, PLOT_BOTTOM, BLACK).await;
+        let width = (PLOT_RIGHT - PLOT_LEFT + 1) as u32;
+        let plot = reading
+            .map(|r| (r, r.plot_scale(self.ripple_scale, reference, reference_mv)));
+        if let Some((reading, plot)) = plot {
             let y = |count: u16| {
                 let count = i32::from(count).clamp(plot.min, plot.max);
-                BOTTOM - (count - plot.min) * (BOTTOM - TOP) / (plot.max - plot.min)
+                (i32::from(PLOT_BOTTOM)
+                    - (count - plot.min)
+                        * (i32::from(PLOT_BOTTOM) - i32::from(PLOT_TOP))
+                        / (plot.max - plot.min)) as u16
             };
-            for division in 0..=VERTICAL_DIVISIONS as i32 {
-                let row = TOP + division * (BOTTOM - TOP) / VERTICAL_DIVISIONS as i32;
-                lcd.fill_window(LEFT as u16, row as u16, (LEFT + PLOT_W - 1) as u16, row as u16, RULE)
-                    .await;
+            for division in 0..=VERTICAL_DIVISIONS {
+                let division = division as u16;
+                let row =
+                    PLOT_TOP + division * (PLOT_BOTTOM - PLOT_TOP) / VERTICAL_DIVISIONS as u16;
+                lcd.fill_window(PLOT_LEFT, row, PLOT_RIGHT, row, RULE).await;
             }
-            for division in 0..=HORIZONTAL_DIVISIONS as i32 {
-                let x = LEFT + division * (PLOT_W - 1) / HORIZONTAL_DIVISIONS as i32;
-                lcd.fill_window(x as u16, TOP as u16, x as u16, BOTTOM as u16, RULE)
-                    .await;
+            for division in 0..=HORIZONTAL_DIVISIONS {
+                let division = division as u16;
+                let x =
+                    PLOT_LEFT + division * (PLOT_RIGHT - PLOT_LEFT) / HORIZONTAL_DIVISIONS as u16;
+                lcd.fill_window(x, PLOT_TOP, x, PLOT_BOTTOM, RULE).await;
             }
-            // The spectrum behind the trace: frequency left to right,
-            // heights relative to the strongest bin.
+            // The spectrum behind the trace: heights relative to the
+            // strongest bin, one bar per column scaled to the plot.
+            let bars = reading.spectrum.bars.len() as u32;
             for (column, &height) in reading.spectrum.bars.iter().enumerate() {
-                let bar = i32::from(height) * (BOTTOM - TOP) / i32::from(FULL_HEIGHT);
+                let bar = u16::from(height) * (PLOT_BOTTOM - PLOT_TOP) / u16::from(FULL_HEIGHT);
                 if bar > 0 {
-                    let x = LEFT + column as i32;
-                    lcd.fill_window(
-                        x as u16,
-                        (BOTTOM - bar) as u16,
-                        x as u16,
-                        BOTTOM as u16,
-                        SPECTRUM,
-                    )
-                    .await;
+                    let x = PLOT_LEFT + (column as u32 * width / bars) as u16;
+                    lcd.fill_window(x, PLOT_BOTTOM - bar, x, PLOT_BOTTOM, SPECTRUM).await;
                 }
             }
-            for (column, bin) in reading.trace.iter().enumerate() {
-                let x = LEFT + column as i32 * COLUMN_PITCH;
-                // y() maps LARGER counts to SMALLER pixel rows, so
-                // y(bin.max) < y(bin.min): the window wants (top, bottom)
-                // — reversed order underflows fill_window's height math
-                // and painted the whole screen green once real (non-flat)
-                // data arrived (the r208 hardware report).
-                let low = y(bin.min);
-                let high = y(bin.max);
-                lcd.fill_window(
-                    x as u16,
-                    high as u16,
-                    (x + 1) as u16,
-                    low as u16,
-                    GREEN,
-                )
-                .await;
-            }
-            // Peak frequencies at the plot's top-right (tenths of a kHz
+            // Peak frequencies at the plot's top right (tenths of a kHz
             // below 100 kHz, whole kHz above).
             if let Some(rate) = reading
                 .timebase
@@ -1508,17 +1435,50 @@ impl Ui {
                     n += 1;
                 }
                 if n > 0 {
-                    // Scale-1 text advances 6 px per char.
-                    let x = LEFT + PLOT_W - 2 - 6 * n as i32;
-                    text(lcd, x as u16, (TOP + 2) as u16, &line, 1, SPECTRUM_LABEL).await;
+                    line[n] = 0;
+                    text(
+                        lcd,
+                        PLOT_RIGHT - 2 - n as u16 * 6,
+                        PLOT_TOP + 2,
+                        &line,
+                        1,
+                        SPECTRUM_LABEL,
+                    )
+                    .await;
                 }
+            }
+            // The envelope trace: one vertical span per bin (r208: the
+            // y() mapping is inverted — the span wants top, bottom
+            // ordered), joined centre-to-centre (r227's line()).
+            let mut previous: Option<(u16, u16)> = None;
+            for (column, bin) in reading.trace.iter().enumerate() {
+                let x = PLOT_LEFT + (column as u32 * width / TRACE_COLUMNS as u32) as u16;
+                let low = y(bin.min);
+                let high = y(bin.max);
+                let (a, b) = if low <= high { (low, high) } else { (high, low) };
+                lcd.fill_window(x, a, x, b, YELLOW).await;
+                let centre = (x, (a + b) / 2);
+                if let Some((px, py)) = previous {
+                    lcd.line(px, py, centre.0, centre.1, YELLOW).await;
+                }
+                previous = Some(centre);
+            }
+            // Peak digits at the bar feet, beside rather than over the
+            // bar, over the trace so they stay legible (kws-x1).
+            for (index, position) in reading.spectrum.peaks.iter().enumerate() {
+                let Some(position) = position else { break };
+                let digit = [b'1' + index as u8, 0];
+                let x = PLOT_LEFT
+                    + ((spectrum::column(*position) as u32) * width / bars) as u16;
+                let dx = if x + 8 < PLOT_RIGHT { x + 2 } else { x - 7 };
+                text(lcd, dx, PLOT_BOTTOM - 9, &digit, 1, SPECTRUM_LABEL).await;
             }
         } else {
             let label = b"NO CAPTURE";
             text(
                 lcd,
-                (LEFT + PLOT_W / 2 - 6 * label.len() as i32 / 2) as u16,
-                ((TOP + BOTTOM) / 2 - 7) as u16,
+                PLOT_LEFT + width as u16 / 2 - 6 * label.len() as u16 / 2,
+                PLOT_TOP + (PLOT_BOTTOM - PLOT_TOP) / 2 - 7,
                 label,
                 2,
                 GRAY,
@@ -1526,35 +1486,41 @@ impl Ui {
             .await;
         }
 
-        // Bus row: left the published output, right the scale setting.
-        let vb = crate::qc_task::VBUS_MV.load(core::sync::atomic::Ordering::Relaxed);
-        let mut line = [0u8; 16];
-        let mut n = 0;
-        for &b in b"VB " {
-            line[n] = b;
-            n += 1;
+        // The bus row: the live calibrated output left, the scale right
+        // (framed when focused — kws-x1's setting()).
+        let cal = crate::settings::applied();
+        let bus_raw = crate::qc_task::METER_BUS_RAW.load(core::sync::atomic::Ordering::Relaxed);
+        let cur_raw = crate::qc_task::METER_CUR_RAW.load(core::sync::atomic::Ordering::Relaxed);
+        let bus_fresh = crate::qc_task::METER_FRESH.load(core::sync::atomic::Ordering::Relaxed);
+        // Two fixed cells — "0.064V 0.000A" is 13 chars and Line12 caps
+        // at 12 (the A unit clipped, caught by the first screenshot).
+        let mut lv = Line12::new();
+        if bus_fresh {
+            lv.num_u32(cal.millivolts(bus_raw), 3);
+            lv.push(b"V");
+        } else {
+            lv.push(b"--.---V");
         }
-        n = crate::push_dec(&mut line, n, u32::from(vb / 1000));
-        line[n] = b'.';
-        line[n + 1] = b'0' + ((vb / 100) % 10) as u8;
-        n += 2;
-        line[n] = b'V';
-        n += 1;
-        while n < 10 {
-            line[n] = b' ';
-            n += 1;
+        lv.pad();
+        lcd.draw_text(8, BUS_Y, lv.bytes(), 2, WHITE, BLACK).await;
+        let mut la = Line12::new();
+        if bus_fresh {
+            let ua = cal.milliamps(cur_raw);
+            la.sign(ua < 0);
+            la.num_u32(ua.unsigned_abs() / 1000, 3);
+            la.push(b"A");
+        } else {
+            la.push(b"--.---A");
         }
-        text(lcd, 8, BUS_Y, &line, 2, WHITE).await;
-
-        // The scale label, kws-x1's four cases (ui.rs:1550-1566): the
-        // plot's own mV/div once one exists, the chosen scale before a
-        // capture, raw counts when no reference backs a voltage. Built in
-        // a scratch, then drawn in a fixed 14-char right-aligned cell so
-        // a SHORTER label's leading edge cannot leave the old one's tail.
-        let mut scratch = [0u8; 16];
+        la.pad();
+        lcd.draw_text(104, BUS_Y, la.bytes(), 2, WHITE, BLACK).await;
+        let mut scratch = [0u8; 20];
         let mut n = 0;
         let auto = self.ripple_scale == Scale::Auto;
-        match (plot.and_then(|plot| plot.mv_per_div), reading.is_none()) {
+        match (
+            plot.as_ref().and_then(|(_, p)| p.mv_per_div),
+            reading.is_none(),
+        ) {
             (Some(mv), _) => {
                 for &b in if auto { b"AUTO " } else { b"LOCK " } {
                     scratch[n] = b;
@@ -1594,37 +1560,33 @@ impl Ui {
                 }
             }
         }
-        let mut scale_buf = [b' '; 14];
-        scale_buf[14 - n..].copy_from_slice(&scratch[..n]);
+        let focused = self.ripple_focus == Some(RippleFocus::Scale);
+        let mut span = [0u8; 24];
+        let sl = framed(&mut span, &scratch[..n], focused);
         text(
             lcd,
-            312 - 12 * 14,
-            BUS_Y,
-            &scale_buf,
-            2,
-            if self.ripple_focus == Some(RippleFocus::Scale) {
-                YELLOW
-            } else {
-                GRAY
-            },
+            PLOT_RIGHT - 2 - sl as u16 * 6,
+            BUS_Y + 6,
+            &span,
+            1,
+            if focused { YELLOW } else { GRAY },
         )
         .await;
 
-        // Run/hold + status, then the timebase — all fixed-width cells.
-        let capture: &[u8] = if self.ripple_hold {
-            b"HOLD"
-        } else {
-            b"RUN "
-        };
-        let mut buf = [0u8; 8];
-        buf[..capture.len()].copy_from_slice(capture);
+        // Run/hold (framed when focused), the capture status beside it,
+        // the nominal timebase right — the r203 fixed-cell rule for the
+        // status (its length varies).
+        let hold_label: &[u8] = if self.ripple_hold { b"HOLD" } else { b"RUN" };
+        let focused = self.ripple_focus == Some(RippleFocus::Capture);
+        let mut span = [0u8; 24];
+        let hl = framed(&mut span, hold_label, focused);
         text(
             lcd,
             8,
             STATUS_Y,
-            &buf,
-            2,
-            if self.ripple_focus == Some(RippleFocus::Capture) {
+            &span,
+            1,
+            if focused {
                 YELLOW
             } else if self.ripple_hold {
                 WHITE
@@ -1633,9 +1595,8 @@ impl Ui {
             },
         )
         .await;
-
         let clipped = reading.is_some_and(|r| r.clipped());
-        let limited = plot.is_some_and(|plot| plot.limited);
+        let limited = plot.as_ref().map_or(false, |(_, p)| p.limited);
         let status: &[u8] = match reading {
             None => b"NO CAPTURE",
             Some(_) if clipped => b"CLIPPED",
@@ -1644,21 +1605,17 @@ impl Ui {
             Some(r) if r.triggered => b"T",
             Some(_) => b" ",
         };
-        // Ten-char cell at a fixed origin erases every predecessor.
-        let mut buf = [b' '; 10];
-        buf[..status.len()].copy_from_slice(status);
+        let mut cell = [b' '; 11];
+        cell[..status.len()].copy_from_slice(status);
         text(
             lcd,
-            68,
+            8 + hl as u16 * 6 + 12,
             STATUS_Y,
-            &buf,
-            2,
+            &cell,
+            1,
             if clipped || limited { ORANGE } else { GRAY },
         )
         .await;
-
-        // `~` marks a nominal, unmeasured timebase (kws-x1's mark), in a
-        // fixed 10-char right-aligned cell ("~500us/div" is the longest).
         let timebase = reading.map_or(self.ripple_timebase, |r| r.timebase);
         let timebase_ok = timebase.sampling(crate::ripple::ADC_CLOCK_HZ).is_some();
         let mut scratch = [0u8; 12];
@@ -1668,31 +1625,27 @@ impl Ui {
             n += 1;
             n = crate::push_dec(&mut scratch, n, u32::from(timebase.us_per_div()));
         } else {
-            for &b in b"--" {
-                scratch[n] = b;
-                n += 1;
-            }
+            scratch[n] = b'-';
+            scratch[n + 1] = b'-';
+            n += 2;
         }
         for &b in b"us/div" {
             scratch[n] = b;
             n += 1;
         }
-        let mut line = [b' '; 10];
-        line[10 - n..].copy_from_slice(&scratch[..n]);
+        let focused = self.ripple_focus == Some(RippleFocus::Time);
+        let tl = framed(&mut span, &scratch[..n], focused);
         text(
             lcd,
-            312 - 12 * 10,
+            PLOT_RIGHT - 2 - tl as u16 * 6,
             STATUS_Y,
-            &line,
-            2,
-            if self.ripple_focus == Some(RippleFocus::Time) {
-                YELLOW
-            } else {
-                GRAY
-            },
+            &span,
+            1,
+            if focused { YELLOW } else { GRAY },
         )
         .await;
     }
+
 
     /// r218: the settings screen's body — the dim timeout value, cycled
     /// with LEFT/RIGHT (redrawn on change only; the save happens on OK
@@ -1704,7 +1657,8 @@ impl Ui {
         let ident = self.set_mode as i16 * 1000
             + self.set_row as i16 * 100
             + self.set_sel as i16 * 10
-            + self.set_energy as i16;
+            + self.set_energy as i16 * 4
+            + i16::from(self.set_passthrough);
         if ident == self.set_drawn {
             return;
         }
@@ -1725,19 +1679,23 @@ impl Ui {
             .get(self.set_energy)
             .map(|&m| m.label().as_bytes())
             .unwrap_or(b"OFF");
-        let rows: [(u16, &[u8], &[u8]); 2] = [
-            (56, b"DIM IDLE", dim_value),
-            (116, b"ENERGY SAVE", energy_value),
+        let pass_value: &[u8] = if self.set_passthrough { b"ON" } else { b"OFF" };
+        // r232: the two settings as outlined cards (the box style the
+        // graphical screens use) — the cursor row's card in yellow, the
+        // other in gray, the value big inside.
+        let rows: [(u16, u16, &[u8], &[u8]); 3] = [
+            (34, 92, b"DIM IDLE", dim_value),
+            (98, 156, b"ENERGY SAVE", energy_value),
+            (162, 206, b"PD PASS", pass_value),
         ];
-        for (i, (y, label, value)) in rows.iter().enumerate() {
+        for (i, (y0, y1, label, value)) in rows.iter().enumerate() {
             let cursor = self.set_mode != SetMode::Idle && self.set_row == i;
             let color = if cursor { YELLOW } else { GRAY };
-            text(lcd, 8, *y, label, 2, color).await;
-            let mut v = [0u8; 24];
-            let n = value.len().min(23);
-            v[..n].copy_from_slice(&value[..n]);
-            v[n] = 0;
-            lcd.draw_text(210, *y, &v, 2, color, BLACK).await;
+            card(lcd, 4, *y0, 315, *y1, label, color).await;
+            let mut v = Line12::new();
+            v.push(value);
+            v.pad();
+            lcd.draw_text(20, y0 + 18, v.bytes(), 2, color, BLACK).await;
         }
     }
 
@@ -2164,6 +2122,132 @@ impl Ui {
     }
 
     /// r225: the lines screen (kws-x1's Lines tab with only the D+/D−
+
+    /// r229: the PD PROFILES screen — kws-x1's draw_fixed: one row per
+    /// advertised fixed PDO ("5V  3.000A  15W", the voltage in the
+    /// overview's level colour), the contract in force badged ACTIVE,
+    /// the previewed row framed while editing. Before any caps the page
+    /// only shows the notice. Redraws on the state identity.
+    pub async fn draw_profiles(&mut self, lcd: &mut Lcd) {
+        use core::sync::atomic::Ordering;
+        let n = crate::pd_task::CAPS_N.load(Ordering::Relaxed);
+        let contract_mv = crate::pd_task::VIEW.selected_mv.load(Ordering::Relaxed);
+        let contracted = crate::pd_task::VIEW.contract.load(Ordering::Relaxed);
+        let ident = (
+            self.profiles_edit,
+            self.profiles_sel,
+            n,
+            if contracted { contract_mv } else { 0 },
+        );
+        if ident == self.profiles_drawn {
+            return;
+        }
+        self.profiles_drawn = ident;
+        lcd.fill_window(0, 32, 319, 210, BLACK).await;
+        if crate::settings::passthrough() {
+            // kws-x1 HIDES the sink pages in passthrough (the meter never
+            // negotiates); fnb58's flat screen list shows the notice.
+            text(lcd, 76, 100, b"PASSTHROUGH: SINK OFF", 2, GRAY).await;
+            text(lcd, 100, 130, b"SET: PD PASS OFF", 1, GRAY).await;
+            self.draw_hint(lcd).await;
+            return;
+        }
+        if n == 0 {
+            // kws-x1's notice(target, "NO PD CHARGER", ...).
+            text(lcd, 92, 100, b"NO PD CHARGER", 2, GREEN).await;
+            text(lcd, 100, 130, b"PLUG IN A PD SOURCE", 1, GRAY).await;
+            self.draw_hint(lcd).await;
+            return;
+        }
+        for i in 0..n {
+            let mv = crate::pd_task::CAPS_MV[i].load(Ordering::Relaxed);
+            let ma = crate::pd_task::CAPS_MA[i].load(Ordering::Relaxed);
+            let y = 40 + i as u16 * 30;
+            if self.profiles_edit && self.profiles_sel == i {
+                // The previewed row framed (kws-x1's editing frame).
+                lcd.rounded_outline(4, y - 6, 315, y + 22, 5, GREEN).await;
+            }
+            // The voltage in the overview's level colour (kws-x1's
+            // level_color), the amps and watts in gray.
+            let mut l = Line12::new();
+            l.num_u32(u32::from(mv), 0);
+            l.push(b"V");
+            l.pad();
+            lcd.draw_text(12, y, l.bytes(), 2, level_color(mv), BLACK).await;
+            let mut a = Line12::new();
+            a.num_u32(u32::from(ma), 3);
+            a.push(b"A");
+            a.pad();
+            lcd.draw_text(110, y, a.bytes(), 2, GRAY, BLACK).await;
+            let mut w = Line12::new();
+            w.num_u32(u32::from(mv) * u32::from(ma) / 1_000_000, 0);
+            w.push(b"W");
+            w.pad();
+            lcd.draw_text(210, y, w.bytes(), 2, GRAY, BLACK).await;
+            if contracted && mv == contract_mv {
+                // The ACTIVE badge (kws-x1's green rounded outline).
+                lcd.rounded_outline(258, y - 2, 312, y + 16, 5, GREEN).await;
+                text(lcd, 265, y + 2, b"ACTIVE", 1, GREEN).await;
+            }
+        }
+        self.draw_hint(lcd).await;
+    }
+
+
+    /// r233: the PD SNIFF screen — kws-x1's PD Sniff: the head line
+    /// (the CC pin, the charger's Rp advertisement and the message
+    /// count) and the heard messages, oldest first, via the vendored
+    /// describe(). Without the passthrough setting: the notice.
+    /// Redraws on the published message count.
+    pub async fn draw_sniff(&mut self, lcd: &mut Lcd) {
+        use core::sync::atomic::Ordering;
+        if !crate::settings::passthrough() {
+            // The notice is static: draw it once (the r230b flicker
+            // class — an ungated redraw per tick strobes the screen).
+            if self.sniff_drawn != 0 {
+                self.sniff_drawn = 0;
+                lcd.fill_window(0, 32, 319, 210, BLACK).await;
+                text(lcd, 84, 92, b"PASSTHROUGH OFF", 2, GRAY).await;
+                text(lcd, 76, 122, b"SET: PD PASS ON", 1, GRAY).await;
+                self.draw_hint(lcd).await;
+            }
+            return;
+        }
+        let m = crate::pd_task::SNIFF_MESSAGES.load(Ordering::Relaxed);
+        let tag = m.min(999);
+        if tag == self.sniff_drawn {
+            return;
+        }
+        self.sniff_drawn = tag;
+        lcd.fill_window(0, 32, 319, 210, BLACK).await;
+        // The head: "SNIFF CC1 RP3.0A M:9" (kws-x1's SNIFF line).
+        let head = *crate::pd_task::SNIFF_HEAD.lock().await;
+        let mut h = [0u8; 24];
+        let hn = head.iter().position(|&b| b == 0).unwrap_or(24);
+        h[..hn].copy_from_slice(&head[..hn]);
+        h[hn] = 0;
+        text(lcd, 8, 38, &h, 2, CYAN).await;
+        // "PASSTHROUGH RX ONLY NO TX NO GOODCRC" (kws-x1's notices), and
+        // the waiting state while no message has arrived (kws-x1's
+        // "WAITING FOR PD TRAFFIC" — a source only transmits to a sink's
+        // Rd, so without a device sharing the CC line there is nothing
+        // to hear).
+        text(lcd, 8, 62, b"RX ONLY - NO TX NO CRC", 1, GRAY).await;
+        if m == 0 {
+            text(lcd, 84, 92, b"WAITING FOR PD", 2, GRAY).await;
+            text(lcd, 68, 122, b"TRAFFIC", 2, GRAY).await;
+        }
+        // The messages, oldest first, from the published rows.
+        let rows = crate::pd_task::SNIFF_ROWS.lock().await;
+        for (i, row) in rows.iter().enumerate() {
+            let mut buf = [0u8; 24];
+            let n = row.iter().position(|&b| b == 0).unwrap_or(24);
+            buf[..n].copy_from_slice(&row[..n]);
+            buf[n] = 0;
+            text(lcd, 8, 86 + i as u16 * 17, &buf, 1, WHITE).await;
+        }
+        self.draw_hint(lcd).await;
+    }
 
     /// r225: the lines screen — kws-x1's draw_lines with only the D+/D−
     /// cards (this tester's CC lines are not wired to the MCU, the user
