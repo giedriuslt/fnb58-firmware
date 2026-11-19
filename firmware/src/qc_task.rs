@@ -205,7 +205,8 @@ const MODE_AFC: u8 = 2;
 pub static MODE: AtomicU8 = AtomicU8::new(MODE_FIXED);
 
 /// r224: session peaks (kws-x1's meter.peaks — the overview's MAX
-/// card). Millivolts / microamperes (magnitude) / milliwatts; positive
+/// card). Millivolts / milliamps (magnitude — the meter block's
+/// calibrated value) / milliwatts; positive
 /// power only (the negative direction is the shunt's other side).
 pub static PEAK_MV: AtomicU32 = AtomicU32::new(0);
 pub static PEAK_UA: AtomicU32 = AtomicU32::new(0);

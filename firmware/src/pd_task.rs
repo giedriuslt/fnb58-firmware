@@ -56,6 +56,13 @@ pub static BTN: AtomicU8 = AtomicU8::new(0);
 /// the boot contract is whatever was last chosen (default 5 V).
 pub static DESIRED_MV: AtomicU16 = AtomicU16::new(5000);
 
+/// r235: the PPS request the PPS screen commits — the operating current
+/// and the PPS-kind flag (DESIRED_MV carries the voltage). The control
+/// closure builds `Target { mv, ma, Supply::Pps(pos) }` from them;
+/// preview() validates against the engine's own offered range.
+pub static DESIRED_MA: AtomicU16 = AtomicU16::new(1000);
+pub static DESIRED_PPS: AtomicBool = AtomicBool::new(false);
+
 /// r229: the advertised FIXED profiles of the last caps (the PD
 /// PROFILES screen's rows — the PD-native equivalents of the QC
 /// target list). Populated at the caps receive site below; the fixed
@@ -77,6 +84,32 @@ pub static CAPS_MA: [AtomicU16; 6] = [
     AtomicU16::new(0),
     AtomicU16::new(0),
 ];
+/// r235: the advertised PPS ranges of the last caps (the PPS screen) —
+/// one entry per SPR PPS APDO, with its object position (1..=7, the
+/// engine's Supply::Pps argument). Populated at the caps store site
+/// from the raw PDO word, kws-x1's describe_pdo bit layout verbatim
+/// (min bits 8..15 and max bits 17..24 in 100 mV units, current bits
+/// 0..6 in 50 mA units, APDO kind 0b1100 in bits 31..28).
+pub static PPS_N: AtomicUsize = AtomicUsize::new(0);
+pub static PPS_OBJ: [AtomicU8; 4] = [AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0)];
+pub static PPS_MIN_MV: [AtomicU16; 4] = [AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0)];
+pub static PPS_MAX_MV: [AtomicU16; 4] = [AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0)];
+pub static PPS_MAX_MA: [AtomicU16; 4] = [AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0)];
+
+/// r236: the caps evidence — the observation's count plus EVERY object
+/// slot's raw word (filled regardless of count, so a dropped APDO is
+/// visible), dumped by the console 'q' command.
+pub static CAPS_COUNT: AtomicU8 = AtomicU8::new(0);
+pub static CAPS_RAW: [core::sync::atomic::AtomicU32; 7] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+
 /// The selectable fixed targets (the PD screen cycles through these).
 pub const CHOICES_MV: [u16; 5] = [5000, 9000, 12000, 15000, 20000];
 
@@ -102,7 +135,20 @@ pub fn cycle_desired(dir: i16) -> u16 {
 /// never schedules transmission").
 pub static COMMIT: AtomicBool = AtomicBool::new(false);
 
+/// Arm a FIXED re-request (the PD PROFILES screen's OK). Clears the PPS
+/// kind so the control closure's fixed match runs.
 pub fn commit_desired() {
+    DESIRED_PPS.store(false, Ordering::Relaxed);
+    COMMIT.store(true, Ordering::Relaxed);
+}
+
+/// r235: arm a PPS request (the PPS screen's OK) — mv within an
+/// advertised range, ma the operating current. preview() validates both
+/// against the engine's own range (20 mV / 50 mA quanta, 1 A minimum).
+pub fn commit_pps(mv: u16, ma: u16) {
+    DESIRED_MV.store(mv, Ordering::Relaxed);
+    DESIRED_MA.store(ma, Ordering::Relaxed);
+    DESIRED_PPS.store(true, Ordering::Relaxed);
     COMMIT.store(true, Ordering::Relaxed);
 }
 /// r160: true for the whole diagnostic+session+restore span. The main
@@ -196,7 +242,52 @@ fn phase_code(phase: Phase) -> u8 {
 /// console-silent because the boot 5 V had consumed the once-flag).
 static LAST_PSRDY_MV: AtomicU16 = AtomicU16::new(0);
 
+/// r234/r236: store the advertised caps for the PD PROFILES and PPS
+/// screens — fixed profiles (object.fixed) and SPR PPS APDOs (decoded
+/// from the raw word with kws-x1's describe_pdo bit layout: kind 0b1100
+/// in bits 31..28, min bits 8..15, max bits 17..24 in 100 mV units,
+/// current bits 0..6 in 50 mA units). Called LIVE from publish() — the
+/// post-session site is unreachable while a persistent contract lives
+/// (the r236 'q' dump proved count=0 at ph=11).
+fn store_caps(caps: &pd_protocol::pd_rx::Advertisements) {
+    let mut fixed_n = 0usize;
+    let mut pps_n = 0usize;
+    for (i, object) in caps
+        .objects
+        .iter()
+        .take(usize::from(caps.count))
+        .enumerate()
+    {
+        if let Some((mv, ma)) = object.fixed {
+            if fixed_n < CAPS_MV.len() {
+                CAPS_MV[fixed_n].store(mv, Ordering::Relaxed);
+                CAPS_MA[fixed_n].store(ma, Ordering::Relaxed);
+                fixed_n += 1;
+            }
+        } else if object.raw >> 28 == 0b1100 && pps_n < PPS_OBJ.len() {
+            // The SPR PPS APDO.
+            PPS_OBJ[pps_n].store(i as u8 + 1, Ordering::Relaxed);
+            PPS_MIN_MV[pps_n].store(((object.raw >> 8) & 0xff) as u16 * 100, Ordering::Relaxed);
+            PPS_MAX_MV[pps_n].store(((object.raw >> 17) & 0xff) as u16 * 100, Ordering::Relaxed);
+            PPS_MAX_MA[pps_n].store((object.raw & 0x7f) as u16 * 50, Ordering::Relaxed);
+            pps_n += 1;
+        }
+    }
+    CAPS_N.store(fixed_n, Ordering::Relaxed);
+    PPS_N.store(pps_n, Ordering::Relaxed);
+    // The evidence dump — count + every raw slot.
+    CAPS_COUNT.store(caps.count, Ordering::Relaxed);
+    for (slot, object) in CAPS_RAW.iter().zip(caps.objects.iter()) {
+        slot.store(object.raw, Ordering::Relaxed);
+    }
+}
+
 fn publish(observation: Observation) {
+    // r236: the caps store runs LIVE — the moment caps are observed,
+    // reachable for persistent contracts too.
+    if let Some(caps) = observation.capabilities {
+        store_caps(&caps);
+    }
     let spr = observation.spr;
     VIEW.phase.store(phase_code(observation.phase), Ordering::Relaxed);
     VIEW.rx_packets
@@ -661,6 +752,12 @@ pub async fn run() {
     STAGE.store(1, Ordering::Relaxed);
     crate::pd_log(b"[pd] boot session\r\n");
     let mut first = true;
+    // r236: the boot dead-line wake fires once — a soft reset (the
+    // bootloader's RESET, a PC replug) never drops the CC pull-downs, so
+    // an attached charger still sees the same sink and never re-announces
+    // its caps; the engine dies having heard nothing. One automatic
+    // OK-press equivalent (the r147 restart flow) wakes it.
+    let mut boot_wake = true;
     loop {
         if !first {
             STAGE.store(6, Ordering::Relaxed); // parked, waiting for OK
@@ -806,28 +903,63 @@ pub async fn run() {
                 let established = selection.established_target();
                 let commit = COMMIT.swap(false, Ordering::Relaxed);
                 let desired = DESIRED_MV.load(Ordering::Relaxed);
+                let desired_ma = DESIRED_MA.load(Ordering::Relaxed);
+                let pps = DESIRED_PPS.load(Ordering::Relaxed);
                 let due = match established {
-                    None => true, // boot: arm the default before any contract
-                    Some(current) => commit && current.mv != desired,
+                    // boot: arm the fixed default before any contract
+                    // (a PPS request only ever comes from the screen).
+                    None => !pps,
+                    Some(current) => {
+                        commit
+                            && (current.mv != desired
+                                || matches!(current.supply, Supply::Pps(_)) != pps
+                                || (pps && current.ma != desired_ma))
+                    }
                 };
                 if !due {
                     return;
                 }
-                let mut match_ = None;
-                for index in 0..selection.option_count() {
-                    if let Some(target) = selection.option(index)
-                        && matches!(target.supply, Supply::Fixed)
-                        && target.mv == desired
-                    {
-                        match_ = Some(target);
-                        break;
+                // r235: a PPS request — the object whose advertised range
+                // holds the desired voltage (the position stored at the
+                // caps site); preview() then validates mv/ma against the
+                // ENGINE's own view of the offer, so stale caps only log.
+                let target = if pps {
+                    let mut range = None;
+                    for k in 0..PPS_N.load(Ordering::Relaxed).min(PPS_OBJ.len()) {
+                        let min = PPS_MIN_MV[k].load(Ordering::Relaxed);
+                        let max = PPS_MAX_MV[k].load(Ordering::Relaxed);
+                        if desired >= min && desired <= max {
+                            range = Some(PPS_OBJ[k].load(Ordering::Relaxed));
+                            break;
+                        }
                     }
-                }
-                let Some(target) = match_ else {
-                    if commit {
-                        crate::pd_log(b"[pd] arm: not offered\r\n");
+                    let Some(object) = range else {
+                        crate::pd_log(b"[pd] pps: no range holds mv\r\n");
+                        return;
+                    };
+                    pd_spr::Target {
+                        mv: desired,
+                        ma: desired_ma,
+                        supply: Supply::Pps(object),
                     }
-                    return;
+                } else {
+                    let mut match_ = None;
+                    for index in 0..selection.option_count() {
+                        if let Some(target) = selection.option(index)
+                            && matches!(target.supply, Supply::Fixed)
+                            && target.mv == desired
+                        {
+                            match_ = Some(target);
+                            break;
+                        }
+                    }
+                    let Some(target) = match_ else {
+                        if commit {
+                            crate::pd_log(b"[pd] arm: not offered\r\n");
+                        }
+                        return;
+                    };
+                    target
                 };
                 if selection.preview(target) && selection.confirm() {
                     // r176: the exchange window opens HERE, not at session
@@ -1037,6 +1169,10 @@ pub async fn run() {
             d[n + 1] = b'\n';
             n += 2;
             crate::pd_log(&d[..n]);
+            // r236: the store now runs LIVE in publish() (a persistent
+            // contract never reaches this post-session logging); this
+            // call covers the one-shot paths.
+            store_caps(&caps);
             for (i, object) in caps.objects.iter().take(6).enumerate() {
                 if i >= usize::from(caps.count) {
                     break;
@@ -1316,6 +1452,23 @@ pub async fn run() {
         publish(phy.observation);
         if error.is_none() && engine_code != 0 && !clean_stop {
             VIEW.error.store(engine_code, Ordering::Relaxed);
+        }
+
+        // r236: the boot dead-line wake — nothing heard, no caps, but the
+        // diagnostic saw a source attached (BC_LVL on either CC): the
+        // charger is asleep in the no-ack regime. Fire the r147 restart
+        // flow once (clearing `error` so the restart branch below runs —
+        // the exact equivalent of the user pressing OK on a dead line).
+        if boot_wake
+            && phy.observation.capabilities.is_none()
+            && phy.observation.rx_packets == 0
+            && (VIEW.cc1.load(Ordering::Relaxed) | VIEW.cc2.load(Ordering::Relaxed)) & 0x03 != 0
+        {
+            boot_wake = false;
+            crate::pd_log(b"[pd] boot dead line: HR wake\r\n");
+            RESTART.store(true, Ordering::Relaxed);
+            error = None;
+            rerun = true;
         }
 
         // r145/r147: a failed restart must not chain (a still-set RESTART

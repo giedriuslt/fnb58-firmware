@@ -63,7 +63,7 @@ static NEXT_SCREEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r233";
+const BUILD: &[u8] = b"r237";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -233,7 +233,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r233 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r237 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot, through the
@@ -318,7 +318,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r233 " {
+                for &b in b"r237 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -425,7 +425,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r233: claim from sector 0\r\n");
+    say(b"[lcd] FNB58 r237: claim from sector 0\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -669,6 +669,9 @@ async fn main(spawner: Spawner) {
     // (button bit, direction, next-repeat ms).
     let mut cal_average = settings_core::calibration::Average::default();
     let mut cal_repeat: Option<(u8, i16, u32)> = None;
+    // r235: the PPS editors' held-button repeat (kws-x1's PPS_MV/A_REPEAT):
+    // (button bit, dir, volts?, next-repeat ms).
+    let mut pps_repeat: Option<(u8, i16, bool, u32)> = None;
     // LEXT probe: enable the 32.768 kHz crystal oscillator on PC14/PC15
     // and wait for its stable flag. If the board has the RTC crystal
     // footprint populated, lextstblf sets within a second; with nothing
@@ -985,6 +988,17 @@ async fn main(spawner: Spawner) {
             }
         }
 
+        // r235: the PPS editors' held-button repeat — ±100 mV / ±250 mA
+        // every 150 ms after a 500 ms delay (kws-x1's repeat steps).
+        if let Some((bit, dir, volts, next_ms)) = pps_repeat {
+            if ui.screen != Screen::Pd || held & bit == 0 {
+                pps_repeat = None;
+            } else if (now_ms.wrapping_sub(next_ms) as i32) >= 0 {
+                ui.pps_step(volts, dir, if volts { 100 } else { 250 });
+                pps_repeat = Some((bit, dir, volts, now_ms.wrapping_add(150)));
+            }
+        }
+
         // r221: the calibration entry's held-button repeat — the FNB58
         // has no button-repeat of its own, so the main loop supplies
         // kws-x1's ENTRY_REPEAT: while the adjusted button stays held,
@@ -1107,6 +1121,33 @@ async fn main(spawner: Spawner) {
                         ui.force_repaint();
                         sender.push(b"[en] reset
 ");
+                    } else if ui.screen == Screen::Pd {
+                        // r235: the PPS request (the amps editor's OK).
+                        if pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) {
+                            pd_task::commit_pps(ui.pps_mv, ui.pps_ma);
+                            let mut d = [0u8; 40];
+                            let mut n = 0;
+                            for &b in b"[pd] pps req=" {
+                                d[n] = b;
+                                n += 1;
+                            }
+                            n = push_dec(&mut d, n, u32::from(ui.pps_mv));
+                            for &b in b"mV " {
+                                d[n] = b;
+                                n += 1;
+                            }
+                            n = push_dec(&mut d, n, u32::from(ui.pps_ma));
+                            for &b in b"mA\r\n" {
+                                d[n] = b;
+                                n += 1;
+                            }
+                            sender.push(&d[..n]);
+                        } else {
+                            // A PPS request needs the live session's
+                            // Selection (the fresh-session boot arm is
+                            // fixed-only); loud, not silent.
+                            sender.push(b"[pd] pps: no session\r\n");
+                        }
                     } else if pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) {
                         pd_task::commit_desired();
                         sender.push(b"[pd] commit\r\n");
@@ -1191,6 +1232,26 @@ async fn main(spawner: Spawner) {
                             None => sender.push(b"[cal] ok\r\n"),
                         }
                     }
+                }
+                Press::PpsVolts(dir) => {
+                    // r235: the PPS voltage editor (±20 mV per press).
+                    ui.pps_step(true, dir, 20);
+                    pps_repeat = Some((
+                        if dir > 0 { 1u8 << buttons::RIGHT } else { 1u8 << buttons::LEFT },
+                        dir,
+                        true,
+                        now_ms.wrapping_add(500),
+                    ));
+                }
+                Press::PpsAmps(dir) => {
+                    // r235: the PPS current editor (±50 mA per press).
+                    ui.pps_step(false, dir, 50);
+                    pps_repeat = Some((
+                        if dir > 0 { 1u8 << buttons::RIGHT } else { 1u8 << buttons::LEFT },
+                        dir,
+                        false,
+                        now_ms.wrapping_add(500),
+                    ));
                 }
                 Press::SetRow(dir) => {
                     // r226: the settings page's row cursor.
@@ -1369,7 +1430,13 @@ async fn main(spawner: Spawner) {
                             b"[afc] tgt=",
                             u32::from(qc_task::cycle_afc_target(dir)),
                         ),
-                        _ => (b"[pd] tgt=", u32::from(pd_task::cycle_desired(dir))),
+                        // r235: no fallback — the PPS page's editors are
+                        // PpsVolts/PpsAmps; fixed voltages live on the
+                        // profiles screen.
+                        _ => {
+                            sender.push(b"[pd] no target here\r\n");
+                            continue;
+                        }
                     };
                     let mut d = [0u8; 32];
                     let mut n = 0;
@@ -1915,6 +1982,49 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
         }
         // r221: the applied calibration + the meter's raw state (the
         // wizard's inputs) — hardware verification without navigating.
+        // r236: the caps/PPS evidence dump — the observation's count,
+        // every raw object slot and the PPS store's fields.
+        b'q' => {
+            let mut d = [0u8; 64];
+            let mut n = 0;
+            for &b in b"[pd] count=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, u32::from(pd_task::CAPS_COUNT.load(Ordering::Relaxed)));
+            for &b in b" pps=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(
+                &mut d,
+                n,
+                pd_task::PPS_N.load(Ordering::Relaxed) as u32,
+            );
+            for &b in b"\r\n" {
+                d[n] = b;
+                n += 1;
+            }
+            send_direct(&d[..n]);
+            for (i, slot) in pd_task::CAPS_RAW.iter().enumerate() {
+                let raw = slot.load(Ordering::Relaxed);
+                let mut d = [0u8; 32];
+                let mut n = 0;
+                d[n] = b'p';
+                n += 1;
+                d[n] = b'1' + i as u8;
+                n += 1;
+                d[n] = b'=';
+                n += 1;
+                for shift in [24u32, 16, 8, 0] {
+                    n = push_hex8(&mut d, n, (raw >> shift) & 0xFF);
+                }
+                d[n] = b'\r';
+                d[n + 1] = b'\n';
+                n += 2;
+                send_direct(&d[..n]);
+            }
+        }
         b'c' => {
             let cal = settings::applied();
             let bus = qc_task::METER_BUS_RAW.load(Ordering::Relaxed);

@@ -118,6 +118,9 @@ pub enum Press {
     GraphWindow(i16),
     /// r229: the profiles selector's previewed row (editing mode).
     Profile(i16),
+    /// r235: the PPS page's focused value (volts, or amps).
+    PpsVolts(i16),
+    PpsAmps(i16),
 }
 
 /// r199: what LEFT/RIGHT adjust on the open ripple screen, in OK's order
@@ -226,6 +229,14 @@ fn framed(buf: &mut [u8; 24], content: &[u8], focused: bool) -> usize {
     n
 }
 
+/// r235: what LEFT/RIGHT adjust on the PPS page (kws-x1's PpsFocus;
+/// None = closed, LEFT/RIGHT navigate, OK opens).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PpsFocus {
+    Volts,
+    Amps,
+}
+
 /// r226: the settings page's three states (kws-x1's Row focus and
 /// value editors): Idle (LEFT/RIGHT navigate; OK enters), Row (the
 /// cursor picks the row; OK opens the editor), Edit (LEFT/RIGHT change
@@ -249,6 +260,12 @@ pub struct Ui {
     pd_err: u16,
     /// r171: the armed target voltage (PPS screen's TGT line).
     pd_tgt: u16,
+    /// r235: the PPS page's state — the focus (None = closed), the set
+    /// voltage/current, and the body's identity cache.
+    pub pps_focus: Option<PpsFocus>,
+    pub pps_mv: u16,
+    pub pps_ma: u16,
+    pps_drawn: (u16, u16, u16, usize, u16, u16, bool),
     /// r189: QC-view identity at the last static redraw (state changes
     /// only — the fast numbers update in place, see draw_qc).
     qc_state: u8,
@@ -497,6 +514,10 @@ impl Ui {
             pd_ma: 0xFFFF,
             pd_err: 0xFFFF,
             pd_tgt: 0xFFFF,
+            pps_focus: None,
+            pps_mv: 5000,
+            pps_ma: 1000,
+            pps_drawn: (u16::MAX, 0, 0, 0, 0, 0, true),
             qc_state: 0xFF,
             qc_outcome: 0xFF,
             qc_failure: 0xFF,
@@ -545,6 +566,39 @@ impl Ui {
     /// the voltage, OK selects it (re-request), BACK returns to screen
     /// navigation. Only glyphs from lcd.rs FONT_CHARS (no '<'/'>'!).
     pub fn on_press(&mut self, i: usize) -> Press {
+        // r235: the PPS page's focus machine (kws-x1's PpsFocus): OK
+        // walks None -> volts -> amps -> request, LEFT/RIGHT adjust the
+        // focused value (clamped to the advertised range), BACK closes.
+        if self.screen == Screen::Pd {
+            match i {
+                buttons::OK => {
+                    return match self.pps_focus {
+                        None => {
+                            self.pps_focus = Some(PpsFocus::Volts);
+                            Press::Hint
+                        }
+                        Some(PpsFocus::Volts) => {
+                            self.pps_focus = Some(PpsFocus::Amps);
+                            Press::Hint
+                        }
+                        Some(PpsFocus::Amps) => Press::Commit,
+                    };
+                }
+                buttons::BACK if self.pps_focus.is_some() => {
+                    self.pps_focus = None;
+                    return Press::Hint;
+                }
+                buttons::LEFT | buttons::RIGHT if self.pps_focus.is_some() => {
+                    let dir = if i == buttons::RIGHT { 1 } else { -1 };
+                    return match self.pps_focus {
+                        Some(PpsFocus::Volts) => Press::PpsVolts(dir),
+                        Some(PpsFocus::Amps) => Press::PpsAmps(dir),
+                        None => Press::None,
+                    };
+                }
+                _ => {}
+            }
+        }
         // r226: the settings page is kws-x1's two-level machine: Idle
         // (LEFT/RIGHT navigate) -> OK -> Row (the cursor picks the row)
         // -> OK -> Edit (LEFT/RIGHT change the row's value, OK saves,
@@ -740,7 +794,7 @@ impl Ui {
             buttons::OK
                 if matches!(
                     self.screen,
-                    Screen::Pd | Screen::Qc | Screen::Qc3 | Screen::Afc
+                    Screen::Qc | Screen::Qc3 | Screen::Afc
                 ) =>
             {
                 if self.selecting {
@@ -752,6 +806,33 @@ impl Ui {
                 }
             }
             _ => Press::None,
+        }
+    }
+
+    /// r235: step the focused PPS editor (kws-x1's ±20 mV / ±50 mA per
+    /// press, ±100 / ±250 held), clamped to the FIRST advertised range
+    /// and the engine's own request rules (20 mV / 50 mA quanta, the
+    /// 1 A PPS operating minimum — preview() would refuse anything
+    /// else). The single-range clamp is a documented simplification:
+    /// kws-x1 edits within the previewed range; this charger class
+    /// advertises one.
+    pub fn pps_step(&mut self, volts: bool, dir: i16, amount: i32) {
+        use core::sync::atomic::Ordering;
+        let n = crate::pd_task::PPS_N
+            .load(Ordering::Relaxed)
+            .min(crate::pd_task::PPS_OBJ.len());
+        if n == 0 {
+            return;
+        }
+        if volts {
+            let min = crate::pd_task::PPS_MIN_MV[0].load(Ordering::Relaxed) as i32;
+            let max = crate::pd_task::PPS_MAX_MV[0].load(Ordering::Relaxed) as i32;
+            let next = (self.pps_mv as i32 + i32::from(dir) * amount).clamp(min, max);
+            self.pps_mv = next as u16;
+        } else {
+            let max = crate::pd_task::PPS_MAX_MA[0].load(Ordering::Relaxed) as i32;
+            let next = (self.pps_ma as i32 + i32::from(dir) * amount).clamp(1000, max);
+            self.pps_ma = next as u16;
         }
     }
 
@@ -783,6 +864,8 @@ impl Ui {
         self.cal_live = (0, 0, false);
         // r227: the graph redraws its whole plot after a forced repaint.
         self.graph_drawn = (None, self.graph_trace, self.graph_window, self.graph_focus);
+        // r235: the PPS page too.
+        self.pps_drawn = (u16::MAX, 0, 0, 0, 0, 0, true);
         // r229/r233: the profiles and sniff bodies too (the notice and
         // the message list re-arm on a forced repaint).
         self.profiles_drawn = (true, usize::MAX, 0, 0);
@@ -850,6 +933,22 @@ impl Ui {
         // editing flag is page state).
         if screen != Screen::Profiles {
             self.profiles_edit = false;
+        }
+        // r235: the PPS page opens unfocused, seeded from the first
+        // advertised range (min voltage / max current, floored at the
+        // 1 A PPS operating minimum).
+        if screen == Screen::Pd {
+            self.pps_focus = None;
+            let n = crate::pd_task::PPS_N
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .min(crate::pd_task::PPS_OBJ.len());
+            if n > 0 {
+                self.pps_mv = crate::pd_task::PPS_MIN_MV[0]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                self.pps_ma = crate::pd_task::PPS_MAX_MA[0]
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .max(1000);
+            }
         }
         // r218: the settings screen starts at the APPLIED value.
         if screen == Screen::Settings {
@@ -938,7 +1037,11 @@ impl Ui {
                 Some(RippleFocus::Scale) => b"LR:SCALE OK:RUN BK:X",
                 Some(RippleFocus::Capture) => b"LR:RUNHOLD OK:TIME BK:X",
             },
-            _ if self.selecting => b"LR SEL OK:REQ BK:EX",
+            Screen::Pd => match self.pps_focus {
+                None => b"OK:PPS",
+                Some(PpsFocus::Volts) => b"LR:VOLT OK:AMPS BK:X",
+                Some(PpsFocus::Amps) => b"LR:AMPS OK:REQ BK:X",
+            },
             _ => b"OK:TGT",
         };
         lcd.draw_text(8, 216, hint, 2, GRAY, BLACK).await;
@@ -1507,7 +1610,7 @@ impl Ui {
         if bus_fresh {
             let ua = cal.milliamps(cur_raw);
             la.sign(ua < 0);
-            la.num_u32(ua.unsigned_abs() / 1000, 3);
+            la.num_u32(ua.unsigned_abs(), 3);
             la.push(b"A");
         } else {
             la.push(b"--.---A");
@@ -2277,14 +2380,14 @@ impl Ui {
         card(lcd, 164, 34, 315, 82, b"CURRENT", CYAN).await;
         // The meter works in either direction, so the current is shown
         // as a magnitude (kws-x1's note).
-        value_text(lcd, 172, 46, ua.unsigned_abs() / 1000, 3, b"A", CYAN, 7).await;
+        value_text(lcd, 172, 46, ua.unsigned_abs(), 3, b"A", CYAN, 7).await;
         // Row 2: the power card and the session peaks.
         card(lcd, 4, 90, 240, 154, b"POWER", GREEN).await;
         value_text(lcd, 12, 104, mw.unsigned_abs(), 4, b"W", GREEN, 9).await;
         card(lcd, 248, 90, 315, 154, b"MAX", MAGENTA).await;
         let peaks = [
             (crate::qc_task::PEAK_MV.load(Ordering::Relaxed), b"V", YELLOW),
-            (crate::qc_task::PEAK_UA.load(Ordering::Relaxed) / 1000, b"A", CYAN),
+            (crate::qc_task::PEAK_UA.load(Ordering::Relaxed), b"A", CYAN),
             (crate::qc_task::PEAK_MW.load(Ordering::Relaxed), b"W", GREEN),
         ];
         for (i, (v, unit, color)) in peaks.iter().enumerate() {
@@ -2309,119 +2412,162 @@ impl Ui {
 
     /// PD screen: the engine view (vendored fusb302-pd session). Redrawn
     /// only when a tracked value changes.
+    /// r235: the PPS screen — kws-x1's draw_pps: the PPS RANGE card
+    /// (each advertised APDO "3.300-11.000V 3.000A"), the SET VOLTAGE
+    /// and CURRENT LIMIT boxes (framed while LEFT/RIGHT adjust them:
+    /// ±20 mV / ±50 mA per press, ±100 / ±250 held — clamped to the
+    /// range and the 1 A PPS minimum), and the OUTPUT row (the
+    /// established contract vs the set level). OK walks
+    /// None → volts → amps → request. Before any caps with a PPS APDO:
+    /// the NO PPS notice (fixed profiles live on PD PROFILES).
     pub async fn draw_pd(&mut self, lcd: &mut Lcd, view: &View) {
-        let phase = view.phase.load(core::sync::atomic::Ordering::Relaxed);
-        let mv = view.selected_mv.load(core::sync::atomic::Ordering::Relaxed);
-        let ma = view.selected_ma.load(core::sync::atomic::Ordering::Relaxed);
-        let err = view.error.load(core::sync::atomic::Ordering::Relaxed);
-        let tgt = crate::pd_task::DESIRED_MV.load(core::sync::atomic::Ordering::Relaxed);
-        if phase == self.pd_phase
-            && mv == self.pd_mv
-            && ma == self.pd_ma
-            && err == self.pd_err
-            && tgt == self.pd_tgt
-        {
+        use core::sync::atomic::Ordering;
+        let n = crate::pd_task::PPS_N.load(Ordering::Relaxed);
+        let sel_mv = view.selected_mv.load(Ordering::Relaxed);
+        let sel_ma = view.selected_ma.load(Ordering::Relaxed);
+        // r236: the phase is the truthful contract signal — r178 sets
+        // Contracted at PS_RDY while the observation's contract flag
+        // lags (the OUTPUT row read NO CONTRACT at ph=11).
+        let contracted =
+            view.phase.load(Ordering::Relaxed) == 11 || view.contract.load(Ordering::Relaxed);
+        let focus_code = match self.pps_focus {
+            None => 0u16,
+            Some(PpsFocus::Volts) => 1,
+            Some(PpsFocus::Amps) => 2,
+        };
+        let ident = (
+            focus_code,
+            self.pps_mv,
+            self.pps_ma,
+            n,
+            sel_mv,
+            sel_ma,
+            contracted,
+        );
+        if ident == self.pps_drawn {
             return;
         }
-        self.pd_phase = phase;
-        self.pd_mv = mv;
-        self.pd_ma = ma;
-        self.pd_err = err;
-        self.pd_tgt = tgt;
+        self.pps_drawn = ident;
         lcd.fill_window(0, 32, 319, 210, BLACK).await;
-
-        // r171: the armed request target, cycled with LEFT/RIGHT:
-        // "TGT 9V" (the next OK requests exactly this).
-        let mut line = [0u8; 24];
-        let mut n = 0;
-        for &b in b"TGT " {
-            line[n] = b;
-            n += 1;
+        if n == 0 {
+            text(lcd, 116, 100, b"NO PPS", 2, CYAN).await;
+            text(lcd, 56, 130, b"CHARGER OFFERS NO PPS", 1, GRAY).await;
+            self.draw_hint(lcd).await;
+            return;
         }
-        n = crate::push_dec(&mut line, n, u32::from(tgt / 1000));
-        line[n] = b'V';
-        n += 1;
-        line[n] = 0;
-        text(lcd, 8, 72, &line, 2, YELLOW).await;
-
-        const NAMES: [&[u8]; 13] = [
-            b"WAIT", b"PASSIVE", b"FAIL", b"SKIP", b"MEAS", b"GUARD", b"VERIFY", b"RX",
-            b"CAPTURED", b"NOCAPS", b"NEG", b"CONTRACT", b"HOLD",
-        ];
-        let name = NAMES.get(phase as usize).copied().unwrap_or(b"?");
-        let mut line = [0u8; 24];
-        let mut n = 0;
-        for &b in b"PD " {
-            line[n] = b;
-            n += 1;
-        }
-        line[n..n + name.len()].copy_from_slice(name);
-        n += name.len();
-        line[n] = 0;
-        text(lcd, 8, 40, &line, 3, WHITE).await;
-
-        // Selected voltage/current: "SEL 5.0V 3.0A".
-        let mut l = Line12::new();
-        for &b in b"SEL " {
-            l.push(&[b]);
-        }
-        if mv >= 1000 {
-            // r142: mv is MILLIVOLTS - scale to volts first (5000 mV
-            // printed as "500.0V" before). Line12 caps at 12 chars, so
-            // whole volts + one-decimal amps fit: "SEL 5V 3.0A".
-            l.num_u32(u32::from(mv) / 1000, 0);
+        // The ranges card, one row per APDO.
+        let rows = 34 + (n as u16 - 1) * 14 + 12;
+        card(lcd, 4, 34, 315, 34 + 20 + n as u16 * 14, b"PPS RANGE", CYAN).await;
+        for k in 0..n {
+            let min_mv = crate::pd_task::PPS_MIN_MV[k].load(Ordering::Relaxed);
+            let max_mv = crate::pd_task::PPS_MAX_MV[k].load(Ordering::Relaxed);
+            let max_ma = crate::pd_task::PPS_MAX_MA[k].load(Ordering::Relaxed);
+            let mut l = Line12::new();
+            l.num_u32(u32::from(min_mv), 3);
+            l.push(b"-");
+            l.num_u32(u32::from(max_mv), 3);
             l.push(b"V ");
-        } else {
-            l.push(b"- ");
-        }
-        if ma >= 1000 {
-            l.num_u32(u32::from(ma) / 100, 1);
+            l.num_u32(u32::from(max_ma), 3);
             l.push(b"A");
+            let w = l.len as u16 * 6;
+            l.pad();
+            lcd.draw_text(305 - w, 44 + k as u16 * 14, l.bytes(), 1, CYAN, BLACK)
+                .await;
+        }
+        let _ = rows;
+        // The SET VOLTAGE and CURRENT LIMIT boxes side by side, framed
+        // (yellow) while adjusted.
+        let volts_focused = self.pps_focus == Some(PpsFocus::Volts);
+        let amps_focused = self.pps_focus == Some(PpsFocus::Amps);
+        card(
+            lcd,
+            4,
+            74 + n as u16 * 14,
+            156,
+            150 + n as u16 * 14,
+            b"SET VOLTAGE",
+            if volts_focused { YELLOW } else { CYAN },
+        )
+        .await;
+        let mut v = Line12::new();
+        v.num_u32(u32::from(self.pps_mv), 3);
+        v.push(b"V");
+        while v.len < 9 {
+            v.push(b" ");
+        }
+        lcd.draw_text(
+            12,
+            88 + n as u16 * 14,
+            v.bytes(),
+            2,
+            if volts_focused { YELLOW } else { CYAN },
+            BLACK,
+        )
+        .await;
+        card(
+            lcd,
+            164,
+            74 + n as u16 * 14,
+            315,
+            150 + n as u16 * 14,
+            b"CURRENT LIMIT",
+            if amps_focused { YELLOW } else { CYAN },
+        )
+        .await;
+        let mut a = Line12::new();
+        a.num_u32(u32::from(self.pps_ma), 3);
+        a.push(b"A");
+        while a.len < 9 {
+            a.push(b" ");
+        }
+        lcd.draw_text(
+            172,
+            88 + n as u16 * 14,
+            a.bytes(),
+            2,
+            if amps_focused { YELLOW } else { CYAN },
+            BLACK,
+        )
+        .await;
+        // The OUTPUT row (kws-x1's supply_status): the established
+        // contract, ACTIVE when it is the set level.
+        let applied = contracted
+            && sel_mv == self.pps_mv
+            && sel_ma == self.pps_ma;
+        let mut o = Line12::new();
+        o.push(b"OUTPUT ");
+        o.num_u32(u32::from(sel_mv), 3);
+        o.push(b"V ");
+        o.num_u32(u32::from(sel_ma), 3);
+        o.push(b"A");
+        o.pad();
+        lcd.draw_text(
+            8,
+            164 + n as u16 * 14,
+            o.bytes(),
+            1,
+            if applied { GREEN } else { GRAY },
+            BLACK,
+        )
+        .await;
+        let state: &[u8] = if applied {
+            b"ACTIVE"
+        } else if contracted {
+            b"NOT APPLIED"
         } else {
-            l.push(b"-A");
-        }
-        l.pad();
-        lcd.draw_text(8, 90, l.bytes(), 2, GREEN, BLACK).await;
-
-        // Flags: "ACC:1 RDY:0 CON:1".
-        let acc = u8::from(view.accept.load(core::sync::atomic::Ordering::Relaxed));
-        let rdy = u8::from(view.psrdy.load(core::sync::atomic::Ordering::Relaxed));
-        let con = u8::from(view.contract.load(core::sync::atomic::Ordering::Relaxed));
-        let mut line = [0u8; 24];
-        let mut n = 0;
-        for &b in b"ACC:1 RDY:1 CON:1" {
-            line[n] = b;
-            n += 1;
-        }
-        line[4] = b'0' + acc;
-        line[10] = b'0' + rdy;
-        line[16] = b'0' + con;
-        line[n] = 0;
-        text(lcd, 8, 130, &line, 2, CYAN).await;
-
-        // Diagnostics: "REV:3 ERR:0 PK:12".
-        let rev = view.peer_rev.load(core::sync::atomic::Ordering::Relaxed);
-        let pk = view.rx_packets.load(core::sync::atomic::Ordering::Relaxed);
-        let mut line = [0u8; 24];
-        let mut n = 0;
-        for &b in b"REV:0 ERR:0 PK:0" {
-            line[n] = b;
-            n += 1;
-        }
-        line[4] = b'0' + (rev % 10);
-        line[11] = b'0' + (err % 10) as u8;
-        let mut pk_n = 0;
-        let mut v = pk;
-        while v > 0 && n + 1 < line.len() {
-            line[n - pk_n] = b'0' + (v % 10) as u8;
-            pk_n += 1;
-            v /= 10;
-        }
-        if pk == 0 {
-            line[n - 1] = b'0';
-        }
-        line[n] = 0;
-        text(lcd, 8, 160, &line, 2, YELLOW).await;
+            b"NO CONTRACT"
+        };
+        // FONT_CHARS-safe ("NOT APPLIED" has no lowercase issue).
+        text(
+            lcd,
+            313 - state.len() as u16 * 6,
+            164 + n as u16 * 14,
+            state,
+            1,
+            if applied { GREEN } else { ORANGE },
+        )
+        .await;
+        self.draw_hint(lcd).await;
     }
 }
 
