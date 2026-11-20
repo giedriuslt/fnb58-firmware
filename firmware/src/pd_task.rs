@@ -953,6 +953,12 @@ pub async fn run() {
     // retry SILENTLY forever behind BUSY=true, freezing the UI. Three
     // failures park the task loudly instead; an OK press retries.
     let mut diag_fails = 0u32;
+    // r239g: the first diagnostic-failure park retries ONCE after the
+    // main task's bus unwedge (the wake-HR's wedge heals ~1.5 s after
+    // BUSY clears; the meter transition fires the pin dance). The
+    // retry restores the r236-style automatic negotiation through the
+    // VBUS race (the charger cycles VBUS vs the console's back-feed).
+    let mut retried = false;
     loop {
         if !first {
             STAGE.store(6, Ordering::Relaxed); // parked, waiting for OK
@@ -988,11 +994,26 @@ pub async fn run() {
                 crate::pd_log(b"[pd] no bus\r\n");
                 diag_fails = diag_fails.saturating_add(1);
                 if diag_fails >= 3 {
-                    crate::pd_log(b"[pd] parked: diag FAIL x3 (OK retries)\r\n");
                     diag_fails = 0;
-                    first = false;
                     SESSION_ACTIVE.store(false, Ordering::Relaxed);
                     BUSY.store(false, Ordering::Relaxed);
+                    if !retried {
+                        // r239g: the ONE automatic retry - BUSY is down now,
+                        // so the main task's meter transition runs the pin
+                        // dance within a tick; the delay gives it the window,
+                        // then the session reruns on the healed bus (the
+                        // wake's HR already woke the charger - its caps
+                        // arrive into THIS session).
+                        retried = true;
+                        crate::pd_log(
+                            b"[pd] diag FAIL x3 - retry after unwedge\r\n",
+                        );
+                        first = true; // the loop top skips its own wait
+                        boot_wake = false; // no second auto-wake
+                        Timer::after_millis(1500).await;
+                        continue;
+                    }
+                    first = false;
                     continue;
                 }
                 VIEW.phase.store(phase_code(Phase::Failed), Ordering::Relaxed);
@@ -1008,11 +1029,26 @@ pub async fn run() {
                 crate::pd_log(b"[pd] baseline FAIL (bus a=22)\r\n");
                 diag_fails = diag_fails.saturating_add(1);
                 if diag_fails >= 3 {
-                    crate::pd_log(b"[pd] parked: diag FAIL x3 (OK retries)\r\n");
                     diag_fails = 0;
-                    first = false;
                     SESSION_ACTIVE.store(false, Ordering::Relaxed);
                     BUSY.store(false, Ordering::Relaxed);
+                    if !retried {
+                        // r239g: the ONE automatic retry - BUSY is down now,
+                        // so the main task's meter transition runs the pin
+                        // dance within a tick; the delay gives it the window,
+                        // then the session reruns on the healed bus (the
+                        // wake's HR already woke the charger - its caps
+                        // arrive into THIS session).
+                        retried = true;
+                        crate::pd_log(
+                            b"[pd] diag FAIL x3 - retry after unwedge\r\n",
+                        );
+                        first = true; // the loop top skips its own wait
+                        boot_wake = false; // no second auto-wake
+                        Timer::after_millis(1500).await;
+                        continue;
+                    }
+                    first = false;
                     continue;
                 }
                 VIEW.phase.store(phase_code(Phase::Failed), Ordering::Relaxed);
@@ -1027,11 +1063,26 @@ pub async fn run() {
                     crate::pd_log(b"[pd] snapshot FAIL\r\n");
                     diag_fails = diag_fails.saturating_add(1);
                     if diag_fails >= 3 {
-                        crate::pd_log(b"[pd] parked: diag FAIL x3 (OK retries)\r\n");
                         diag_fails = 0;
-                        first = false;
                         SESSION_ACTIVE.store(false, Ordering::Relaxed);
                         BUSY.store(false, Ordering::Relaxed);
+                        if !retried {
+                            // r239g: the ONE automatic retry - BUSY is down now,
+                            // so the main task's meter transition runs the pin
+                            // dance within a tick; the delay gives it the window,
+                            // then the session reruns on the healed bus (the
+                            // wake's HR already woke the charger - its caps
+                            // arrive into THIS session).
+                            retried = true;
+                            crate::pd_log(
+                                b"[pd] diag FAIL x3 - retry after unwedge\r\n",
+                            );
+                            first = true; // the loop top skips its own wait
+                            boot_wake = false; // no second auto-wake
+                            Timer::after_millis(1500).await;
+                            continue;
+                        }
+                        first = false;
                         continue;
                     }
                 VIEW.phase.store(phase_code(Phase::Failed), Ordering::Relaxed);
@@ -1097,11 +1148,26 @@ pub async fn run() {
                     }
                     crate::pd_log(&d[..n]);
                     if diag_fails >= 3 {
-                        crate::pd_log(b"[pd] parked: diag FAIL x3 (OK retries)\r\n");
                         diag_fails = 0;
-                        first = false;
                         SESSION_ACTIVE.store(false, Ordering::Relaxed);
                         BUSY.store(false, Ordering::Relaxed);
+                        if !retried {
+                            // r239g: the ONE automatic retry - BUSY is down now,
+                            // so the main task's meter transition runs the pin
+                            // dance within a tick; the delay gives it the window,
+                            // then the session reruns on the healed bus (the
+                            // wake's HR already woke the charger - its caps
+                            // arrive into THIS session).
+                            retried = true;
+                            crate::pd_log(
+                                b"[pd] diag FAIL x3 - retry after unwedge\r\n",
+                            );
+                            first = true; // the loop top skips its own wait
+                            boot_wake = false; // no second auto-wake
+                            Timer::after_millis(1500).await;
+                            continue;
+                        }
+                        first = false;
                         continue;
                     }
                 VIEW.phase.store(phase_code(Phase::Failed), Ordering::Relaxed);
