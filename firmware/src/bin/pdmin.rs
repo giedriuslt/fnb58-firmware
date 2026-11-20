@@ -34,6 +34,13 @@ mod board;
 mod console;
 #[path = "../pd_phy.rs"]
 mod pd_phy;
+// r238: the cable page's pure model — pd_task's scroll-driven MODES read
+// calls cable_page::svid_index; the screen-side functions are dead code
+// here and drop out at link time.
+#[path = "../cable_summary.rs"]
+mod cable_summary;
+#[path = "../cable_page.rs"]
+mod cable_page;
 // BUS (the shared I2C1 cell) lives in pd_task; the probe never spawns it.
 #[path = "../pd_task.rs"]
 mod pd_task;

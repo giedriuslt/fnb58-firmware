@@ -9,7 +9,7 @@
 //! session's SenderResponseTimer survives even a 31-byte FIFO read).
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -150,6 +150,144 @@ pub fn commit_pps(mv: u16, ma: u16) {
     DESIRED_MA.store(ma, Ordering::Relaxed);
     DESIRED_PPS.store(true, Ordering::Relaxed);
     COMMIT.store(true, Ordering::Relaxed);
+}
+
+// --- r238: the CABLE screen (kws-x1's Detail::Cable page) -------------
+// The vendored stack already carries the whole feature — the engine's
+// Selection::request_cable/request_cable_mode arming, the FUSB302's SOP'
+// inspection (Soft_Reset sync, Discover Identity with the PD3/PD2
+// fallbacks, Discover SVIDs, Get_Manufacturer_Info, the cable and SOP''
+// statuses — pd_discovery behind phy::discover_cable) and the pd_svids
+// bitmap store; the FnbPlatform's INSPECTION_CC/INSPECTION_SWITCHES0 were
+// in place since the crate copy. This is the trigger + view wiring.
+
+/// The cable's SVID set (kws-x1's CABLE_SVIDS): the vendored discovery
+/// fills it from Discover SVIDs replies; the page and the scroll-driven
+/// mode requests read it back. 8 KiB of bitmap.
+static CABLE_SVIDS: embassy_sync::blocking_mutex::Mutex<
+    CriticalSectionRawMutex,
+    RefCell<pd_protocol::pd_svids::Svids>,
+> = embassy_sync::blocking_mutex::Mutex::new(RefCell::new(
+    pd_protocol::pd_svids::Svids::EMPTY,
+));
+/// The `pd_svids::Store` handle the session config gets (kws-x1's
+/// CableSvidStore).
+pub struct CableSvidStore;
+impl pd_protocol::pd_svids::Store for CableSvidStore {
+    fn clear(&self) {
+        CABLE_SVIDS.lock(|cell| cell.borrow_mut().clear());
+    }
+    fn response(&self, objects: &[u32]) -> Option<pd_protocol::pd_svids::Progress> {
+        CABLE_SVIDS.lock(|cell| cell.borrow_mut().response(objects))
+    }
+    fn at(&self, index: u16) -> Option<u16> {
+        CABLE_SVIDS.lock(|cell| cell.borrow().at(index))
+    }
+    fn contains(&self, svid: u16) -> bool {
+        CABLE_SVIDS.lock(|cell| cell.borrow().contains(svid))
+    }
+}
+/// The store handle the cable page reads the MODES row's names through.
+pub(crate) static CABLE_SVID_STORE: CableSvidStore = CableSvidStore;
+
+/// The browse mode's OK asked for a cable read (kws-x1's long-OK →
+/// PdCommand::QueryCable; fnb58 has no long-press, the r226 energy-reset
+/// precedent). Consumed by the control closure.
+pub static CABLE_ASK: AtomicBool = AtomicBool::new(false);
+/// An ask happened since boot (kws-x1's CABLE_ASKED): a refused query
+/// explains itself only after one.
+pub static CABLE_ASKED: AtomicBool = AtomicBool::new(false);
+/// The ask waits for the 5 V contract it requested first (kws-x1's
+/// Selection::after_5v — the engine only inspects from fixed 5 V).
+static CABLE_AFTER_5V: AtomicBool = AtomicBool::new(false);
+/// When the waiting 5 V contract was first seen, ms (kws-x1's
+/// five_volts_since; FIVE_VOLT_SETTLE_MS = 300).
+static CABLE_5V_MS: AtomicU32 = AtomicU32::new(0);
+/// An inspection window the closure armed (identity or modes): BUSY stays
+/// up until the engine reports it done, so the ~230 ms SPI draws cannot
+/// stall the SOP' exchanges (the r160/r176 answer-window rule — the
+/// inspection is one long answer window).
+static CABLE_WINDOW: AtomicBool = AtomicBool::new(false);
+/// The cable page's section on view (0 = not browsing, else section+1):
+/// the closure requests the MODES read of the SVID the user scrolled to
+/// (kws-x1's control_cable_selection driven by detail_page()).
+pub static CABLE_SECTION: AtomicU8 = AtomicU8::new(0);
+/// The mode cursor (kws-x1's Selection::mode_cursor), as index+1; 0 none.
+static CABLE_MODE_CURSOR: AtomicU8 = AtomicU8::new(0);
+/// The published cable page data (written at every publish — the
+/// inspection's breadcrumbs each fire one — read by draw_cable). A
+/// blocking-mutex RefCell (embassy 0.8's `lock` hands out `&T`, the
+/// RefCell carries the mutation — the CABLE_SVIDS shape); the critical
+/// section only covers the ~150-byte copy.
+pub static CABLE: embassy_sync::blocking_mutex::Mutex<
+    CriticalSectionRawMutex,
+    RefCell<CableData>,
+> = embassy_sync::blocking_mutex::Mutex::new(RefCell::new(CableData::EMPTY));
+
+/// The CABLE screen's ask (its browse-mode OK; kws-x1's long-OK).
+pub fn ask_cable() {
+    CABLE_ASKED.store(true, Ordering::Relaxed);
+    CABLE_ASK.store(true, Ordering::Relaxed);
+}
+
+/// The mode cursor's SVID — the page's selected alt mode (kws-x1's draw
+/// passes `svids.at(mode_cursor())`).
+pub fn cable_cursor_svid() -> Option<u16> {
+    let cursor = CABLE_MODE_CURSOR.load(Ordering::Relaxed);
+    (cursor != 0)
+        .then(|| CABLE_SVIDS.lock(|cell| cell.borrow().at(u16::from(cursor - 1))))
+        .flatten()
+}
+
+/// What the CABLE static publishes: a Copy snapshot of the observation's
+/// SOP' state, refreshed at every publish (the inspection's breadcrumbs
+/// each fire one). Lives here — not in cable_page — so the pdmin bin,
+/// which includes this file without the UI modules, still builds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CableData {
+    /// The last inspection's report (`None` while none has landed, or a
+    /// new one is running).
+    pub report: Option<pd_protocol::pd_cable::CableReport>,
+    /// The SVID/modes/extended discovery state beside the report.
+    pub modes: pd_protocol::pd_cable_modes::Discovery,
+    /// An inspection is running right now.
+    pub active: bool,
+    /// The observation carries an SPR section at all (kws-x1's
+    /// `let Some(spr) = observation.spr` — without one the page says
+    /// NO DISCOVERY YET whatever `asked` holds).
+    pub spr: bool,
+    /// OK asked for a cable read since boot (so a refusal can say why).
+    pub asked: bool,
+    /// The PD session ended in failure (kws-x1's `Phase::Failed` check).
+    pub failed: bool,
+    /// The peer's PD revision (3 = PD 3.0), as the observation records it.
+    pub peer_revision: Option<u8>,
+    /// The request the engine would send now (the safe-fixed-5V gate).
+    pub supply: pd_spr::Supply,
+    pub target_mv: u16,
+}
+
+impl CableData {
+    /// A state with no session data at all.
+    pub const EMPTY: Self = Self {
+        report: None,
+        modes: pd_protocol::pd_cable_modes::Discovery::EMPTY,
+        active: false,
+        spr: false,
+        asked: false,
+        failed: false,
+        peer_revision: None,
+        supply: pd_spr::Supply::Fixed,
+        target_mv: 0,
+    };
+    /// No live SPR observation (`spr` was `None` in the publish): the
+    /// page's NO DISCOVERY state, whatever an old report said.
+    pub fn no_session() -> Self {
+        Self {
+            peer_revision: None,
+            ..Self::EMPTY
+        }
+    }
 }
 /// r160: true for the whole diagnostic+session+restore span. The main
 /// loop freezes ALL screen draws, meter/accel reads and other SPI/I2C
@@ -336,6 +474,28 @@ fn publish(observation: Observation) {
     VIEW.tx_written
         .store(observation.spr.is_some_and(|spr| spr.tx_written), Ordering::Relaxed);
     VIEW.rx_error.store(observation.rx_error, Ordering::Relaxed);
+    // r238: the cable page's data — a live copy of the SOP' state so the
+    // screen follows the inspection's breadcrumb publishes (each mark
+    // fires one; the report lands at mark 28, the modes fill between
+    // marks 11..25).
+    CABLE.lock(|cell| {
+        *cell.borrow_mut() = match observation.spr {
+            Some(spr) => CableData {
+                report: spr.cable_report,
+                modes: spr.cable_modes,
+                active: spr.cable_active,
+                spr: true,
+                asked: CABLE_ASKED.load(Ordering::Relaxed),
+                failed: observation.phase == Phase::Failed,
+                peer_revision: spr.peer_revision,
+                supply: spr.supply,
+                target_mv: spr.target_mv,
+            },
+            // No SPR observation at all: the kws-x1 page's NO DISCOVERY
+            // state, whatever an old report said.
+            None => CableData::no_session(),
+        };
+    });
 }
 
 fn stop_requested() -> bool {
@@ -565,6 +725,18 @@ fn uncaptured_request(uncaptured: &mut Option<usize>, rdo: u32) -> pd_protocol::
     } else {
         Supply::Raw
     }
+}
+
+/// r233/r238 FIX: the passthrough task entry — main spawns THIS instead
+/// of run() when the boot-chosen setting is ON (the receive-only sniffer
+/// replaces the sink session). The dispatch was a casualty of the r233
+/// rebuild — sniff() existed but nothing called it, so a pass=ON boot
+/// still ran the sink session and the SNIFF screen waited forever;
+/// caught while wiring the r238 cable page (whose passthrough notice
+/// assumes the sink is off in that mode).
+#[embassy_executor::task]
+pub async fn sniff_task() {
+    sniff().await;
 }
 
 /// r233: the passthrough sniff loop (kws-x1's sniff()): the CC pull-downs
@@ -895,10 +1067,204 @@ pub async fn run() {
         // silently ignored. confirm() refuses after a Reject until fresh
         // caps — also logged.
         let control =
-            |_observation: &mut Observation, _store: Option<&dyn pd_protocol::pd_svids::Store>| {
+            |observation: &mut Observation, store: Option<&dyn pd_protocol::pd_svids::Store>| {
                 use pd_protocol::pd_spr::Supply;
+                // r238: the cable inspection window CLOSED — the engine
+                // finished (or refused) its SOP' work. BUSY reopens the
+                // draws here (the r176 outcome side; publish() cannot own
+                // this: between arm and start the trace still carries the
+                // PREVIOUS report, and the CC2-refused inspection returns
+                // without a closing publish). Exactly one close per armed
+                // window, so this is also where the outcome logs.
+                if CABLE_WINDOW.load(Ordering::Relaxed)
+                    && !selection.cable_active()
+                    && !selection.has_pending()
+                {
+                    CABLE_WINDOW.store(false, Ordering::Relaxed);
+                    BUSY.store(false, Ordering::Relaxed);
+                    // 0 Identity, 1 Nak, 2 Busy, 3 Timeout, 4 Deferred.
+                    let (status, count, rev) = observation
+                        .spr
+                        .and_then(|spr| spr.cable_report)
+                        .map_or((9u32, 0u32, 0u32), |report| {
+                            (
+                                match report.status {
+                                    pd_protocol::pd_cable::CableStatus::Identity => 0,
+                                    pd_protocol::pd_cable::CableStatus::Nak => 1,
+                                    pd_protocol::pd_cable::CableStatus::Busy => 2,
+                                    pd_protocol::pd_cable::CableStatus::Timeout => 3,
+                                    pd_protocol::pd_cable::CableStatus::Deferred => 4,
+                                },
+                                u32::from(report.count),
+                                u32::from(report.revision),
+                            )
+                        });
+                    let mut d = [0u8; 40];
+                    let mut n = 0;
+                    for &b in b"[cable] report s=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = crate::push_dec(&mut d, n, status);
+                    for &b in b" n=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = crate::push_dec(&mut d, n, count);
+                    for &b in b" rev=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = crate::push_dec(&mut d, n, rev);
+                    for &b in b"\r\n" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    crate::pd_log(&d[..n]);
+                }
                 if selection.has_pending() || selection.request_in_flight() {
                     return; // a latched COMMIT waits for the next idle poll
+                }
+                // r238: the CABLE screen's ask (kws-x1's long-OK →
+                // query_at_5v). The engine only inspects from a PD 3.0
+                // fixed-5V Ready (Selection::request_cable's own gate), so
+                // a contract on another voltage first re-requests 5 V and
+                // the query waits for it; a PD 2.0 peer never drops the
+                // contract for a query that cannot follow (kws-x1's
+                // `!pd3` drop).
+                let pd3 = observation
+                    .spr
+                    .and_then(|spr| spr.peer_revision)
+                    == Some(3);
+                if CABLE_ASK.swap(false, Ordering::Relaxed) {
+                    if !pd3 {
+                        crate::pd_log(b"[cable] ask: needs PD3.0\r\n");
+                    } else if selection.request_cable() {
+                        CABLE_WINDOW.store(true, Ordering::Relaxed);
+                        BUSY.store(true, Ordering::Relaxed);
+                        crate::pd_log(b"[cable] ask armed\r\n");
+                    } else {
+                        // Not at fixed 5 V: request 5 V first, the query
+                        // follows once it has held (kws-x1's after_5v).
+                        let five = (0..selection.option_count())
+                            .filter_map(|index| selection.option(index))
+                            .find(|option| {
+                                matches!(option.supply, Supply::Fixed) && option.mv == 5_000
+                            });
+                        if five.is_some_and(|five| selection.preview(five) && selection.confirm())
+                        {
+                            // The 5 V exchange window (the existing PS_RDY
+                            // publish reopens BUSY when it lands; the
+                            // resume below re-arms it for the read).
+                            BUSY.store(true, Ordering::Relaxed);
+                            CABLE_AFTER_5V.store(true, Ordering::Relaxed);
+                            crate::pd_log(b"[cable] ask: 5V first\r\n");
+                        } else {
+                            crate::pd_log(b"[cable] ask: no 5V contract\r\n");
+                        }
+                    }
+                }
+                // The waiting query fires once its 5 V contract has held
+                // for kws-x1's FIVE_VOLT_SETTLE_MS (their resume_5v_query;
+                // selection.now_ms() is the engine's own clock).
+                if CABLE_AFTER_5V.load(Ordering::Relaxed) {
+                    let at_5v = selection
+                        .established_target()
+                        .is_some_and(|target| target.mv == 5_000 && matches!(target.supply, Supply::Fixed));
+                    if !at_5v {
+                        CABLE_5V_MS.store(0, Ordering::Relaxed);
+                    } else {
+                        let now = selection.now_ms().min(u64::from(u32::MAX)) as u32;
+                        // The FIRST sighting latches (kws-x1's
+                        // `unwrap_or(now)`); a sliding timestamp would
+                        // never reach the settle.
+                        let since = match CABLE_5V_MS.compare_exchange(
+                            0,
+                            now,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => now,
+                            Err(previous) => previous,
+                        };
+                        if now.saturating_sub(since) >= 300 && selection.request_cable() {
+                            CABLE_AFTER_5V.store(false, Ordering::Relaxed);
+                            CABLE_5V_MS.store(0, Ordering::Relaxed);
+                            CABLE_WINDOW.store(true, Ordering::Relaxed);
+                            BUSY.store(true, Ordering::Relaxed);
+                            crate::pd_log(b"[cable] ask armed at 5V\r\n");
+                        }
+                    }
+                }
+                // r238: the SVID whose MODES section is on view gets its
+                // Discover Modes read (kws-x1's control_cable_selection,
+                // driven there by their detail page's section).
+                if pd3
+                    && !selection.cable_active()
+                    && !selection.has_pending()
+                    && observation
+                        .spr
+                        .is_some_and(|spr| {
+                            spr.cable_modes.status == pd_protocol::pd_cable_modes::Status::Ack
+                        })
+                {
+                    let section = CABLE_SECTION.load(Ordering::Relaxed);
+                    let page = u32::from(section).saturating_sub(1);
+                    let data = observation.spr.map(|spr| CableData {
+                        report: spr.cable_report,
+                        modes: spr.cable_modes,
+                        active: spr.cable_active,
+                        spr: true,
+                        asked: false,
+                        failed: false,
+                        peer_revision: spr.peer_revision,
+                        supply: spr.supply,
+                        target_mv: spr.target_mv,
+                    });
+                    let index = data
+                        .as_ref()
+                        .and_then(|data| crate::cable_page::svid_index(data, page));
+                    if let Some(index) = index {
+                        let cursor = index.saturating_add(1).min(255) as u8;
+                        if CABLE_MODE_CURSOR.load(Ordering::Relaxed) != cursor {
+                            let svid = store.and_then(|store| store.at(index));
+                            let current = observation
+                                .spr
+                                .map(|spr| spr.cable_modes.mode.svid)
+                                .unwrap_or(0);
+                            if svid == Some(current) && current != 0 {
+                                CABLE_MODE_CURSOR.store(cursor, Ordering::Relaxed);
+                            } else if svid.is_some_and(|svid| selection.request_cable_mode(svid)) {
+                                // request_cable_mode armed it; svid is
+                                // Some (the predicate only ran then).
+                                let svid = svid.unwrap_or_default();
+                                CABLE_MODE_CURSOR.store(cursor, Ordering::Relaxed);
+                                CABLE_WINDOW.store(true, Ordering::Relaxed);
+                                BUSY.store(true, Ordering::Relaxed);
+                                if let Some(spr) = observation.spr.as_mut() {
+                                    spr.cable_modes.mode = pd_protocol::pd_cable_modes::Modes {
+                                        svid,
+                                        ..Default::default()
+                                    };
+                                }
+                                let mut d = [0u8; 32];
+                                let mut n = 0;
+                                for &b in b"[cable] mode svid=" {
+                                    d[n] = b;
+                                    n += 1;
+                                }
+                                for shift in [12u16, 8, 4, 0] {
+                                    d[n] = b"0123456789ABCDEF"[((svid >> shift) & 15) as usize];
+                                    n += 1;
+                                }
+                                for &b in b"\r\n" {
+                                    d[n] = b;
+                                    n += 1;
+                                }
+                                crate::pd_log(&d[..n]);
+                            }
+                        }
+                    }
                 }
                 let established = selection.established_target();
                 let commit = COMMIT.swap(false, Ordering::Relaxed);
@@ -990,12 +1356,18 @@ pub async fn run() {
             // r149: the arming callback above (was None — the engine
             // never transmitted without it).
             control: Some(&control),
-            identity_started: None,
+            // r238: a fresh identity inspection invalidates the mode
+            // cursor (kws-x1's identity_started → set_mode_cursor(None)).
+            identity_started: Some(&|| {
+                CABLE_MODE_CURSOR.store(0, Ordering::Relaxed);
+            }),
             publish: Some(&publish),
             trace_steps: true,
-            trace_cable: false,
+            // r238: the cable breadcrumbs too (each mark publishes the
+            // live SOP' state — the CABLE screen follows the read).
+            trace_cable: true,
             stop_requested: Some(stop_requested),
-            svids: None,
+            svids: Some(&CABLE_SVID_STORE),
             emarker: false,
         };
         let mut bus = SharedBus;
@@ -1045,6 +1417,17 @@ pub async fn run() {
         pd_protocol::pd_spr::DEBUG_REQ_OK.store(0, Ordering::Relaxed);
         pd_protocol::pd_spr::DEBUG_REQ_MV.store(0, Ordering::Relaxed);
         pd_protocol::pd_spr::DEBUG_STAGE.store(0, Ordering::Relaxed);
+                // r238: a stale after-5V wait or inspection window dies with
+                // the session that armed it (the attempt-end BUSY clear
+                // already reopened the draws). The ASK itself stays
+                // latched — a deliberate deviation from kws-x1, which
+                // drains its PD_COMMANDS queue at session start: fnb58's
+                // ask can arrive while no session runs (main.rs may arm a
+                // restart for it), and the fresh session's control closure
+                // consumes it once the PD 3.0 verdict is known.
+                CABLE_AFTER_5V.store(false, Ordering::Relaxed);
+                CABLE_5V_MS.store(0, Ordering::Relaxed);
+                CABLE_WINDOW.store(false, Ordering::Relaxed);
         if restart_requested() && error.is_none() {
             // r147: a restart press never runs the engine — kws-x1's
             // restart shape (Session::start, then the Hard Reset at once).

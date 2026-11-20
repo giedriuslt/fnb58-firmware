@@ -22,6 +22,8 @@
 mod board;
 mod adc;
 mod backlight;
+mod cable_page;
+mod cable_summary;
 mod console;
 mod dac;
 mod afc_phy;
@@ -397,7 +399,16 @@ async fn main(spawner: Spawner) {
             let mut guard = pd_task::BUS.lock().await;
             *guard = pd_task::BusCell(i2c.ok());
         }
-        spawner.spawn(pd_task::run().expect("one pd task"));
+        // r233/r238 FIX: the boot-chosen passthrough spawns the receive-
+        // only SNIFFER instead of the sink session (the r226 settings
+        // row's own contract). The dispatch was lost in the r233 rebuild
+        // — sniff() was dead code and a pass=ON boot still negotiated;
+        // caught while wiring the r238 cable page.
+        if settings::passthrough() {
+            spawner.spawn(pd_task::sniff_task().expect("one pd sniffer task"));
+        } else {
+            spawner.spawn(pd_task::run().expect("one pd task"));
+        }
         // r189: the QC2.0 trigger task — DAC drive + ADC verify on the
         // traced data-line front end (board.rs).
         spawner.spawn(qc_task::run().expect("one qc task"));
@@ -855,6 +866,14 @@ async fn main(spawner: Spawner) {
             ui.draw_sniff(&mut lcd).await;
         }
 
+        // r238: the CABLE screen — same gate, and it MATTERS here: the
+        // BUSY flag is up for the whole SOP' inspection window (the
+        // control closure arms it), so a ~230 ms draw can never stall
+        // the e-marker exchanges (the r160/r176 answer-window rule).
+        if ui.screen == Screen::Cable && !pd_task::BUSY.load(Ordering::Relaxed) {
+            ui.draw_cable(&mut lcd).await;
+        }
+
         // r189: the QC screen draws under the same BUSY gate (the QC
         // task's own blocking work is microseconds-scale ADC reads).
         if ui.screen == Screen::Qc && !pd_task::BUSY.load(Ordering::Relaxed) {
@@ -959,6 +978,7 @@ async fn main(spawner: Spawner) {
                     Screen::Graph => ui.draw_graph(&mut lcd, &power_history).await,
                     Screen::Pd => ui.draw_pd(&mut lcd, &pd_task::VIEW).await,
                     Screen::Sniff => ui.draw_sniff(&mut lcd).await,
+                    Screen::Cable => ui.draw_cable(&mut lcd).await,
                     Screen::Profiles => ui.draw_profiles(&mut lcd).await,
                     Screen::Qc => ui.draw_qc(&mut lcd).await,
                     Screen::Qc3 => ui.draw_qc3(&mut lcd).await,
@@ -1343,6 +1363,54 @@ async fn main(spawner: Spawner) {
                         n2 += 1;
                     }
                     sender.push(&d[..n2]);
+                }
+                Press::CablePage(dir) => {
+                    // r238: the cable page's section flip. The
+                    // section-on-view marker feeds the control closure's
+                    // scroll-driven MODES read (kws-x1's
+                    // control_cable_selection, armed on its next pass).
+                    let data = pd_task::CABLE.lock(|cell| *cell.borrow());
+                    let sections = crate::cable_page::sections(&data).max(1);
+                    ui.cable_page = ((ui.cable_page as i16 + dir).rem_euclid(sections as i16))
+                        as u16;
+                    pd_task::CABLE_SECTION.store(
+                        ui.cable_page.min(254) as u8 + 1,
+                        Ordering::Relaxed,
+                    );
+                    ui.cable_ident = None; // force redraw
+                    let mut d = [0u8; 24];
+                    let mut n = 0;
+                    for &b in b"[cable] page " {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = push_dec(&mut d, n, u32::from(ui.cable_page) + 1);
+                    for &b in b"/" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = push_dec(&mut d, n, u32::from(sections));
+                    for &b in b"\r\n" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    sender.push(&d[..n]);
+                }
+                Press::CableAsk => {
+                    // r238: the cable read's ask (kws-x1's long-OK).
+                    // Without a live session, start one (the profiles-OK
+                    // precedent): the latched ask survives the session
+                    // start (pd_task's documented r238 deviation from
+                    // kws-x1's drained PD_COMMANDS) and the fresh
+                    // session's control closure consumes it once the
+                    // PD 3.0 verdict is known.
+                    pd_task::ask_cable();
+                    if pd_task::SESSION_ACTIVE.load(Ordering::Relaxed) {
+                        sender.push(b"[cable] ask\r\n");
+                    } else {
+                        sender.push(b"[cable] ask: session start\r\n");
+                        pd_task::request_restart();
+                    }
                 }
                 Press::Voltage(dir) => {
                     // r171: the PPS screen's voltage selection. r189/r196:

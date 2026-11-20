@@ -42,6 +42,11 @@ pub enum Screen {
     /// advertised fixed PDOs as a selector; OK requests the previewed
     /// profile through the r173 PD-native re-request).
     Profiles,
+    /// r238: the CABLE screen (kws-x1's Detail::Cable page): the
+    /// e-marker's identity summary, raw VDOs, SVID modes, maker info and
+    /// statuses, in sections browsed OK-gated; the browse mode's OK asks
+    /// (kws-x1's long-OK → SOP' discovery at fixed 5 V).
+    Cable,
     /// r189: the QC2.0 trigger screen (targets 5/9/12/20 V, OK = REQ).
     Qc,
     /// r196: the QC3.0 continuous screen (target in mV, 200 mV steps).
@@ -60,7 +65,7 @@ pub enum Screen {
 }
 
 /// The screen cycle order (LEFT/RIGHT walk it in both directions).
-const SCREEN_CYCLE: [Screen; 13] = [
+const SCREEN_CYCLE: [Screen; 14] = [
     Screen::Power,
     Screen::Graph,
     Screen::Lines,
@@ -68,6 +73,7 @@ const SCREEN_CYCLE: [Screen; 13] = [
     Screen::Pd,
     Screen::Sniff,
     Screen::Profiles,
+    Screen::Cable,
     Screen::Qc,
     Screen::Qc3,
     Screen::Afc,
@@ -121,6 +127,11 @@ pub enum Press {
     /// r235: the PPS page's focused value (volts, or amps).
     PpsVolts(i16),
     PpsAmps(i16),
+    /// r238: the cable page's section flip (browsing mode).
+    CablePage(i16),
+    /// r238: the cable page's ask — the browse mode's OK (kws-x1's
+    /// long-OK → the SOP' e-marker discovery).
+    CableAsk,
 }
 
 /// r199: what LEFT/RIGHT adjust on the open ripple screen, in OK's order
@@ -291,6 +302,13 @@ pub struct Ui {
     pub profiles_drawn: (bool, usize, usize, u16),
     /// r233: the sniff body's identity (the message count).
     sniff_drawn: u16,
+    /// r238: the cable page — the browse mode (OK-gated sections, the
+    /// r222 directive), the section on view, and the two draw gates (the
+    /// static passthrough notice; the live state tuple).
+    pub cable_browse: bool,
+    pub cable_page: u16,
+    cable_notice: bool,
+    pub cable_ident: Option<(crate::pd_task::CableData, bool, u32, Option<u16>)>,
     /// r227: the graph screen's state (kws-x1 Input's graph fields —
     /// the trace/window are view prefs that persist; the focus closes
     /// on leaving, like the ripple's).
@@ -533,6 +551,10 @@ impl Ui {
             profiles_sel: 0,
             profiles_drawn: (true, usize::MAX, 0, 0),
             sniff_drawn: u16::MAX,
+            cable_browse: false,
+            cable_page: 0,
+            cable_notice: false,
+            cable_ident: None,
             graph_focus: None,
             graph_trace: settings_core::power_history::GraphTrace::default(),
             graph_window: settings_core::power_history::GraphWindow::default(),
@@ -696,6 +718,35 @@ impl Ui {
                 }
                 buttons::LEFT | buttons::RIGHT if self.profiles_edit => {
                     return Press::Profile(if i == buttons::RIGHT { 1 } else { -1 });
+                }
+                _ => {}
+            }
+        }
+        // r238: the cable page (kws-x1's Detail::Cable): OK enters the
+        // section browser (the r222 OK-gate — LEFT/RIGHT navigate
+        // screens unfocused), inside it LEFT/RIGHT flip sections, OK asks
+        // for the SOP' read (kws-x1's long-OK; the browse-OK here), BACK
+        // steps out.
+        if self.screen == Screen::Cable {
+            match i {
+                buttons::OK => {
+                    if self.cable_browse {
+                        return Press::CableAsk;
+                    }
+                    self.cable_browse = true;
+                    self.cable_page = 0;
+                    // Section 0 (+1) is on view (the closure's
+                    // scroll-driven MODES read keys on this marker).
+                    crate::pd_task::CABLE_SECTION.store(1, core::sync::atomic::Ordering::Relaxed);
+                    return Press::Hint;
+                }
+                buttons::BACK if self.cable_browse => {
+                    self.cable_browse = false;
+                    crate::pd_task::CABLE_SECTION.store(0, core::sync::atomic::Ordering::Relaxed);
+                    return Press::Hint;
+                }
+                buttons::LEFT | buttons::RIGHT if self.cable_browse => {
+                    return Press::CablePage(if i == buttons::RIGHT { 1 } else { -1 });
                 }
                 _ => {}
             }
@@ -870,6 +921,9 @@ impl Ui {
         // the message list re-arm on a forced repaint).
         self.profiles_drawn = (true, usize::MAX, 0, 0);
         self.sniff_drawn = u16::MAX;
+        // r238: the cable page's two gates too.
+        self.cable_notice = false;
+        self.cable_ident = None;
     }
 
     /// r230c: the per-screen header, uniform across all screens —
@@ -887,6 +941,7 @@ impl Ui {
             Screen::Pd => (b"PPS", CYAN),
             Screen::Sniff => (b"PD SNIFF", GREEN),
             Screen::Profiles => (b"PD PROFILES", GREEN),
+            Screen::Cable => (b"CABLE", GREEN),
             Screen::Qc => (b"QC 2.0", ORANGE),
             Screen::Qc3 => (b"QC 3.0", ORANGE),
             Screen::Afc => (b"AFC", CYAN),
@@ -933,6 +988,13 @@ impl Ui {
         // editing flag is page state).
         if screen != Screen::Profiles {
             self.profiles_edit = false;
+        }
+        // r238: the cable browse mode closes on leaving (the profiles
+        // precedent), and the section-on-view marker goes with it (the
+        // control closure's scroll-driven MODES read keys on it).
+        if screen != Screen::Cable {
+            self.cable_browse = false;
+            crate::pd_task::CABLE_SECTION.store(0, core::sync::atomic::Ordering::Relaxed);
         }
         // r235: the PPS page opens unfocused, seeded from the first
         // advertised range (min voltage / max current, floored at the
@@ -998,6 +1060,11 @@ impl Ui {
             // "< > choose OK request BACK cancel").
             Screen::Profiles if self.profiles_edit => b"LR:SEL OK:REQ BK:X",
             Screen::Profiles => b"OK:SEL",
+            // r238: the cable page's browse mode (kws-x1's long-OK ask
+            // is the browse OK — fnb58 has no long-press, the r226
+            // energy-reset precedent).
+            Screen::Cable if self.cable_browse => b"LR:PAGE OK:ASK BK:X",
+            Screen::Cable => b"OK:SECTIONS",
             // r233: the sniff screen's scroll hint.
             Screen::Sniff => b"OK:SCROLL",
             // r227: the graph's focus model (kws-x1's hints; no hold-OK
@@ -2296,6 +2363,69 @@ impl Ui {
         self.draw_hint(lcd).await;
     }
 
+
+    /// r238: the CABLE screen — kws-x1's Detail::Cable page: the
+    /// e-marker's readable summary, raw identity VDOs, the SVID set and
+    /// the selected SVID's modes, maker info and both cable statuses,
+    /// one section per view (their 8-row pages at scale 1 here, 30
+    /// columns = 180 px). The browse mode flips sections; its OK asks
+    /// for the SOP' read. Redraws when the published state tuple moves
+    /// (the inspection's breadcrumb publishes each change the data).
+    pub async fn draw_cable(&mut self, lcd: &mut Lcd) {
+        use core::sync::atomic::Ordering;
+        if crate::settings::passthrough() {
+            // kws-x1 HIDES the sink pages in passthrough (the meter never
+            // negotiates; the r233 profiles notice).
+            if !self.cable_notice {
+                self.cable_notice = true;
+                self.cable_ident = None;
+                lcd.fill_window(0, 32, 319, 210, BLACK).await;
+                text(lcd, 76, 100, b"PASSTHROUGH: SINK OFF", 2, GRAY).await;
+                text(lcd, 100, 130, b"SET: PD PASS OFF", 1, GRAY).await;
+                self.draw_hint(lcd).await;
+            }
+            return;
+        }
+        let data = crate::pd_task::CABLE.lock(|cell| *cell.borrow());
+        let sections = crate::cable_page::sections(&data).max(1);
+        let page = if self.cable_browse {
+            u32::from(self.cable_page).min(sections - 1)
+        } else {
+            0
+        };
+        let svid = crate::pd_task::cable_cursor_svid();
+        let ident = (data, self.cable_browse, page, svid);
+        if self.cable_ident == Some(ident) {
+            return;
+        }
+        self.cable_ident = Some(ident);
+        lcd.fill_window(0, 32, 319, 210, BLACK).await;
+        if self.cable_browse {
+            // The editing frame (the profiles selector's yellow outline).
+            lcd.rounded_outline(2, 34, 317, 168, 5, YELLOW).await;
+        }
+        let rows = crate::cable_page::lines(
+            &data,
+            page,
+            svid,
+            &crate::pd_task::CABLE_SVID_STORE,
+        );
+        for (i, row) in rows.iter().enumerate() {
+            let color = if i == 0 { GREEN } else { WHITE };
+            // The heading in the screen's accent; 17 px rows like the
+            // sniff list.
+            lcd.draw_text(10, 40 + i as u16 * 17, row, 1, color, BLACK)
+                .await;
+        }
+        // The section position, kws-x1's page dots as a count.
+        let mut l = Line12::new();
+        l.num_u32(u32::from(page) + 1, 0);
+        l.push(b"/");
+        l.num_u32(u32::from(sections), 0);
+        let x = 300 - l.len as u16 * 6;
+        lcd.draw_text(x, 190, l.bytes(), 1, GRAY, BLACK).await;
+        self.draw_hint(lcd).await;
+    }
 
     /// r233: the PD SNIFF screen — kws-x1's PD Sniff: the head line
     /// (the CC pin, the charger's Rp advertisement and the message

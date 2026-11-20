@@ -423,10 +423,12 @@ impl Lcd {
         self.capture_char(x, y, scale, fg, bg, ch);
         // r189: Q and X appended (the QC screen title + the BK:EX hint);
         // r199: k s d i v p ~ appended (the ripple screen's kHz / us /
-        // div / p-p / nominal-timebase labels); the blank fallback stays
-        // at index 11 — append only at the end.
-        const FONT_CHARS: &[u8] = b"0123456789. VAWmu-PSCDBEFGHIKLMNORTUY:/QXksdivp~<>+h";
-        static FONT_5X7: [[u8; 5]; 52] = [
+        // div / p-p / nominal-timebase labels); r238: b ? , _ appended
+        // (the cable page's Gbps / "A ?" / "YES, ACTIVE" / GET_STATUS
+        // strings); the blank fallback stays at index 11 — append only
+        // at the end.
+        const FONT_CHARS: &[u8] = b"0123456789. VAWmu-PSCDBEFGHIKLMNORTUY:/QXksdivp~<>+hb?,_";
+        static FONT_5X7: [[u8; 5]; 56] = [
             [0x3E, 0x51, 0x49, 0x45, 0x3E], // 0
             [0x00, 0x42, 0x7F, 0x40, 0x00], // 1
             [0x62, 0x51, 0x49, 0x49, 0x46], // 2
@@ -479,6 +481,10 @@ impl Lcd {
             [0x00, 0x00, 0x22, 0x14, 0x08], // > (r224)
             [0x08, 0x08, 0x3E, 0x08, 0x08], // + (r225, the D+ card label)
             [0x7C, 0x04, 0x04, 0x78, 0x00], // h (r226, the Ah/Wh units)
+            [0x7E, 0x48, 0x48, 0x78, 0x30], // b (r238, the cable page's Gbps)
+            [0x02, 0x01, 0x51, 0x09, 0x06], // ? (r238, the reserved-rating mark)
+            [0x00, 0x40, 0x20, 0x00, 0x00], // , (r238, "YES, ACTIVE")
+            [0x40, 0x40, 0x40, 0x40, 0x40], // _ (r238, "PD2 NO GET_STATUS")
         ];
         let idx = FONT_CHARS
             .iter()
