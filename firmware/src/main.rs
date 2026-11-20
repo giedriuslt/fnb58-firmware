@@ -34,6 +34,7 @@ mod ripple;
 mod settings;
 mod buttons;
 mod buzzer;
+mod rec;
 mod flash;
 mod kxtj3;
 mod lcd;
@@ -65,7 +66,7 @@ static NEXT_SCREEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
 /// before the host opens the port).
-const BUILD: &[u8] = b"r237";
+const BUILD: &[u8] = b"r239";
 
 use crate::ui::Press;
 use crate::ui::Screen;
@@ -235,7 +236,7 @@ async fn main(spawner: Spawner) {
         let mut cmd = [0u8; 64];
         let mut ticker = embassy_time::Ticker::every(Duration::from_millis(10));
         // First paint: the mode is on screen before the host connects.
-        lcd.draw_text(8, 224, b"r237 PC LINK\0", 1, 0x7BEF, 0x0000).await;
+        lcd.draw_text(8, 224, b"r239 PC LINK\0", 1, 0x7BEF, 0x0000).await;
         loop {
             ticker.next().await;
             // One meter sample into the next report slot, through the
@@ -320,7 +321,7 @@ async fn main(spawner: Spawner) {
                 ui.draw_power(&mut lcd, mv, ua, mw).await;
                 let mut line = [b' '; 32];
                 let mut w = 0;
-                for &b in b"r237 " {
+                for &b in b"r239 " {
                     line[w] = b;
                     w += 1;
                 }
@@ -436,7 +437,7 @@ async fn main(spawner: Spawner) {
     fn say(msg: &[u8]) {
         boot_log().push(msg);
     }
-    say(b"[lcd] FNB58 r237: claim from sector 0\r\n");
+    say(b"[lcd] FNB58 r239: claim from sector 0\r\n");
 
     // (The C glue's I2C health check is gone with the vendor i2c code;
     // the Rust meter's mfr read below proves the bus the same way.)
@@ -464,6 +465,9 @@ async fn main(spawner: Spawner) {
     // checkpoint read-only, and start the tracker from it (kws-x1
     // main.rs:1052). The journal keeps only cursor state; the flash is
     // passed per save.
+    // r239: the offline recorder's boot recovery — reads the rec meta,
+    // scans the write cursor, auto-resumes an interrupted log.
+    rec::recover(&mut flash);
     let mut energy_journal = match settings::prepare_energy(&mut flash) {
         settings_core::energy_store::Preparation::Ready => {
             say(b"[en] pair ready
@@ -484,6 +488,9 @@ async fn main(spawner: Spawner) {
     );
     let mut energy_save_ok = energy_journal.is_some();
     let mut next_energy_save: Option<u64> = None;
+    // r239: the recorder's next-due instant (the meter block's cadence
+    // drives it; None = not recording).
+    let mut next_rec_at: Option<u64> = None;
     // r227: the graph's per-second history (RAM only, kws-x1
     // main.rs:1084 — no flash wear, a restart clears it).
     let mut power_history = settings_core::power_history::History::default();
@@ -874,6 +881,19 @@ async fn main(spawner: Spawner) {
             ui.draw_cable(&mut lcd).await;
         }
 
+        // r239: the REC screen — same gate; CLEAR's per-tick sector
+        // erase also runs here, off a PD exchange (one erase per loop
+        // tick keeps the UI live; a 60-400 ms erase must never land
+        // inside an answer window).
+        if rec::state() == rec::CLEARING
+            && !pd_task::BUSY.load(Ordering::Relaxed)
+        {
+            rec::clear_step(&mut flash);
+        }
+        if ui.screen == Screen::Rec && !pd_task::BUSY.load(Ordering::Relaxed) {
+            ui.draw_rec(&mut lcd).await;
+        }
+
         // r189: the QC screen draws under the same BUSY gate (the QC
         // task's own blocking work is microseconds-scale ADC reads).
         if ui.screen == Screen::Qc && !pd_task::BUSY.load(Ordering::Relaxed) {
@@ -978,6 +998,7 @@ async fn main(spawner: Spawner) {
                     Screen::Graph => ui.draw_graph(&mut lcd, &power_history).await,
                     Screen::Pd => ui.draw_pd(&mut lcd, &pd_task::VIEW).await,
                     Screen::Sniff => ui.draw_sniff(&mut lcd).await,
+                    Screen::Rec => ui.draw_rec(&mut lcd).await,
                     Screen::Cable => ui.draw_cable(&mut lcd).await,
                     Screen::Profiles => ui.draw_profiles(&mut lcd).await,
                     Screen::Qc => ui.draw_qc(&mut lcd).await,
@@ -1124,6 +1145,7 @@ async fn main(spawner: Spawner) {
                             minutes,
                             ui.set_energy,
                             ui.set_passthrough,
+                            ui.set_rec,
                             settings::applied(),
                         );
                         ui.set_mode = SetMode::Row;
@@ -1227,6 +1249,7 @@ async fn main(spawner: Spawner) {
                             settings::DIM_MINUTES.load(Ordering::Relaxed),
                             settings::ENERGY_IDX.load(Ordering::Relaxed),
                             settings::PASSTHROUGH.load(Ordering::Relaxed),
+                            settings::REC_IDX.load(Ordering::Relaxed),
                             cal,
                         );
                         ui.enter(&mut lcd, Screen::Settings).await;
@@ -1275,7 +1298,7 @@ async fn main(spawner: Spawner) {
                 }
                 Press::SetRow(dir) => {
                     // r226: the settings page's row cursor.
-                    ui.set_row = ((ui.set_row as i16 + dir).rem_euclid(3)) as usize;
+                    ui.set_row = ((ui.set_row as i16 + dir).rem_euclid(4)) as usize;
                     ui.set_drawn = -1;
                     let mut d = [0u8; 24];
                     let mut n = 0;
@@ -1412,11 +1435,122 @@ async fn main(spawner: Spawner) {
                         pd_task::request_restart();
                     }
                 }
+                Press::RecSel(dir) => {
+                    // r239: the REC menu's cursor (wraps the state's
+                    // action list).
+                    let len = rec::menu(rec::state()).len() as i16;
+                    ui.rec_sel =
+                        ((ui.rec_sel as i16 + dir).rem_euclid(len.max(1))) as usize;
+                    ui.rec_ident = (0xFF, 0, false, 0, 0, 0); // force redraw
+                    let mut d = [0u8; 24];
+                    let mut n = 0;
+                    for &b in b"[rec] sel=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = push_dec(&mut d, n, ui.rec_sel as u32);
+                    for &b in b"\r\n" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    sender.push(&d[..n]);
+                }
+                Press::RecRun(sel) => {
+                    // r239: execute the highlighted action. Every
+                    // outcome logs; the menu closes so the state view
+                    // shows the result (CLEAR hands the screen to the
+                    // CLEARING progress until the step loop finishes).
+                    let state = rec::state();
+                    let item = rec::menu(state).get(sel).copied().unwrap_or(b"");
+                    match (state, item) {
+                        (rec::NO_LOG, b"START") => {
+                            let seconds = settings::REC_INTERVALS
+                                .get(settings::REC_IDX.load(Ordering::Relaxed))
+                                .copied()
+                                .unwrap_or(1);
+                            match rec::start(&mut flash, seconds.min(255) as u8) {
+                                Ok(()) => {
+                                    let mut d = [0u8; 32];
+                                    let mut n = 0;
+                                    for &b in b"[rec] start int=" {
+                                        d[n] = b;
+                                        n += 1;
+                                    }
+                                    n = push_dec(&mut d, n, seconds);
+                                    for &b in b"s\r\n" {
+                                        d[n] = b;
+                                        n += 1;
+                                    }
+                                    sender.push(&d[..n]);
+                                }
+                                Err(()) => sender.push(b"[rec] start FAIL\r\n"),
+                            }
+                        }
+                        (rec::RUNNING, b"STOP") => match rec::stop(&mut flash) {
+                            Ok(()) => sender.push(b"[rec] stop\r\n"),
+                            Err(()) => sender.push(b"[rec] stop FAIL\r\n"),
+                        },
+                        (rec::STOPPED, b"RESUME") => {
+                            match rec::resume(&mut flash) {
+                                Ok(()) => {
+                                    let mut d = [0u8; 32];
+                                    let mut n = 0;
+                                    for &b in b"[rec] resume int=" {
+                                        d[n] = b;
+                                        n += 1;
+                                    }
+                                    n = push_dec(&mut d, n, rec::interval());
+                                    for &b in b"s\r\n" {
+                                        d[n] = b;
+                                        n += 1;
+                                    }
+                                    sender.push(&d[..n]);
+                                }
+                                Err(()) => sender.push(b"[rec] resume FAIL\r\n"),
+                            }
+                        }
+                        (_, b"CLEAR")
+                            if state == rec::RUNNING || state == rec::STOPPED =>
+                        {
+                            rec::clear_begin(&mut flash);
+                        }
+                        _ => sender.push(b"[rec] ERR state changed\r\n"),
+                    }
+                    ui.rec_menu = false;
+                    ui.rec_ident = (0xFF, 0, false, 0, 0, 0); // force redraw
+                }
                 Press::Voltage(dir) => {
                     // r171: the PPS screen's voltage selection. r189/r196:
                     // the QC screens cycle their own targets. r226: the
                     // settings page's Edit mode changes the CURSOR row's
                     // value (dim, or the energy checkpoint interval).
+                    if ui.screen == Screen::Settings && ui.set_row == 3 {
+                        // r239: the REC INT row cycles the interval
+                        // index (1-2-3-5-10-20-30-60 s; a fresh
+                        // recording takes this value).
+                        let len = settings::REC_INTERVALS.len() as i16;
+                        ui.set_rec =
+                            ((ui.set_rec as i16 + dir).rem_euclid(len)) as usize;
+                        ui.set_drawn = -1;
+                        let seconds = settings::REC_INTERVALS
+                            .get(ui.set_rec)
+                            .copied()
+                            .unwrap_or(1);
+                        let mut d = [0u8; 32];
+                        let mut n = 0;
+                        for &b in b"[set] rec int=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        n = push_dec(&mut d, n, seconds);
+                        for &b in b"s
+" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        sender.push(&d[..n]);
+                        continue;
+                    }
                     if ui.screen == Screen::Settings && ui.set_row == 2 {
                         // r233: the PD PASS row toggles (OFF <-> ON);
                         // the mode applies at the next boot (kws-x1's
@@ -1725,6 +1859,35 @@ async fn main(spawner: Spawner) {
                         }
                     } else {
                         next_energy_save = None;
+                    }
+                    // r239: the offline recorder's sample — one per the
+                    // log's interval, from the same calibrated reading
+                    // the screens show. Paused time stretches nothing
+                    // (no samples while stopped); the meter block's
+                    // !BUSY gate keeps the rollover sector erase off a
+                    // PD exchange.
+                    if rec::state() == rec::RUNNING {
+                        let due = match next_rec_at {
+                            None => {
+                                next_rec_at =
+                                    Some(now64 + u64::from(rec::interval()) * 1000);
+                                false
+                            }
+                            Some(t) => now64 >= t,
+                        };
+                        if due {
+                            rec::sample(
+                                &mut flash,
+                                mv.min(u16::MAX as u32) as u16,
+                                ua.unsigned_abs().min(u16::MAX as u32) as u16,
+                            );
+                            next_rec_at = Some(
+                                embassy_time::Instant::now().as_millis()
+                                    + u64::from(rec::interval()) * 1000,
+                            );
+                        }
+                    } else {
+                        next_rec_at = None;
                     }
                     // The RAW registers publish for the calibration
                     // screen (its rows calibrate at draw time, through
@@ -2043,15 +2206,13 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
             send_direct(b"[shot] armed\r\n");
         }
         // r225: arm one screen advance (consumed by the main loop's
-        // next tick — remote navigation for the screenshot workflow).
+        // next tick - remote navigation for the screenshot workflow).
         b'x' => {
             NEXT_SCREEN.store(true, Ordering::Relaxed);
             send_direct(b"[ui] advance armed\r\n");
         }
-        // r221: the applied calibration + the meter's raw state (the
-        // wizard's inputs) — hardware verification without navigating.
-        // r236: the caps/PPS evidence dump — the observation's count,
-        // every raw object slot and the PPS store's fields.
+        // r225: arm one screen advance (consumed by the main loop's
+        // next tick — remote navigation for the screenshot workflow).
         b'q' => {
             let mut d = [0u8; 64];
             let mut n = 0;
@@ -2311,6 +2472,150 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
             cortex_m::asm::delay(192_000 * 100); // ~100 ms CDC drain
             cortex_m::peripheral::SCB::sys_reset();
         }
+        // r239: the recorder's console commands: `ri` = the log's
+        // info line, `rd <first> <count>` = the records as hex lines
+        // (6 records = 48 hex chars per 64-byte line; the exporter
+        // walks ranges). Read-only over the shared flash - the dump
+        // blocks the main loop while it runs (the 'f' dump's
+        // precedent), so keep chunks modest.
+        b'r' if cmd == b"ri" => {
+            let count = rec::count();
+            let state: &[u8] = match rec::state() {
+                rec::NO_LOG => b"idle",
+                rec::RUNNING => b"run",
+                rec::STOPPED => b"stop",
+                _ => b"clear",
+            };
+            let mut d = [0u8; 64];
+            let mut n = 0;
+            for &b in b"[rec] state=" {
+                d[n] = b;
+                n += 1;
+            }
+            for &b in state {
+                d[n] = b;
+                n += 1;
+            }
+            for &b in b" n=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, count);
+            for &b in b" int=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, rec::interval());
+            for &b in b"s cur=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(
+                &mut d,
+                n,
+                crate::rec::REC_FIRST + count / crate::rec::SAMPLES_PER_SECTOR,
+            );
+            for &b in b"\r\n" {
+                d[n] = b;
+                n += 1;
+            }
+            send_direct(&d[..n]);
+        }
+        b'r' if cmd.starts_with(b"rd ") => {
+            // `rd <first> <count>`: two decimal args, bounded by the
+            // log and by one command's reasonable dump size.
+            let args = &cmd[3..];
+            let mut vals = [0u32; 2];
+            let mut got = 0;
+            let mut v: u32 = 0;
+            let mut in_num = false;
+            for &c in args {
+                if c.is_ascii_digit() {
+                    v = v.saturating_mul(10).saturating_add(u32::from(c - b'0'));
+                    in_num = true;
+                } else if in_num {
+                    if got < 2 {
+                        vals[got] = v;
+                    }
+                    got += 1;
+                    v = 0;
+                    in_num = false;
+                }
+            }
+            if in_num && got < 2 {
+                vals[got] = v;
+                got += 1;
+            }
+            let total = rec::count();
+            if got != 2 || rec::state() == rec::NO_LOG {
+                sender.push(b"[rec] ERR args (rd <first> <count>)\r\n");
+            } else if vals[0] >= total {
+                sender.push(b"[rec] ERR past end\r\n");
+            } else {
+                let first = vals[0];
+                let n_dump = vals[1].min(total - first).min(8192);
+                let mut d = [0u8; 40];
+                let mut w = 0;
+                for &b in b"[rec] dump f=" {
+                    d[w] = b;
+                    w += 1;
+                }
+                w = push_dec(&mut d, w, first);
+                for &b in b" n=" {
+                    d[w] = b;
+                    w += 1;
+                }
+                w = push_dec(&mut d, w, n_dump);
+                for &b in b"\r\n" {
+                    d[w] = b;
+                    w += 1;
+                }
+                send_direct(&d[..w]);
+                // 6 records (48 hex chars) per 64-byte line.
+                let mut i = first;
+                while i < first + n_dump {
+                    let mut line = [0u8; 64];
+                    let mut w = 0;
+                    for &b in b"[rec] d " {
+                        line[w] = b;
+                        w += 1;
+                    }
+                    let per = (first + n_dump - i).min(6);
+                    let mut ok = true;
+                    for _ in 0..per {
+                        match rec::read_word(flash, i) {
+                            Ok(word) => {
+                                for shift in [24u32, 16, 8, 0] {
+                                    w = push_hex8(&mut line, w, (word >> shift) & 0xFF);
+                                }
+                                i += 1;
+                            }
+                            Err(()) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        sender.push(b"[rec] ERR read\r\n");
+                        break;
+                    }
+                    line[w] = b'\r';
+                    line[w + 1] = b'\n';
+                    send_direct(&line[..w + 2]);
+                }
+            }
+        }
+        // r239: the catch-all must NOT swallow `run-bootloader`
+        // (match arms run in order; the reset command is registered
+        // further down and starts with 'r' too).
+        b'r' if cmd != b"run-bootloader" => {
+            sender.push(b"[rec] ERR cmd (ri | rd <first> <count>)\r\n");
+        }
+        // r221: the applied calibration + the meter's raw state (the
+        // wizard's inputs) — hardware verification without navigating.
+        // r236: the caps/PPS evidence dump — the observation's count,
+        // every raw object slot and the PPS store's fields.
         _ => {}
     }
 }

@@ -381,6 +381,24 @@ W25Q128 carries the stock firmware's littlefs, so claiming ERASES the
 sector first — once per ~10,240 records, never during saves. The
 region boundary protects everything beyond sector 20.
 
+## Offline recorder (r239)
+
+The REC screen records calibrated voltage/current samples into the
+external flash's FREE area — sector 20 is the log's meta (magic `FNRL`,
+the interval seconds, an `FEND` word programmed only by an explicit
+stop), sectors 21..4095 hold the samples, 4 bytes each (u16 mV LE,
+u16 mA LE, magnitudes — the overview's own units), 1024 per sector:
+capacity ~4.17M samples (~48 days at 1 s). The interval is a settings
+row (SET: REC INT, 1-2-3-5-10-20-30-60 s) captured at START; RESUME
+keeps the log's own interval, so a log is single-interval and the time
+axis is sample-index x interval. An interrupted log (no FEND — a VBUS
+dip) auto-resumes at boot; the cursor is recovered by a binary search
+over sector blankness plus one word-scan. CLEAR erases one used sector
+per main-loop tick (UI stays live, off PD-exchange windows). Export:
+console `ri` (info) and `rd <first> <count>` (hex lines, 6 records per
+64-byte line), and `tools/fnb58-rec-export.py COMx out.csv` writes CSV
+columns t_s,v_v,a_a,w_w.
+
 **Screen 10/11 (SET, r226)**: kws-x1's two-level page — LEFT/RIGHT
 always navigate (the r218 always-adjusting screen blocked reaching the
 later screens; r222 gated the adjust, r226 grew the rows); **OK enters

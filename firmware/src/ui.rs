@@ -34,6 +34,11 @@ pub enum Screen {
     /// r226: the energy screen (kws-x1's Energy tab — the charge /
     /// energy / time totals, checkpointed to the journal).
     Energy,
+    /// r239: the REC screen — the offline recorder (calibrated V/I
+    /// samples into the external flash's free area; the interval is a
+    /// settings row). OK opens an action menu (START / STOP / RESUME /
+    /// CLEAR by state); CLEAR erases one sector per main-loop tick.
+    Rec,
     Pd,
     /// r233: the PD SNIFF screen (kws-x1's PD Sniff — the messages the
     /// passthrough sniffer hears between the charger and the device).
@@ -65,11 +70,12 @@ pub enum Screen {
 }
 
 /// The screen cycle order (LEFT/RIGHT walk it in both directions).
-const SCREEN_CYCLE: [Screen; 14] = [
+const SCREEN_CYCLE: [Screen; 15] = [
     Screen::Power,
     Screen::Graph,
     Screen::Lines,
     Screen::Energy,
+    Screen::Rec,
     Screen::Pd,
     Screen::Sniff,
     Screen::Profiles,
@@ -132,6 +138,11 @@ pub enum Press {
     /// r238: the cable page's ask — the browse mode's OK (kws-x1's
     /// long-OK → the SOP' e-marker discovery).
     CableAsk,
+    /// r239: the REC menu's cursor move (browsing the action list).
+    RecSel(i16),
+    /// r239: the REC menu's execute — the highlighted action (START /
+    /// STOP / RESUME / CLEAR by state).
+    RecRun(usize),
 }
 
 /// r199: what LEFT/RIGHT adjust on the open ripple screen, in OK's order
@@ -309,6 +320,13 @@ pub struct Ui {
     pub cable_page: u16,
     cable_notice: bool,
     pub cable_ident: Option<(crate::pd_task::CableData, bool, u32, Option<u16>)>,
+    /// r239: the REC screen — the action menu (OK-gated, the r222
+    /// directive) and its cursor, plus the two draw gates (the static
+    /// state line; the live counters redraw on change).
+    pub rec_menu: bool,
+    pub rec_sel: usize,
+    pub rec_ident: (u8, u32, bool, usize, u16, u32),
+    rec_notice: bool,
     /// r227: the graph screen's state (kws-x1 Input's graph fields —
     /// the trace/window are view prefs that persist; the focus closes
     /// on leaving, like the ripple's).
@@ -336,7 +354,7 @@ pub struct Ui {
     pub set_sel: usize,
     /// r218: the settings body's cache (a change redraws). Pub: the
     /// commit arm forces a redraw after saving.
-    pub set_drawn: i16,
+    pub set_drawn: i32,
     /// r226: the settings page's mode and row cursor, plus the edited
     /// energy-interval index (settings-core's ALL order) and the r233
     /// PD passthrough toggle.
@@ -344,6 +362,9 @@ pub struct Ui {
     pub set_row: usize,
     pub set_energy: usize,
     pub set_passthrough: bool,
+    /// r239: the REC-interval row's edited value (the REC_INTERVALS
+    /// index), re-read from the applied value on entry.
+    pub set_rec: usize,
     /// r221: the calibration wizard (created fresh on the OK that
     /// enters it, from the applied calibration; nothing applies until
     /// the last OK). r226: `cal_active` gates the wizard — without it
@@ -555,6 +576,10 @@ impl Ui {
             cable_page: 0,
             cable_notice: false,
             cable_ident: None,
+            rec_menu: false,
+            rec_sel: 0,
+            rec_ident: (0xFF, 0, false, 0, 0, 0),
+            rec_notice: false,
             graph_focus: None,
             graph_trace: settings_core::power_history::GraphTrace::default(),
             graph_window: settings_core::power_history::GraphWindow::default(),
@@ -572,6 +597,7 @@ impl Ui {
             ripple_tag: 0xFFFF,
             set_sel: 0,
             set_drawn: -1,
+            set_rec: 0,
             set_mode: SetMode::Idle,
             set_row: 0,
             set_energy: 0,
@@ -751,6 +777,29 @@ impl Ui {
                 _ => {}
             }
         }
+        // r239: the REC screen (kws-x1's OK-gated rows): OK opens the
+        // action menu (START / STOP / RESUME / CLEAR by state), inside
+        // it LEFT/RIGHT move the cursor, OK executes, BACK steps out.
+        if self.screen == Screen::Rec {
+            match i {
+                buttons::OK => {
+                    if self.rec_menu {
+                        return Press::RecRun(self.rec_sel);
+                    }
+                    self.rec_menu = true;
+                    self.rec_sel = 0;
+                    return Press::Hint;
+                }
+                buttons::BACK if self.rec_menu => {
+                    self.rec_menu = false;
+                    return Press::Hint;
+                }
+                buttons::LEFT | buttons::RIGHT if self.rec_menu => {
+                    return Press::RecSel(if i == buttons::RIGHT { 1 } else { -1 });
+                }
+                _ => {}
+            }
+        }
         // r224: the overview's OK resets the session peaks (kws-x1's
         // long-OK reset — no long-press here, so a plain OK; the MAX
         // card sweeps back to the current sample).
@@ -924,6 +973,9 @@ impl Ui {
         // r238: the cable page's two gates too.
         self.cable_notice = false;
         self.cable_ident = None;
+        // r239: the REC screen's gates too.
+        self.rec_notice = false;
+        self.rec_ident = (0xFF, 0, false, 0, 0, 0);
     }
 
     /// r230c: the per-screen header, uniform across all screens —
@@ -938,6 +990,7 @@ impl Ui {
             Screen::Graph => (b"GRAPH", ORANGE),
             Screen::Lines => (b"LINES", YELLOW),
             Screen::Energy => (b"ENERGY", GREEN),
+            Screen::Rec => (b"REC", GREEN),
             Screen::Pd => (b"PPS", CYAN),
             Screen::Sniff => (b"PD SNIFF", GREEN),
             Screen::Profiles => (b"PD PROFILES", GREEN),
@@ -996,6 +1049,10 @@ impl Ui {
             self.cable_browse = false;
             crate::pd_task::CABLE_SECTION.store(0, core::sync::atomic::Ordering::Relaxed);
         }
+        // r239: the REC action menu closes on leaving too.
+        if screen != Screen::Rec {
+            self.rec_menu = false;
+        }
         // r235: the PPS page opens unfocused, seeded from the first
         // advertised range (min voltage / max current, floored at the
         // 1 A PPS operating minimum).
@@ -1021,6 +1078,8 @@ impl Ui {
                 crate::settings::ENERGY_IDX.load(core::sync::atomic::Ordering::Relaxed);
             self.set_passthrough =
                 crate::settings::PASSTHROUGH.load(core::sync::atomic::Ordering::Relaxed);
+            self.set_rec =
+                crate::settings::REC_IDX.load(core::sync::atomic::Ordering::Relaxed);
             self.set_mode = SetMode::Idle;
             self.set_drawn = -1;
         }
@@ -1056,6 +1115,9 @@ impl Ui {
             // r226: the energy page's reset (the save note is drawn in
             // the body — it is dynamic).
             Screen::Energy => b"OK:RST",
+            // r239: the REC screen's action menu.
+            Screen::Rec if self.rec_menu => b"LR:SEL OK:RUN BK:X",
+            Screen::Rec => b"OK:MENU",
             // r229: the profiles selector's two states (kws-x1's
             // "< > choose OK request BACK cancel").
             Screen::Profiles if self.profiles_edit => b"LR:SEL OK:REQ BK:X",
@@ -1824,11 +1886,14 @@ impl Ui {
     /// energy checkpoint interval) with kws-x1's cursor model: Idle
     /// shows both flat, Row/Edit highlight the cursor row in yellow.
     pub async fn draw_settings(&mut self, lcd: &mut Lcd) {
-        let ident = self.set_mode as i16 * 1000
-            + self.set_row as i16 * 100
-            + self.set_sel as i16 * 10
-            + self.set_energy as i16 * 4
-            + i16::from(self.set_passthrough);
+        // r239: the REC row joins the identity (the old i16 packing
+        // had no room for a 4th field; i32 with wide spacing).
+        let ident = self.set_mode as i32 * 1_000_000
+            + self.set_row as i32 * 100_000
+            + self.set_sel as i32 * 10_000
+            + self.set_energy as i32 * 1_000
+            + self.set_rec as i32 * 10
+            + i32::from(self.set_passthrough);
         if ident == self.set_drawn {
             return;
         }
@@ -1850,13 +1915,31 @@ impl Ui {
             .map(|&m| m.label().as_bytes())
             .unwrap_or(b"OFF");
         let pass_value: &[u8] = if self.set_passthrough { b"ON" } else { b"OFF" };
-        // r232: the two settings as outlined cards (the box style the
+        // r239: the REC interval row — the interval a FRESH recording
+        // starts with (a resumed log keeps its own).
+        let rec_value: &[u8] = match crate::settings::REC_INTERVALS
+            .get(self.set_rec)
+            .copied()
+            .unwrap_or(1)
+        {
+            1 => b"1 S",
+            2 => b"2 S",
+            3 => b"3 S",
+            5 => b"5 S",
+            10 => b"10 S",
+            20 => b"20 S",
+            30 => b"30 S",
+            _ => b"60 S",
+        };
+        // r232: the settings as outlined cards (the box style the
         // graphical screens use) — the cursor row's card in yellow, the
-        // other in gray, the value big inside.
-        let rows: [(u16, u16, &[u8], &[u8]); 3] = [
-            (34, 92, b"DIM IDLE", dim_value),
-            (98, 156, b"ENERGY SAVE", energy_value),
-            (162, 206, b"PD PASS", pass_value),
+        // other in gray, the value big inside. r239: four rows now
+        // (the REC interval joins).
+        let rows: [(u16, u16, &[u8], &[u8]); 4] = [
+            (34, 76, b"DIM IDLE", dim_value),
+            (78, 120, b"ENERGY SAVE", energy_value),
+            (122, 164, b"PD PASS", pass_value),
+            (166, 208, b"REC INT", rec_value),
         ];
         for (i, (y0, y1, label, value)) in rows.iter().enumerate() {
             let cursor = self.set_mode != SetMode::Idle && self.set_row == i;
@@ -2363,6 +2446,112 @@ impl Ui {
         self.draw_hint(lcd).await;
     }
 
+
+    /// r239: the REC screen — the offline recorder's state, counters
+    /// and action menu. The state line is big and colored (green
+    /// RUNNING, gray IDLE, yellow STOPPED, orange CLEARING/FULL); the
+    /// samples / time / interval / used rows follow; the OK-gated menu
+    /// (the r222 directive) draws its actions as outlined boxes with
+    /// the cursor in yellow. Redraws on the state/count/menu identity.
+    pub async fn draw_rec(&mut self, lcd: &mut Lcd) {
+        use core::sync::atomic::Ordering;
+        let state = crate::rec::state();
+        let count = crate::rec::count();
+        let interval = crate::rec::interval();
+        let items = crate::rec::menu(state);
+        let sel = self.rec_sel.min(items.len().saturating_sub(1));
+        let ident = (
+            state,
+            count.min(0xFFFF_FFFF),
+            self.rec_menu,
+            sel,
+            crate::rec::CLEAR_DONE.load(Ordering::Relaxed),
+            interval,
+        );
+        if ident == self.rec_ident {
+            return;
+        }
+        self.rec_ident = ident;
+        lcd.fill_window(0, 32, 319, 210, BLACK).await;
+        // The state line; FULL overrides STOPPED (the log ran to the
+        // area's end — the distinction matters for what to do next).
+        let full = state == crate::rec::STOPPED && count >= crate::rec::capacity();
+        let (label, color): (&[u8], u16) = match (state, full) {
+            (crate::rec::RUNNING, _) => (b"REC RUNNING", GREEN),
+            (crate::rec::STOPPED, true) => (b"REC FULL", ORANGE),
+            (crate::rec::STOPPED, _) => (b"REC STOPPED", YELLOW),
+            (crate::rec::CLEARING, _) => (b"REC CLEARING", ORANGE),
+            _ => (b"REC IDLE", GRAY),
+        };
+        let x = (320 - label.len() as u16 * 15) / 2;
+        text(lcd, x, 44, label, 3, color).await;
+        if state == crate::rec::CLEARING {
+            // The clear's own progress (one sector per loop tick).
+            let mut l = Line12::new();
+            l.num_u32(u32::from(crate::rec::CLEAR_DONE.load(Ordering::Relaxed)), 0);
+            l.push(b"/");
+            l.num_u32(u32::from(crate::rec::CLEAR_TOTAL.load(Ordering::Relaxed)), 0);
+            l.push(b" SECT");
+            let x = (320 - l.len as u16 * 12) / 2;
+            lcd.draw_text(x, 90, l.bytes(), 2, ORANGE, BLACK).await;
+        } else {
+            // SAMPLES n
+            let mut l = Line12::new();
+            l.push(b"SAMPLES ");
+            l.num_u32(count, 0);
+            lcd.draw_text(12, 92, l.bytes(), 2, WHITE, BLACK).await;
+            // TIME h:mm:ss (n x interval — pauses stretch nothing, no
+            // samples are written while stopped).
+            let seconds = count.saturating_mul(interval);
+            let mut l = Line12::new();
+            l.push(b"TIME ");
+            l.num_u32(seconds / 3600, 0);
+            l.push(b":");
+            let m = (seconds / 60) % 60;
+            if m < 10 {
+                l.push(b"0");
+            }
+            l.num_u32(m, 0);
+            l.push(b":");
+            let s = seconds % 60;
+            if s < 10 {
+                l.push(b"0");
+            }
+            l.num_u32(s, 0);
+            lcd.draw_text(12, 122, l.bytes(), 2, CYAN, BLACK).await;
+            // INTERVAL (the LOG's while one exists; the setting's value
+            // is what a fresh START would take) and the flash use.
+            let shown = if state == crate::rec::NO_LOG {
+                let idx = crate::settings::REC_IDX.load(Ordering::Relaxed);
+                crate::settings::REC_INTERVALS.get(idx).copied().unwrap_or(1)
+            } else {
+                interval
+            };
+            let mut l = Line12::new();
+            l.push(b"INT ");
+            l.num_u32(shown, 0);
+            l.push(b"s  USED ");
+            l.num_u32(crate::rec::used_sectors() * 4, 0);
+            l.push(b"K");
+            lcd.draw_text(12, 152, l.bytes(), 1, GRAY, BLACK).await;
+        }
+        // The action menu: outlined boxes, the cursor's in yellow.
+        if self.rec_menu && state != crate::rec::CLEARING {
+            let items = crate::rec::menu(state);
+            for (i, item) in items.iter().enumerate() {
+                let x0 = if items.len() == 1 {
+                    85
+                } else {
+                    8 + i as u16 * 158
+                };
+                let color = if i == sel { YELLOW } else { GRAY };
+                lcd.rounded_outline(x0, 170, x0 + 148, 206, 5, color).await;
+                let x = x0 + (148 - item.len() as u16 * 12) / 2;
+                lcd.draw_text(x, 180, item, 2, color, BLACK).await;
+            }
+        }
+        self.draw_hint(lcd).await;
+    }
 
     /// r238: the CABLE screen — kws-x1's Detail::Cable page: the
     /// e-marker's readable summary, raw identity VDOs, the SVID set and

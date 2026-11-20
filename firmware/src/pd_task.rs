@@ -930,6 +930,11 @@ pub async fn run() {
     // its caps; the engine dies having heard nothing. One automatic
     // OK-press equivalent (the r147 restart flow) wakes it.
     let mut boot_wake = true;
+    // r239: the boot diagnostic's failure count — a wedged FUSB302
+    // (I2C NAKs after an MCU reset hit it mid-transaction) used to
+    // retry SILENTLY forever behind BUSY=true, freezing the UI. Three
+    // failures park the task loudly instead; an OK press retries.
+    let mut diag_fails = 0u32;
     loop {
         if !first {
             STAGE.store(6, Ordering::Relaxed); // parked, waiting for OK
@@ -963,6 +968,18 @@ pub async fn run() {
                 // leave no trace at all).
                 VIEW.error.store(26, Ordering::Relaxed);
                 crate::pd_log(b"[pd] no bus\r\n");
+                diag_fails = diag_fails.saturating_add(1);
+                if diag_fails >= 3 {
+                    crate::pd_log(b"[pd] parked: diag FAIL x3 (OK retries)\r\n");
+                    diag_fails = 0;
+                    first = false;
+                    SESSION_ACTIVE.store(false, Ordering::Relaxed);
+                    BUSY.store(false, Ordering::Relaxed);
+                    continue;
+                }
+                VIEW.phase.store(phase_code(Phase::Failed), Ordering::Relaxed);
+                SESSION_ACTIVE.store(false, Ordering::Relaxed);
+                BUSY.store(false, Ordering::Relaxed);
                 continue;
             };
             // Restore the power-on configuration FIRST: a previous session
@@ -970,13 +987,39 @@ pub async fn run() {
             // and the crate's Baseline gate would fail every later attempt.
             if restore_baseline(bus).await.is_err() {
                 VIEW.error.store(0x300, Ordering::Relaxed);
+                crate::pd_log(b"[pd] baseline FAIL\r\n");
+                diag_fails = diag_fails.saturating_add(1);
+                if diag_fails >= 3 {
+                    crate::pd_log(b"[pd] parked: diag FAIL x3 (OK retries)\r\n");
+                    diag_fails = 0;
+                    first = false;
+                    SESSION_ACTIVE.store(false, Ordering::Relaxed);
+                    BUSY.store(false, Ordering::Relaxed);
+                    continue;
+                }
+                VIEW.phase.store(phase_code(Phase::Failed), Ordering::Relaxed);
+                SESSION_ACTIVE.store(false, Ordering::Relaxed);
+                BUSY.store(false, Ordering::Relaxed);
                 continue;
             }
             let snapshot = match fusb302_pd::snapshot::snapshot(bus).await {
                 Ok(snapshot) => snapshot,
                 Err(failure) => {
                     VIEW.error.store(u16::from(failure.register) | 0x100, Ordering::Relaxed);
-                    continue;
+                    crate::pd_log(b"[pd] snapshot FAIL\r\n");
+                    diag_fails = diag_fails.saturating_add(1);
+                    if diag_fails >= 3 {
+                        crate::pd_log(b"[pd] parked: diag FAIL x3 (OK retries)\r\n");
+                        diag_fails = 0;
+                        first = false;
+                        SESSION_ACTIVE.store(false, Ordering::Relaxed);
+                        BUSY.store(false, Ordering::Relaxed);
+                        continue;
+                    }
+                VIEW.phase.store(phase_code(Phase::Failed), Ordering::Relaxed);
+                SESSION_ACTIVE.store(false, Ordering::Relaxed);
+                BUSY.store(false, Ordering::Relaxed);
+                continue;
                 }
             };
             VIEW.phase.store(phase_code(Phase::Measuring), Ordering::Relaxed);
@@ -989,6 +1032,7 @@ pub async fn run() {
             .await
             {
                 Ok(report) => {
+                    diag_fails = 0;
                     VIEW.cc1.store(report.status[0], Ordering::Relaxed);
                     VIEW.cc2.store(report.status[1], Ordering::Relaxed);
                     VIEW.listen.store(
@@ -1002,19 +1046,50 @@ pub async fn run() {
                 Err(failure) => {
                     // Baseline/verify failures report the offending
                     // register in the low byte.
-                    VIEW.error.store(
-                        match failure.error {
-                            fusb302_pd::config::Error::Baseline { register, .. }
-                            | fusb302_pd::config::Error::Verify { register, .. } => {
-                                u16::from(register) | 0x100
-                            }
-                            fusb302_pd::config::Error::Bus { register, .. } => {
-                                u16::from(register) | 0x200
-                            }
-                        },
-                        Ordering::Relaxed,
-                    );
-                    continue;
+                    let code: u16 = match failure.error {
+                        fusb302_pd::config::Error::Baseline { register, .. }
+                        | fusb302_pd::config::Error::Verify { register, .. } => {
+                            u16::from(register) | 0x100
+                        }
+                        fusb302_pd::config::Error::Bus { register, .. } => {
+                            u16::from(register) | 0x200
+                        }
+                    };
+                    VIEW.error.store(code, Ordering::Relaxed);
+                    // r239: the failure used to retry silently forever
+                    // (BUSY latched, the UI frozen) — log, retry 3x,
+                    // then park loudly (an OK press starts a fresh
+                    // attempt; a power cycle unwedges the chip).
+                    diag_fails = diag_fails.saturating_add(1);
+                    let mut d = [0u8; 40];
+                    let mut n = 0;
+                    for &b in b"[pd] diag FAIL n=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = crate::push_dec(&mut d, n, diag_fails);
+                    for &b in b" err=" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = crate::push_dec(&mut d, n, u32::from(code));
+                    for &b in b"\r\n" {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    crate::pd_log(&d[..n]);
+                    if diag_fails >= 3 {
+                        crate::pd_log(b"[pd] parked: diag FAIL x3 (OK retries)\r\n");
+                        diag_fails = 0;
+                        first = false;
+                        SESSION_ACTIVE.store(false, Ordering::Relaxed);
+                        BUSY.store(false, Ordering::Relaxed);
+                        continue;
+                    }
+                VIEW.phase.store(phase_code(Phase::Failed), Ordering::Relaxed);
+                SESSION_ACTIVE.store(false, Ordering::Relaxed);
+                BUSY.store(false, Ordering::Relaxed);
+                continue;
                 }
             }
         };

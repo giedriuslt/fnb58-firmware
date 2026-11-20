@@ -76,6 +76,15 @@ pub static CAL_VOLTAGE_PPM: core::sync::atomic::AtomicI32 = core::sync::atomic::
 pub static ENERGY_IDX: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// r239: the applied REC interval, as the REC_INTERVALS index
+/// (0 = 1 s .. 7 = 60 s). The interval a FRESH recording starts with;
+/// a resumed log keeps its own (the rec meta's stored value).
+pub static REC_IDX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// r239: the recording interval choices (seconds), by REC_IDX.
+pub use settings_core::REC_INTERVALS;
+
 /// r233: the applied PD passthrough flag (default off; ON removes the
 /// FUSB302's CC pull-downs after boot and starts the receive-only
 /// sniffer instead of the sink session).
@@ -247,6 +256,7 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
         dim,
         energy,
         passthrough,
+        rec,
         cal,
     } = state;
     match dim {
@@ -256,6 +266,7 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
                 ENERGY_IDX.store(idx, core::sync::atomic::Ordering::Relaxed);
             }
             PASSTHROUGH.store(passthrough, core::sync::atomic::Ordering::Relaxed);
+            REC_IDX.store(rec.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
             store_cal(cal.calibration());
             let mut d = [0u8; 40];
             let mut n = 0;
@@ -271,12 +282,18 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
             log(&d[..n]);
             log_energy();
             log_passthrough();
+            log_rec();
             log_cal(b"[set] stored cal", cal.calibration());
             (
                 Store {
                     next,
                     saved: (
-                        settings_word(minutes, energy.unwrap_or(0), passthrough),
+                        settings_word(
+                            minutes,
+                            energy.unwrap_or(0),
+                            passthrough,
+                            rec.unwrap_or(0),
+                        ),
                         cal.calibration(),
                     ),
                 },
@@ -294,7 +311,9 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
                 log_energy();
             }
             log_passthrough();
+            log_rec();
             PASSTHROUGH.store(passthrough, core::sync::atomic::Ordering::Relaxed);
+            REC_IDX.store(rec.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
             if cal.any() {
                 store_cal(cal.calibration());
                 log_cal(b"[set] stored cal", cal.calibration());
@@ -326,6 +345,26 @@ fn log_passthrough() {
         n += 1;
     }
     for &b in b"
+" {
+        d[n] = b;
+        n += 1;
+    }
+    log(&d[..n]);
+}
+
+/// r239: log the applied REC interval (the boot evidence — without it
+/// a fresh recording's interval choice is invisible in the log).
+fn log_rec() {
+    let idx = REC_IDX.load(core::sync::atomic::Ordering::Relaxed);
+    let seconds = settings_core::REC_INTERVALS.get(idx).copied().unwrap_or(1);
+    let mut d = [0u8; 32];
+    let mut n = 0;
+    for &b in b"[set] rec int=" {
+        d[n] = b;
+        n += 1;
+    }
+    n = crate::push_dec(&mut d, n, seconds);
+    for &b in b"s
 " {
         d[n] = b;
         n += 1;
@@ -397,10 +436,11 @@ fn record_set(
     minutes: u32,
     energy_idx: usize,
     passthrough: bool,
+    rec_idx: usize,
     cal: Calibration,
 ) -> [u32; 1 + FIELDS] {
     let mut records = [0u32; 1 + FIELDS];
-    records[0] = settings_word(minutes, energy_idx, passthrough);
+    records[0] = settings_word(minutes, energy_idx, passthrough, rec_idx);
     records[1..].copy_from_slice(&cal.records());
     records
 }
@@ -417,13 +457,14 @@ pub fn save(
     minutes: u32,
     energy_idx: usize,
     passthrough: bool,
+    rec_idx: usize,
     cal: Calibration,
 ) {
     let Some(word) = dim_minutes_to_record(minutes) else {
         log(b"[set] save refused (bad value)\r\n");
         return;
     };
-    let word = settings_word(minutes, energy_idx, passthrough);
+    let word = settings_word(minutes, energy_idx, passthrough, rec_idx);
     if word == store.saved.0 && cal == store.saved.1 {
         return;
     }
@@ -431,7 +472,7 @@ pub fn save(
     // dim word if it changed, all FIELDS calibration records if the
     // calibration as a whole changed) — compared against the OLD saved
     // set, which updates only after the fold.
-    let records = record_set(minutes, energy_idx, passthrough, cal);
+    let records = record_set(minutes, energy_idx, passthrough, rec_idx, cal);
     let mut changed = [0u32; 1 + FIELDS];
     let mut count = 0;
     for (record, keep) in records.iter().zip(
@@ -448,6 +489,7 @@ pub fn save(
     DIM_MINUTES.store(minutes, core::sync::atomic::Ordering::Relaxed);
     ENERGY_IDX.store(energy_idx, core::sync::atomic::Ordering::Relaxed);
     PASSTHROUGH.store(passthrough, core::sync::atomic::Ordering::Relaxed);
+    REC_IDX.store(rec_idx, core::sync::atomic::Ordering::Relaxed);
     store_cal(cal);
     store.saved = (word, cal);
     let result = match store.next {
