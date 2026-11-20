@@ -62,6 +62,9 @@ static SHOT_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// r225: console 'x' armed — advance one screen forward (the remote
 /// navigation the screenshot workflow drives: 'x' then 'shot').
 static NEXT_SCREEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// r239d: the meter arm's last-read health, for the transition logs.
+static METER_WAS_OK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
 
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
@@ -1908,6 +1911,9 @@ async fn main(spawner: Spawner) {
                     if ui.screen == Screen::Power {
                         ui.draw_power(&mut lcd, mv, ua, mw).await;
                     }
+                    if !METER_WAS_OK.swap(true, Ordering::Relaxed) {
+                        sender.push(b"[meter] reads OK\r\n");
+                    }
                     true
                 }
                 _ => {
@@ -1916,6 +1922,13 @@ async fn main(spawner: Spawner) {
                     // forgets what went before (kws-x1's average.clear).
                     qc_task::METER_FRESH.store(false, Ordering::Relaxed);
                     cal_average.clear();
+                    // r239d: the failure was SILENT — a wedged I2C bus
+                    // (the FUSB302 NAKing) starved the recorder and the
+                    // screen with no trace. Log the Ok->fail transition
+                    // once; the recovery likewise.
+                    if METER_WAS_OK.swap(false, Ordering::Relaxed) {
+                        sender.push(b"[meter] reads FAIL (i2c)\r\n");
+                    }
                     false
                 }
             };
@@ -2011,6 +2024,17 @@ async fn main(spawner: Spawner) {
                 n += 1;
             }
             n = push_dec(&mut d, n, u32::from(pd_task::VIEW.phase.load(Ordering::Relaxed)));
+            // r239d: the recorder's live state in every heartbeat.
+            for &b in b" rs=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, u32::from(crate::rec::state()));
+            for &b in b" rc=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, crate::rec::count());
             for &b in b" err=" {
                 d[n] = b;
                 n += 1;
