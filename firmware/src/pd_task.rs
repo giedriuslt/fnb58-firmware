@@ -539,6 +539,24 @@ pub(crate) async fn restore_baseline(bus: &mut embassy_at32::i2c::I2c) -> Result
 
 /// The session/PHY error mapped to a diagnostic code for the PD screen.
 /// r167: shared with the pdmin probe's log lines.
+/// r239f probe: the I2C error kind, as a small code for the log line
+/// (1 Timeout, 2 ArbitrationLoss, 3 Bus, 4 Overrun, 5 ClockTimeout,
+/// 6.. NAK by source: 6 Generic, 7 Address, 8 Data, 9 Acknowledge).
+pub(crate) fn i2c_src_code(e: embassy_at32::i2c::Error) -> u32 {
+    use embassy_at32::i2c::Error as I;
+    match e {
+        I::Timeout => 1,
+        I::ArbitrationLoss => 2,
+        I::Bus => 3,
+        I::Overrun => 4,
+        I::ClockTimeout => 5,
+        I::NoAcknowledge(source) => match source {
+            embassy_at32::i2c::NoAcknowledgeSource::Address => 7,
+            embassy_at32::i2c::NoAcknowledgeSource::Data => 8,
+        },
+    }
+}
+
 pub(crate) fn error_code(error: &pd_phy::Error<embassy_at32::i2c::Error>) -> u16 {
     use pd_phy::Error as E;
     match error {
@@ -987,7 +1005,7 @@ pub async fn run() {
             // and the crate's Baseline gate would fail every later attempt.
             if restore_baseline(bus).await.is_err() {
                 VIEW.error.store(0x300, Ordering::Relaxed);
-                crate::pd_log(b"[pd] baseline FAIL\r\n");
+                crate::pd_log(b"[pd] baseline FAIL (bus a=22)\r\n");
                 diag_fails = diag_fails.saturating_add(1);
                 if diag_fails >= 3 {
                     crate::pd_log(b"[pd] parked: diag FAIL x3 (OK retries)\r\n");
@@ -1473,13 +1491,36 @@ pub async fn run() {
         let mut clean_stop = false; // r145: BACK stop finished the contract
         {
             let code = error.as_ref().map_or(0, error_code);
-            let mut d = [0u8; 32];
+            let mut d = [0u8; 48];
             let mut n = 0;
             for &b in b"[pd] start err=" {
                 d[n] = b;
                 n += 1;
             }
             n = crate::push_dec(&mut d, n, u32::from(code));
+            // r239f probe: WHICH device NAKed and why.
+            if let Some(pd_phy::Error::Bus {
+                address,
+                register,
+                source,
+            }) = error
+            {
+                for &b in b" bus a=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                n = crate::push_hex8(&mut d, n, u32::from(address));
+                for &b in b" r=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                n = crate::push_hex8(&mut d, n, u32::from(register));
+                for &b in b" src=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                n = crate::push_dec(&mut d, n, i2c_src_code(source));
+            }
             d[n] = b'\r';
             d[n + 1] = b'\n';
             crate::pd_log(&d[..n + 2]);

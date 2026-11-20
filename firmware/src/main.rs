@@ -65,6 +65,45 @@ static NEXT_SCREEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 /// r239d: the meter arm's last-read health, for the transition logs.
 static METER_WAS_OK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
+    /// r239f: the standard I2C bus unwedge — a slave stuck mid-
+    /// transaction (the FUSB302's I2C interface locks up after an
+    /// unanswered Hard-Reset transmission, the boot dead-line wake's
+    /// case) holds SDA low and dead-ends EVERY device on I2C1, the
+    /// meter at 0x40 included. The pins are re-driven as GPIO open-
+    /// drain; if SDA is held low, up to 9 SCL pulses release it, then
+    /// a STOP condition. The caller re-muxes the pins to their
+    /// alternate function afterwards (and holds `pd_task::BUS` at
+    /// runtime, so no transaction can interleave). Harmless on a
+    /// healthy bus: the pulses only fire when SDA is actually held.
+    unsafe fn i2c_unwedge() {
+        use embassy_at32::gpio::{Drive, OutputPin, Port};
+        const HALF: u32 = 48; // ~5 us at 192 MHz
+        let mut scl =
+            unsafe { OutputPin::new_open_drain(Port::B, 6, true, Drive::Moderate) }
+                .expect("i2c scl gpio");
+        let mut sda =
+            unsafe { OutputPin::new_open_drain(Port::B, 7, true, Drive::Moderate) }
+                .expect("i2c sda gpio");
+        cortex_m::asm::delay(HALF);
+        if !sda.is_set() {
+            for _ in 0..9 {
+                scl.set_low();
+                cortex_m::asm::delay(HALF);
+                scl.set_high();
+                cortex_m::asm::delay(HALF);
+                if sda.is_set() {
+                    break;
+                }
+            }
+        }
+        // A STOP condition: SDA low while SCL high, then SDA high.
+        sda.set_low();
+        cortex_m::asm::delay(HALF);
+        sda.set_high();
+        cortex_m::asm::delay(HALF);
+    }
+
+
 
 /// Build tag, carried on every [meter] console line so a paste can
 /// never be mistaken for another build (the boot banner is usually lost
@@ -387,6 +426,10 @@ async fn main(spawner: Spawner) {
         use embassy_at32::gpio::{AlternatePin, Drive, Port};
         use embassy_at32::i2c::{I2c, Speed};
 
+        // r239f: clear a wedge left by the previous boot's wake-HR (a
+        // MCU reset does not reset the FUSB302; only the pin dance
+        // does).
+        unsafe { i2c_unwedge() };
         let _scl = unsafe { AlternatePin::new_open_drain(Port::B, 6, Drive::Moderate) };
         let _sda = unsafe { AlternatePin::new_open_drain(Port::B, 7, Drive::Moderate) };
         // r129: PB14 = SPI2_MISO for the W25Q128 flash reads (the LCD
@@ -1927,7 +1970,24 @@ async fn main(spawner: Spawner) {
                     // screen with no trace. Log the Ok->fail transition
                     // once; the recovery likewise.
                     if METER_WAS_OK.swap(false, Ordering::Relaxed) {
-                        sender.push(b"[meter] reads FAIL (i2c)\r\n");
+                        // r239f: the wedge is here NOW (a slave holds
+                        // SDA) — the pin dance releases it without a
+                        // power cycle; the BUS mutex is held, so no
+                        // transaction can interleave.
+                        unsafe { i2c_unwedge() };
+                        {
+                            // Restore the alternate-function mux (the
+                            // I2C peripheral's registers survived; only
+                            // the pin mux moved to GPIO for the dance).
+                            use embassy_at32::gpio::{AlternatePin, Drive, Port};
+                            unsafe {
+                                AlternatePin::new_open_drain(Port::B, 6, Drive::Moderate)
+                            };
+                            unsafe {
+                                AlternatePin::new_open_drain(Port::B, 7, Drive::Moderate)
+                            };
+                        }
+                        sender.push(b"[meter] reads FAIL (i2c) - unwedged\r\n");
                     }
                     false
                 }
