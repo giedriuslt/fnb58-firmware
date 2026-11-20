@@ -1444,7 +1444,7 @@ async fn main(spawner: Spawner) {
                     let len = rec::menu(rec::state()).len() as i16;
                     ui.rec_sel =
                         ((ui.rec_sel as i16 + dir).rem_euclid(len.max(1))) as usize;
-                    ui.rec_struct = (0xFF, false, false, 0, 0, 0);
+                    ui.rec_struct = (0xFF, false, false, false, 0, 0, 0);
                     ui.rec_live = (u32::MAX, u16::MAX); // force redraw
                     let mut d = [0u8; 24];
                     let mut n = 0;
@@ -1521,7 +1521,7 @@ async fn main(spawner: Spawner) {
                         _ => sender.push(b"[rec] ERR state changed\r\n"),
                     }
                     ui.rec_menu = false;
-                    ui.rec_struct = (0xFF, false, false, 0, 0, 0);
+                    ui.rec_struct = (0xFF, false, false, false, 0, 0, 0);
                     ui.rec_live = (u32::MAX, u16::MAX); // force redraw
                 }
                 Press::Voltage(dir) => {
@@ -2481,6 +2481,15 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
         // read-back — if the backup domain dropped the write, this line
         // says so instead of promising a bootloader handoff that will
         // never happen.
+        // r239e: a plain reboot for diagnostics - the `run-bootloader`
+        // handoff's little sibling: same reset, no BPR request, so the
+        // app restarts (or the bootloader if OK is held at boot).
+        // MUST stay before the rec arms' catch-all (match order).
+        b'r' if cmd == b"reboot" => {
+            send_direct(b"[app] reboot\r\n");
+            cortex_m::asm::delay(192_000 * 100); // ~100 ms CDC drain
+            cortex_m::peripheral::SCB::sys_reset();
+        }
         b'r' if cmd == b"run-bootloader" => {
             let rb = request_bootloader();
             let mut d = [0u8; 64];

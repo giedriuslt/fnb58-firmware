@@ -324,9 +324,12 @@ pub struct Ui {
     /// directive) and its cursor, plus the two draw gates (the static
     /// state line; the live counters redraw on change).
     pub rec_menu: bool,
+    /// r239e: the CLEAR confirm dialog (destructive action — the OK on
+    /// the CLEAR item opens NO/YES instead of executing).
+    pub rec_confirm: bool,
     pub rec_sel: usize,
     /// r239c: the two draw gates' caches (structural / live).
-    pub rec_struct: (u8, bool, bool, usize, u32, u32),
+    pub rec_struct: (u8, bool, bool, bool, usize, u32, u32),
     pub rec_live: (u32, u16),
     rec_notice: bool,
     /// r227: the graph screen's state (kws-x1 Input's graph fields —
@@ -579,8 +582,9 @@ impl Ui {
             cable_notice: false,
             cable_ident: None,
             rec_menu: false,
+            rec_confirm: false,
             rec_sel: 0,
-            rec_struct: (0xFF, false, false, 0, 0, 0),
+            rec_struct: (0xFF, false, false, false, 0, 0, 0),
             rec_live: (u32::MAX, u16::MAX),
             rec_notice: false,
             graph_focus: None,
@@ -787,6 +791,27 @@ impl Ui {
             match i {
                 buttons::OK => {
                     if self.rec_menu {
+                        if self.rec_confirm {
+                            // The dialog's OK: YES runs the CLEAR, NO
+                            // returns to the menu.
+                            if self.rec_sel == 1 {
+                                self.rec_confirm = false;
+                                self.rec_menu = false;
+                                return Press::RecRun(1);
+                            }
+                            self.rec_confirm = false;
+                            return Press::Hint;
+                        }
+                        // r239e: CLEAR is destructive - the OK on it
+                        // opens the NO/YES dialog instead of executing.
+                        let items = crate::rec::menu(crate::rec::state());
+                        if self.rec_sel == 1
+                            && items.get(1).copied() == Some(b"CLEAR".as_slice())
+                        {
+                            self.rec_confirm = true;
+                            self.rec_sel = 0; // NO preselected
+                            return Press::Hint;
+                        }
                         return Press::RecRun(self.rec_sel);
                     }
                     self.rec_menu = true;
@@ -794,6 +819,10 @@ impl Ui {
                     return Press::Hint;
                 }
                 buttons::BACK if self.rec_menu => {
+                    if self.rec_confirm {
+                        self.rec_confirm = false;
+                        return Press::Hint;
+                    }
                     self.rec_menu = false;
                     return Press::Hint;
                 }
@@ -978,7 +1007,7 @@ impl Ui {
         self.cable_ident = None;
         // r239: the REC screen's gates too.
         self.rec_notice = false;
-        self.rec_struct = (0xFF, false, false, 0, 0, 0);
+        self.rec_struct = (0xFF, false, false, false, 0, 0, 0);
         self.rec_live = (u32::MAX, u16::MAX);
     }
 
@@ -1056,6 +1085,7 @@ impl Ui {
         // r239: the REC action menu closes on leaving too.
         if screen != Screen::Rec {
             self.rec_menu = false;
+            self.rec_confirm = false;
         }
         // r235: the PPS page opens unfocused, seeded from the first
         // advertised range (min voltage / max current, floored at the
@@ -1119,7 +1149,9 @@ impl Ui {
             // r226: the energy page's reset (the save note is drawn in
             // the body — it is dynamic).
             Screen::Energy => b"OK:RST",
-            // r239: the REC screen's action menu.
+            // r239: the REC screen's action menu. r239e: the CLEAR
+            // confirm's own line (BACK returns to the menu).
+            Screen::Rec if self.rec_confirm => b"LR:NO/YES OK:RUN BK:NO",
             Screen::Rec if self.rec_menu => b"LR:SEL OK:RUN BK:X",
             Screen::Rec => b"OK:MENU",
             // r229: the profiles selector's two states (kws-x1's
@@ -2476,6 +2508,7 @@ impl Ui {
             state,
             count >= crate::rec::capacity(),
             self.rec_menu,
+            self.rec_confirm,
             sel,
             interval,
             crate::rec::used_sectors() * 4,
@@ -2494,12 +2527,17 @@ impl Ui {
             // area's end - the distinction matters for what to do next).
             let full = state == crate::rec::STOPPED
                 && count >= crate::rec::capacity();
-            let (label, color): (&[u8], u16) = match (state, full) {
+            // r239e: the confirm dialog replaces the state line.
+            let (label, color): (&[u8], u16) = if self.rec_confirm {
+                (b"CLEAR LOG?", ORANGE)
+            } else {
+            match (state, full) {
                 (crate::rec::RUNNING, _) => (b"REC RUNNING", GREEN),
                 (crate::rec::STOPPED, true) => (b"REC FULL", ORANGE),
                 (crate::rec::STOPPED, _) => (b"REC STOPPED", YELLOW),
                 (crate::rec::CLEARING, _) => (b"REC CLEARING", ORANGE),
                 _ => (b"REC IDLE", GRAY),
+            }
             };
             let x = (320 - label.len() as u16 * 15) / 2;
             text(lcd, x, 44, label, 3, color).await;
@@ -2523,8 +2561,13 @@ impl Ui {
             l.pad();
             lcd.draw_text(12, 152, l.bytes(), 1, GRAY, BLACK).await;
             // The action menu: outlined boxes, the cursor's in yellow.
+            // r239e: the confirm dialog shows NO/YES instead.
             if self.rec_menu && state != crate::rec::CLEARING {
-                let items = crate::rec::menu(state);
+                let items: &[&[u8]] = if self.rec_confirm {
+                    &[b"NO".as_slice(), b"YES".as_slice()]
+                } else {
+                    crate::rec::menu(state)
+                };
                 for (i, item) in items.iter().enumerate() {
                     let x0 = if items.len() == 1 {
                         85
