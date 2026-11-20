@@ -168,9 +168,15 @@ pub fn recover(flash: &mut Flash) {
             lo = mid + 1;
         }
     }
-    let count = if lo == REC_FIRST {
-        0
-    } else if lo == SECTOR_COUNT {
+    // r239 FIX: `lo` is the first sector whose LAST word is blank — a
+    // partially-filled cursor sector's last word IS blank (20 samples
+    // in a 1024-slot sector), so lo lands ON the cursor sector, and the
+    // old `lo == REC_FIRST -> count 0` branch threw away every sample
+    // in it: the auto-resume then restarted at sample 0 and the first
+    // write erased the sector, wiping the log on every power cycle
+    // (user-reported: samples lost across a reconnect). The cursor
+    // sector is `lo` itself; the full prefix is lo - REC_FIRST.
+    let count = if lo == SECTOR_COUNT {
         // No blank sector: the area is full.
         CAPACITY
     } else {
@@ -178,14 +184,14 @@ pub fn recover(flash: &mut Flash) {
         let mut k = 0u32;
         while k < SAMPLES_PER_SECTOR {
             let word = flash
-                .read_u32le((lo - 1) * crate::flash::SECTOR_SIZE as u32 + k * 4)
+                .read_u32le(lo * crate::flash::SECTOR_SIZE as u32 + k * 4)
                 .unwrap_or(0xFFFF_FFFF);
             if word == 0xFFFF_FFFF {
                 break;
             }
             k += 1;
         }
-        (lo - REC_FIRST - 1) * SAMPLES_PER_SECTOR + k
+        (lo - REC_FIRST) * SAMPLES_PER_SECTOR + k
     };
     INTERVAL.store(interval, Ordering::Relaxed);
     COUNT.store(count, Ordering::Relaxed);
