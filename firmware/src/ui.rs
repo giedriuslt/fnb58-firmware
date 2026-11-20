@@ -325,7 +325,9 @@ pub struct Ui {
     /// state line; the live counters redraw on change).
     pub rec_menu: bool,
     pub rec_sel: usize,
-    pub rec_ident: (u8, u32, bool, usize, u16, u32),
+    /// r239c: the two draw gates' caches (structural / live).
+    pub rec_struct: (u8, bool, bool, usize, u32, u32),
+    pub rec_live: (u32, u16),
     rec_notice: bool,
     /// r227: the graph screen's state (kws-x1 Input's graph fields —
     /// the trace/window are view prefs that persist; the focus closes
@@ -578,7 +580,8 @@ impl Ui {
             cable_ident: None,
             rec_menu: false,
             rec_sel: 0,
-            rec_ident: (0xFF, 0, false, 0, 0, 0),
+            rec_struct: (0xFF, false, false, 0, 0, 0),
+            rec_live: (u32::MAX, u16::MAX),
             rec_notice: false,
             graph_focus: None,
             graph_trace: settings_core::power_history::GraphTrace::default(),
@@ -975,7 +978,8 @@ impl Ui {
         self.cable_ident = None;
         // r239: the REC screen's gates too.
         self.rec_notice = false;
-        self.rec_ident = (0xFF, 0, false, 0, 0, 0);
+        self.rec_struct = (0xFF, false, false, 0, 0, 0);
+        self.rec_live = (u32::MAX, u16::MAX);
     }
 
     /// r230c: the per-screen header, uniform across all screens —
@@ -2455,70 +2459,53 @@ impl Ui {
     /// the cursor in yellow. Redraws on the state/count/menu identity.
     pub async fn draw_rec(&mut self, lcd: &mut Lcd) {
         use core::sync::atomic::Ordering;
+        // r239c: TWO draw gates (the r230b/r194 flicker class — the old
+        // single gate included the sample count, so every 1 s sample
+        // forced a full-body fill and the screen strobed). STRUCTURAL
+        // changes (state, menu, cursor, interval, flash use) redraw
+        // everything; a live change (the sample count, the clear's
+        // done counter) overdraws ONLY the value bands in place,
+        // fixed-width Line12 pads as the eraser.
         let state = crate::rec::state();
         let count = crate::rec::count();
         let interval = crate::rec::interval();
         let items = crate::rec::menu(state);
         let sel = self.rec_sel.min(items.len().saturating_sub(1));
-        let ident = (
+        let done = crate::rec::CLEAR_DONE.load(Ordering::Relaxed);
+        let struct_ident = (
             state,
-            count.min(0xFFFF_FFFF),
+            count >= crate::rec::capacity(),
             self.rec_menu,
             sel,
-            crate::rec::CLEAR_DONE.load(Ordering::Relaxed),
             interval,
+            crate::rec::used_sectors() * 4,
         );
-        if ident == self.rec_ident {
+        let live_ident = (count, done);
+        let struct_changed = struct_ident != self.rec_struct;
+        let live_changed = live_ident != self.rec_live;
+        if !struct_changed && !live_changed {
             return;
         }
-        self.rec_ident = ident;
-        lcd.fill_window(0, 32, 319, 210, BLACK).await;
-        // The state line; FULL overrides STOPPED (the log ran to the
-        // area's end — the distinction matters for what to do next).
-        let full = state == crate::rec::STOPPED && count >= crate::rec::capacity();
-        let (label, color): (&[u8], u16) = match (state, full) {
-            (crate::rec::RUNNING, _) => (b"REC RUNNING", GREEN),
-            (crate::rec::STOPPED, true) => (b"REC FULL", ORANGE),
-            (crate::rec::STOPPED, _) => (b"REC STOPPED", YELLOW),
-            (crate::rec::CLEARING, _) => (b"REC CLEARING", ORANGE),
-            _ => (b"REC IDLE", GRAY),
-        };
-        let x = (320 - label.len() as u16 * 15) / 2;
-        text(lcd, x, 44, label, 3, color).await;
-        if state == crate::rec::CLEARING {
-            // The clear's own progress (one sector per loop tick).
-            let mut l = Line12::new();
-            l.num_u32(u32::from(crate::rec::CLEAR_DONE.load(Ordering::Relaxed)), 0);
-            l.push(b"/");
-            l.num_u32(u32::from(crate::rec::CLEAR_TOTAL.load(Ordering::Relaxed)), 0);
-            l.push(b" SECT");
-            let x = (320 - l.len as u16 * 12) / 2;
-            lcd.draw_text(x, 90, l.bytes(), 2, ORANGE, BLACK).await;
-        } else {
-            // SAMPLES n
-            let mut l = Line12::new();
-            l.push(b"SAMPLES ");
-            l.num_u32(count, 0);
-            lcd.draw_text(12, 92, l.bytes(), 2, WHITE, BLACK).await;
-            // TIME h:mm:ss (n x interval — pauses stretch nothing, no
-            // samples are written while stopped).
-            let seconds = count.saturating_mul(interval);
-            let mut l = Line12::new();
-            l.push(b"TIME ");
-            l.num_u32(seconds / 3600, 0);
-            l.push(b":");
-            let m = (seconds / 60) % 60;
-            if m < 10 {
-                l.push(b"0");
-            }
-            l.num_u32(m, 0);
-            l.push(b":");
-            let s = seconds % 60;
-            if s < 10 {
-                l.push(b"0");
-            }
-            l.num_u32(s, 0);
-            lcd.draw_text(12, 122, l.bytes(), 2, CYAN, BLACK).await;
+        if struct_changed {
+            self.rec_struct = struct_ident;
+            self.rec_live = (u32::MAX, u16::MAX); // force the value redraw
+            lcd.fill_window(0, 32, 319, 210, BLACK).await;
+            // The state line; FULL overrides STOPPED (the log ran to the
+            // area's end - the distinction matters for what to do next).
+            let full = state == crate::rec::STOPPED
+                && count >= crate::rec::capacity();
+            let (label, color): (&[u8], u16) = match (state, full) {
+                (crate::rec::RUNNING, _) => (b"REC RUNNING", GREEN),
+                (crate::rec::STOPPED, true) => (b"REC FULL", ORANGE),
+                (crate::rec::STOPPED, _) => (b"REC STOPPED", YELLOW),
+                (crate::rec::CLEARING, _) => (b"REC CLEARING", ORANGE),
+                _ => (b"REC IDLE", GRAY),
+            };
+            let x = (320 - label.len() as u16 * 15) / 2;
+            text(lcd, x, 44, label, 3, color).await;
+            // The row labels (the values live-redraw beside them).
+            lcd.draw_text(12, 92, b"SAMPLES", 2, GRAY, BLACK).await;
+            lcd.draw_text(12, 122, b"TIME", 2, GRAY, BLACK).await;
             // INTERVAL (the LOG's while one exists; the setting's value
             // is what a fresh START would take) and the flash use.
             let shown = if state == crate::rec::NO_LOG {
@@ -2533,24 +2520,69 @@ impl Ui {
             l.push(b"s  USED ");
             l.num_u32(crate::rec::used_sectors() * 4, 0);
             l.push(b"K");
+            l.pad();
             lcd.draw_text(12, 152, l.bytes(), 1, GRAY, BLACK).await;
+            // The action menu: outlined boxes, the cursor's in yellow.
+            if self.rec_menu && state != crate::rec::CLEARING {
+                let items = crate::rec::menu(state);
+                for (i, item) in items.iter().enumerate() {
+                    let x0 = if items.len() == 1 {
+                        85
+                    } else {
+                        8 + i as u16 * 158
+                    };
+                    let color = if i == sel { YELLOW } else { GRAY };
+                    lcd.rounded_outline(x0, 170, x0 + 148, 206, 5, color)
+                        .await;
+                    let x = x0 + (148 - item.len() as u16 * 12) / 2;
+                    lcd.draw_text(x, 180, item, 2, color, BLACK).await;
+                }
+            }
+            self.draw_hint(lcd).await;
         }
-        // The action menu: outlined boxes, the cursor's in yellow.
-        if self.rec_menu && state != crate::rec::CLEARING {
-            let items = crate::rec::menu(state);
-            for (i, item) in items.iter().enumerate() {
-                let x0 = if items.len() == 1 {
-                    85
-                } else {
-                    8 + i as u16 * 158
-                };
-                let color = if i == sel { YELLOW } else { GRAY };
-                lcd.rounded_outline(x0, 170, x0 + 148, 206, 5, color).await;
-                let x = x0 + (148 - item.len() as u16 * 12) / 2;
-                lcd.draw_text(x, 180, item, 2, color, BLACK).await;
+        if live_changed {
+            self.rec_live = live_ident;
+            if state == crate::rec::CLEARING {
+                // The clear's progress, fixed x so growing digits leave
+                // no residue (the pads erase).
+                let mut l = Line12::new();
+                l.num_u32(u32::from(done), 0);
+                l.push(b"/");
+                l.num_u32(
+                    u32::from(crate::rec::CLEAR_TOTAL.load(Ordering::Relaxed)),
+                    0,
+                );
+                l.push(b" SECT");
+                l.pad();
+                lcd.draw_text(110, 90, l.bytes(), 2, ORANGE, BLACK).await;
+            } else {
+                // The SAMPLES value (the label is structural).
+                let mut l = Line12::new();
+                l.num_u32(count, 0);
+                l.pad();
+                lcd.draw_text(108, 92, l.bytes(), 2, WHITE, BLACK).await;
+                // TIME h:mm:ss (n x interval - pauses stretch nothing,
+                // no samples are written while stopped). Hours grow to
+                // 6 digits at full capacity; 12 cells cover it.
+                let seconds = count.saturating_mul(interval);
+                let mut l = Line12::new();
+                l.num_u32(seconds / 3600, 0);
+                l.push(b":");
+                let m = (seconds / 60) % 60;
+                if m < 10 {
+                    l.push(b"0");
+                }
+                l.num_u32(m, 0);
+                l.push(b":");
+                let sec = seconds % 60;
+                if sec < 10 {
+                    l.push(b"0");
+                }
+                l.num_u32(sec, 0);
+                l.pad();
+                lcd.draw_text(108, 122, l.bytes(), 2, CYAN, BLACK).await;
             }
         }
-        self.draw_hint(lcd).await;
     }
 
     /// r238: the CABLE screen — kws-x1's Detail::Cable page: the

@@ -1441,7 +1441,8 @@ async fn main(spawner: Spawner) {
                     let len = rec::menu(rec::state()).len() as i16;
                     ui.rec_sel =
                         ((ui.rec_sel as i16 + dir).rem_euclid(len.max(1))) as usize;
-                    ui.rec_ident = (0xFF, 0, false, 0, 0, 0); // force redraw
+                    ui.rec_struct = (0xFF, false, false, 0, 0, 0);
+                    ui.rec_live = (u32::MAX, u16::MAX); // force redraw
                     let mut d = [0u8; 24];
                     let mut n = 0;
                     for &b in b"[rec] sel=" {
@@ -1517,7 +1518,8 @@ async fn main(spawner: Spawner) {
                         _ => sender.push(b"[rec] ERR state changed\r\n"),
                     }
                     ui.rec_menu = false;
-                    ui.rec_ident = (0xFF, 0, false, 0, 0, 0); // force redraw
+                    ui.rec_struct = (0xFF, false, false, 0, 0, 0);
+                    ui.rec_live = (u32::MAX, u16::MAX); // force redraw
                 }
                 Press::Voltage(dir) => {
                     // r171: the PPS screen's voltage selection. r189/r196:
