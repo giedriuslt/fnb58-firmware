@@ -3,11 +3,13 @@
 Open firmware for the **FNIRSI FNB58** USB tester (Artery AT32F403A),
 built on [`embassy-at32`](../at32f403a-embassy-rs) and ported from
 [kws-x1-standalone-rs](https://github.com/kralonur/kws-x1-standalone-rs).
-Status: **r126** — working USB CDC console, 320x240 UI with
+Status: **r239g** — working USB CDC console, 320x240 UI with
 accelerometer-driven 180° screen flip and click feedback (buzzer),
-live V/A/W meter, and a PD sink flow on the vendored `fusb302-pd`
-stack (PC-gated, one-shot per OK — the charger's Request acknowledgment
-is the one open hardware question).
+live V/A/W meter, an auto-contracting PD sink flow on the vendored
+`fusb302-pd` stack (the boot session completes the contract on its
+own), QC2/QC3 and AFC triggers, the ripple scope, the settings store
+with calibration, the energy journal and the offline recorder. The PD
+passthrough sniffer is **not working** (see its section below).
 
 ## Architecture
 
@@ -137,10 +139,13 @@ SPI2 with the LCD via CS=PA13.
    ever auto-acked an incoming frame, x = transmit collision, f = raw
    hex of whatever still sits in the RX FIFO.
 
-Known issue: the Request itself usually comes back `r=2` (the
-transmitter does not start for the second back-to-back message), so the
-contract does not hold yet — the caps/scan path is fully working. The
-FUSB302's CC2 line is the charger's active line on this unit.
+r104-era known issue, resolved since: the Request used to come back
+`r=2` (the transmitter would not start for the second back-to-back
+message) and the contract did not hold. The flow now runs as the
+automatic boot session (r138): it completes contracts on its own —
+contracted receipts through r239g — with every contract clearing BUSY
+(r179). The FUSB302's CC2 line is the charger's active line on this
+unit.
 
 ## Console
 
@@ -478,6 +483,40 @@ the screenshot capture sees every primitive:
   padded trailing spaces were opaque black cells that erased the
   cards' right borders every redraw (the flicker).
 
+## PD passthrough sniffer (r226–r239) — NOT WORKING
+
+The settings store carries a **PD PASS** row (SET screen) that is
+meant to select kws-x1's receive-only passthrough sniffer at boot:
+the meter releases its CC pull-downs (Rd), listens on the charger's
+CC line without ever transmitting or acknowledging (auto-CRC off),
+and the SNIFF screen renders the heard PD traffic (kws-x1's
+`pd_sniff` describe()). The mode is boot-chosen — the flag applies at
+the next boot.
+
+**It does not work on this hardware.** As of r239g a pass=ON boot
+still runs the normal sink session: the boot dispatch reads the
+setting before the flash scan applies it, so it always sees OFF. The
+r240–r241 attempts were reverted by user order after bench testing —
+the sniffer still never ran with the full chain (charger + downstream
+device) attached, and repeated power cycles did not change it. Facts
+recorded for any retry:
+
+- The FNB58 is **VBUS-powered** (kws-x1 is battery powered): an
+  unconditional Rd release with no downstream device attached makes
+  the charger cut VBUS and the whole meter power-cycles — kws-x1's
+  release-first boot does not transfer.
+- The vendored sniffer's orientation picks a CC only when exactly one
+  CC carries an Rd-loaded Rp (the downstream device's Rd through the
+  shared CC path); with no device it refuses (the observed
+  `err=O` starts).
+- The FUSB302's I2C toward 0x22 degraded in this mode on the bench
+  (timeouts writing SWITCHES0) while the TPA626 at 0x40 kept
+  answering — the r239f wedge profile.
+
+The code is reverted to r239g (the device runs it); the passthrough
+remains a stock-firmware feature only until someone picks this up
+with hardware in hand.
+
 ## Energy journal (r226)
 
 The energy totals checkpoint to a two-sector journal (kws-x1's
@@ -594,13 +633,17 @@ SWD debugging, which this project never uses.
 
 ## Roadmap
 
-1. PD: the charger acknowledges Get_Source_Cap but never the Request
-   (isolated — same with the hand-rolled driver and the vendored
-   engine). Needs a wire capture (USB-C breakout + analyzer) or a
-   board-level answer (parallel Rd, charger quirk).
-2. PD profiles screen: request a chosen PDO, PPS support.
+1. PD passthrough sniffer: **not working** (see its section) — needs a
+   boot dispatch that honors the stored flag plus a release strategy
+   that keeps the VBUS-powered meter alive without a downstream
+   device.
+2. ~~PD: the charger acknowledges Get_Source_Cap but never the
+   Request~~ — resolved (the boot session completes contracts,
+   r138–r179). ~~PD profiles screen / PPS~~ — shipped (r228–r237).
 3. RTC driver on the confirmed 32 kHz crystal (PC14/15).
-4. KXTJ3 tap/wake features; W25Q128 logging; ADC (ripple/VBUS taps).
+4. KXTJ3 tap/wake features. ~~W25Q128 logging~~ (the offline
+   recorder, r239). ~~ADC (ripple/VBUS taps)~~ (the ripple scope,
+   r199–r209).
 5. PC-link sentinels: trace the D+/D− ADC taps (likely among the
    unclaimed PA0–PA7) to replace the last 0 sentinels in the
    OpenFNB58 stream (temperature is live since r136).
