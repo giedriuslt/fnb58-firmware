@@ -778,7 +778,11 @@ async fn main(spawner: Spawner) {
         });
         flags
     };
-    ui.draw_rst(&mut lcd, rst_flags).await;
+    // r242: the boot-time draw_rst overlay ("rst=NN" in the title bar —
+    // a reboot-loop debug aid) is GONE: it stamped the reset-cause flags
+    // into the header of every boot ("s 03" on cold power-on, "s 05"
+    // after a bootloader/soft reset — the user's artifact report), and
+    // the same value goes to the console log right below.
     {
         let mut d = [0u8; 64];
         let mut n = 0;
@@ -2395,6 +2399,37 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
         }
         // r216: toggle the idle dim immediately (the same 20%/100% the
         // idle logic applies) — hardware verification without waiting
+        // r242: the boot-primitive dump — BEFORE the bare `b'b'` arm
+        // (it matches every b-command).
+        b'b' if cmd == b"bootcap" => {
+            // Dump the boot-primitive recorder (lcd.rs bootcap_record)
+            // — every draw primitive from the boot's first one, one
+            // capture line each (`F x0 y0 x1 y1 cccc` / `C x y s ffff
+            // bbbb hh`). Blocking line-by-line (the 'f' dump's
+            // precedent).
+            let bc = lcd::bootcap();
+            let mut d = [0u8; 48];
+            let mut n = 0;
+            for &b in b"[bootcap] n=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, bc.n as u32);
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            send_direct(&d[..n + 2]);
+            let mut i = 0;
+            while i < bc.n {
+                let end = bc.buf[i..bc.n]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map(|p| i + p + 1)
+                    .unwrap_or(bc.n);
+                send_direct(&bc.buf[i..end]);
+                i = end;
+            }
+            send_direct(b"[bootcap] done\r\n");
+        }
         // the 60 s. Also resets the idle clock so an undim sticks.
         b'b' => {
             let dimmed = !BL_DIMMED.load(Ordering::Relaxed);

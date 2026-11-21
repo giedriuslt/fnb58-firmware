@@ -41,6 +41,40 @@ pub struct Lcd {
     // timer. PB3 is no longer claimed here.
 }
 
+/// r242: the boot-primitive recorder — every draw primitive from the
+/// very first one lands here as its capture line (a 16 KiB RAM ring,
+/// recording stops at full), so a boot-time draw that the forced
+/// repaint hides (the user's "s 03"/"s 05" header artifact: a real
+/// primitive, which the shot's own black fill erases before any
+/// capture) can be dumped with console `bootcap` line-for-line.
+/// `static mut` + fresh each boot (.bss cleared at the reset vector);
+/// main-task use only — the same contract as console's BOOT_LOG.
+pub(crate) struct BootCap {
+    pub(crate) buf: [u8; 16384],
+    pub(crate) n: usize,
+}
+
+static mut BOOT_CAP: BootCap = BootCap {
+    buf: [0; 16384],
+    n: 0,
+};
+
+pub(crate) fn bootcap() -> &'static mut BootCap {
+    unsafe { &mut *core::ptr::addr_of_mut!(BOOT_CAP) }
+}
+
+/// Append one capture line (stops at full).
+pub(crate) fn bootcap_record(d: &[u8]) {
+    let bc = bootcap();
+    let room = bc.buf.len() - bc.n;
+    let take = d.len().min(room);
+    if take == 0 {
+        return;
+    }
+    bc.buf[bc.n..bc.n + take].copy_from_slice(&d[..take]);
+    bc.n += take;
+}
+
 impl Lcd {
     /// Claim the pins and SPI2, and release PA15/PB3/PB4 from JTAG (the
     /// SWJTAG remap the C driver performed — without it PB3 stays JTDO and
@@ -95,10 +129,6 @@ impl Lcd {
     /// until the endpoint accepts, and a whole capture is well under
     /// the stall watch's 2 s window.
     fn capture_fill(&mut self, x0: u16, y0: u16, x1: u16, y1: u16, color: u16) {
-        if !self.capture {
-            return;
-        }
-        self.capture_n += 1;
         let mut d = [0u8; 32];
         let mut n = 0;
         for &b in b"F " {
@@ -113,17 +143,17 @@ impl Lcd {
         n = console::push_hex16(&mut d, n, u32::from(color));
         d[n] = b'\r';
         d[n + 1] = b'\n';
-        crate::console::send_direct(&d[..n + 2]);
+        bootcap_record(&d[..n + 2]);
+        if self.capture {
+            self.capture_n += 1;
+            crate::console::send_direct(&d[..n + 2]);
+        }
     }
 
     /// r223: stream one glyph primitive (`C x y s <fg4> <bg4> <hh>`) —
     /// the char itself as two hex digits, so any byte survives the
     /// text-line console.
     fn capture_char(&mut self, x: u16, y: u16, scale: u8, fg: u16, bg: u16, ch: u8) {
-        if !self.capture {
-            return;
-        }
-        self.capture_n += 1;
         let mut d = [0u8; 32];
         let mut n = 0;
         for &b in b"C " {
@@ -147,7 +177,11 @@ impl Lcd {
         n = console::push_hex8(&mut d, n, u32::from(ch));
         d[n] = b'\r';
         d[n + 1] = b'\n';
-        crate::console::send_direct(&d[..n + 2]);
+        bootcap_record(&d[..n + 2]);
+        if self.capture {
+            self.capture_n += 1;
+            crate::console::send_direct(&d[..n + 2]);
+        }
     }
 
     /// Integer square root (corner radii and dot radii are single

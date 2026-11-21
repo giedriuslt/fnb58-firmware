@@ -2185,23 +2185,6 @@ impl Ui {
         lcd.draw_text(20, 180, line.bytes(), 2, GRAY, BLACK).await;
     }
 
-    /// Show the reset-cause flags in the title bar so a reboot loop is
-    /// visible standalone (no PC needed).
-    pub async fn draw_rst(&self, lcd: &mut Lcd, flags: u8) {
-        let mut line = [0u8; 24];
-        let mut n = 0;
-        for &b in b"rst=" {
-            line[n] = b;
-            n += 1;
-        }
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        line[n] = HEX[(flags >> 4) as usize];
-        line[n + 1] = HEX[(flags & 0xF) as usize];
-        n += 2;
-        line[n] = 0;
-        lcd.draw_text(180, 8, &line, 2, GRAY, BLACK).await;
-    }
-
     /// r227: the graph screen — kws-x1's draw_graph: the NOW/MAX card
     /// (the latest second and the window's highest, in the overview's
     /// colours), then the plot: full/half/zero rules, an auto-scaled
