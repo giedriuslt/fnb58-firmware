@@ -941,13 +941,18 @@ impl Ui {
         }
     }
 
-    /// r235: step the focused PPS editor (kws-x1's ±20 mV / ±50 mA per
-    /// press, ±100 / ±250 held), clamped to the FIRST advertised range
-    /// and the engine's own request rules (20 mV / 50 mA quanta, the
-    /// 1 A PPS operating minimum — preview() would refuse anything
-    /// else). The single-range clamp is a documented simplification:
-    /// kws-x1 edits within the previewed range; this charger class
-    /// advertises one.
+    /// r246: step the focused PPS editor (kws-x1's ±20 mV / ±50 mA per
+    /// press, ±100 / ±250 held), clamped to the UNION of every advertised
+    /// range (the lowest min / the highest max / the highest current) and
+    /// the engine's own request rules (20 mV / 50 mA quanta, the 1 A PPS
+    /// operating minimum — preview() validates the value against ALL the
+    /// ranges and picks the matching APDO for the request). The old clamp
+    /// to the FIRST range only let the first APDO's span be edited even
+    /// when the charger advertised several (the user's multi-range
+    /// request); the engine handles the multi-APDO requests natively.
+    /// A voltage between ranges (a gap in the charger's APDO spans) is
+    /// clamped here but preview() refuses it — the OUTPUT row shows NOT
+    /// APPLIED and the user walks to a valid point.
     pub fn pps_step(&mut self, volts: bool, dir: i16, amount: i32) {
         use core::sync::atomic::Ordering;
         let n = crate::pd_task::PPS_N
@@ -956,14 +961,19 @@ impl Ui {
         if n == 0 {
             return;
         }
+        let mut min_mv = i32::MAX;
+        let mut max_mv = i32::MIN;
+        let mut max_ma = 1000i32; // the 1 A PPS operating minimum
+        for k in 0..n {
+            min_mv = min_mv.min(crate::pd_task::PPS_MIN_MV[k].load(Ordering::Relaxed) as i32);
+            max_mv = max_mv.max(crate::pd_task::PPS_MAX_MV[k].load(Ordering::Relaxed) as i32);
+            max_ma = max_ma.max(crate::pd_task::PPS_MAX_MA[k].load(Ordering::Relaxed) as i32);
+        }
         if volts {
-            let min = crate::pd_task::PPS_MIN_MV[0].load(Ordering::Relaxed) as i32;
-            let max = crate::pd_task::PPS_MAX_MV[0].load(Ordering::Relaxed) as i32;
-            let next = (self.pps_mv as i32 + i32::from(dir) * amount).clamp(min, max);
+            let next = (self.pps_mv as i32 + i32::from(dir) * amount).clamp(min_mv, max_mv);
             self.pps_mv = next as u16;
         } else {
-            let max = crate::pd_task::PPS_MAX_MA[0].load(Ordering::Relaxed) as i32;
-            let next = (self.pps_ma as i32 + i32::from(dir) * amount).clamp(1000, max);
+            let next = (self.pps_ma as i32 + i32::from(dir) * amount).clamp(1000, max_ma);
             self.pps_ma = next as u16;
         }
     }
@@ -1087,20 +1097,26 @@ impl Ui {
             self.rec_menu = false;
             self.rec_confirm = false;
         }
-        // r235: the PPS page opens unfocused, seeded from the first
-        // advertised range (min voltage / max current, floored at the
-        // 1 A PPS operating minimum).
+        // r246: the PPS page opens unfocused, seeded from the UNION of
+        // the advertised ranges (the lowest min voltage / the highest
+        // max current, floored at the 1 A PPS operating minimum) — the
+        // same span pps_step clamps to.
         if screen == Screen::Pd {
             self.pps_focus = None;
             let n = crate::pd_task::PPS_N
                 .load(core::sync::atomic::Ordering::Relaxed)
                 .min(crate::pd_task::PPS_OBJ.len());
             if n > 0 {
-                self.pps_mv = crate::pd_task::PPS_MIN_MV[0]
-                    .load(core::sync::atomic::Ordering::Relaxed);
-                self.pps_ma = crate::pd_task::PPS_MAX_MA[0]
-                    .load(core::sync::atomic::Ordering::Relaxed)
-                    .max(1000);
+                let mut min_mv = u16::MAX;
+                let mut max_ma = 0u16;
+                for k in 0..n {
+                    min_mv = min_mv.min(crate::pd_task::PPS_MIN_MV[k]
+                        .load(core::sync::atomic::Ordering::Relaxed));
+                    max_ma = max_ma.max(crate::pd_task::PPS_MAX_MA[k]
+                        .load(core::sync::atomic::Ordering::Relaxed));
+                }
+                self.pps_mv = min_mv;
+                self.pps_ma = max_ma.max(1000);
             }
         }
         // r218: the settings screen starts at the APPLIED value.
@@ -1284,7 +1300,13 @@ impl Ui {
             (3, _, 3) => b"OUTPUT IGNORED",
             _ => b"",
         };
-        let mut line = [0u8; 24];
+        // r247: 32 bytes — the worst case ("QC ACTIVE OUTPUT FOLLOWED")
+        // is 25 bytes and PANICKED the 24-byte buffer the first time the
+        // QC follow actually succeeded (the user's QC entry: the state 3
+        // + the outcome 2 = "QC ACTIVE OUTPUT FOLLOWED" = 25 > 24 — the
+        // device froze mid-draw). 25 chars x 12 px (scale 2) = 300 px
+        // from x=8: fits the 320-px screen.
+        let mut line = [0u8; 32];
         let mut n = 0;
         for &b in b"QC " {
             line[n] = b;
