@@ -542,6 +542,48 @@ pub(crate) async fn restore_baseline(bus: &mut embassy_at32::i2c::I2c) -> Result
 /// r239f probe: the I2C error kind, as a small code for the log line
 /// (1 Timeout, 2 ArbitrationLoss, 3 Bus, 4 Overrun, 5 ClockTimeout,
 /// 6.. NAK by source: 6 Generic, 7 Address, 8 Data, 9 Acknowledge).
+/// r250: the standard I2C bus unwedge — a slave stuck mid-
+/// transaction (the FUSB302's I2C interface locks up after an
+/// unanswered Hard-Reset transmission, the boot dead-line wake's
+/// case) holds SDA low and dead-ends EVERY device on I2C1, the
+/// meter at 0x40 included. The pins are re-driven as GPIO open-
+/// drain; if SDA is held low, up to 9 SCL pulses release it, then
+/// a STOP condition. The caller re-muxes the pins to their
+/// alternate function afterwards (and holds `BUS` at runtime, so
+/// no transaction can interleave). Harmless on a healthy bus: the
+/// pulses only fire when SDA is actually held.
+/// Moved here from main.rs (r250): the PD task's park arms run it
+/// themselves — the FUSB302-only wedge never trips the meter arm's
+/// read transition (the TPA keeps answering), so on charger-only
+/// power the unwedge never happened and the bootlooped.
+pub(crate) unsafe fn i2c_unwedge() {
+    use embassy_at32::gpio::{Drive, OutputPin, Port};
+    const HALF: u32 = 48; // ~5 us at 192 MHz
+    let mut scl =
+        unsafe { OutputPin::new_open_drain(Port::B, 6, true, Drive::Moderate) }
+            .expect("i2c scl gpio");
+    let mut sda =
+        unsafe { OutputPin::new_open_drain(Port::B, 7, true, Drive::Moderate) }
+            .expect("i2c sda gpio");
+    cortex_m::asm::delay(HALF);
+    if !sda.is_set() {
+        for _ in 0..9 {
+            scl.set_low();
+            cortex_m::asm::delay(HALF);
+            scl.set_high();
+            cortex_m::asm::delay(HALF);
+            if sda.is_set() {
+                break;
+            }
+        }
+    }
+    // A STOP condition: SDA low while SCL high, then SDA high.
+    sda.set_low();
+    cortex_m::asm::delay(HALF);
+    sda.set_high();
+    cortex_m::asm::delay(HALF);
+}
+
 pub(crate) fn i2c_src_code(e: embassy_at32::i2c::Error) -> u32 {
     use embassy_at32::i2c::Error as I;
     match e {
@@ -947,6 +989,24 @@ pub async fn run() {
     // an attached charger still sees the same sink and never re-announces
     // its caps; the engine dies having heard nothing. One automatic
     // OK-press equivalent (the r147 restart flow) wakes it.
+    //
+    // r250: the wake's role re-established. The caps announce at attach
+    // is NEVER heard by any build — the FUSB302's receiver is configured
+    // only ~600 ms into boot, and the source's announce cycle finishes
+    // before that (the diag's listen reports li=0 in every build,
+    // r239g included). The engine's own Get_Source_Cap recovery does not
+    // fire either, and once the source has exhausted nCapsCount without
+    // an ACK it disables its PD — no caps ever again without a trigger.
+    // The wake's HR is that trigger: it makes the source re-announce
+    // AFTER the receiver is ready, which is how r239g contracted.
+    //
+    // The wake's cost: per the r239f finding the FUSB302's I2C interface
+    // locks up after an unanswered HR transmission, and on charger-only
+    // power the charger then cuts VBUS with no console back-feed to hold
+    // the rail — the r249 standalone bootloop. The mitigation is the
+    // r250b dance in the failure arms below: every HR is followed by the
+    // bus unwedge, and the retry reruns the session on the healed bus
+    // with the wake re-armed for one more attempt.
     let mut boot_wake = true;
     // r239: the boot diagnostic's failure count — a wedged FUSB302
     // (I2C NAKs after an MCU reset hit it mid-transaction) used to
@@ -1004,10 +1064,21 @@ pub async fn run() {
                         // then the session reruns on the healed bus (the
                         // wake's HR already woke the charger - its caps
                         // arrive into THIS session).
+                        //
+                        // r250: the dance now runs HERE, from the PD side —
+                        // the FUSB302-only wedge never trips the meter arm's
+                        // read transition (the TPA keeps answering), so on
+                        // charger-only power the unwedge never happened and
+                        // the bootlooped. The dance's SDA gate makes it
+                        // harmless when the wedge is the NAK-latch type.
                         retried = true;
                         crate::pd_log(
                             b"[pd] diag FAIL x3 - retry after unwedge\r\n",
                         );
+                        {
+                            let mut guard = BUS.lock().await;
+                            unsafe { i2c_unwedge() };
+                        }
                         first = true; // the loop top skips its own wait
                         boot_wake = false; // no second auto-wake
                         Timer::after_millis(1500).await;
@@ -1039,10 +1110,21 @@ pub async fn run() {
                         // then the session reruns on the healed bus (the
                         // wake's HR already woke the charger - its caps
                         // arrive into THIS session).
+                        //
+                        // r250: the dance now runs HERE, from the PD side —
+                        // the FUSB302-only wedge never trips the meter arm's
+                        // read transition (the TPA keeps answering), so on
+                        // charger-only power the unwedge never happened and
+                        // the bootlooped. The dance's SDA gate makes it
+                        // harmless when the wedge is the NAK-latch type.
                         retried = true;
                         crate::pd_log(
                             b"[pd] diag FAIL x3 - retry after unwedge\r\n",
                         );
+                        {
+                            let mut guard = BUS.lock().await;
+                            unsafe { i2c_unwedge() };
+                        }
                         first = true; // the loop top skips its own wait
                         boot_wake = false; // no second auto-wake
                         Timer::after_millis(1500).await;
@@ -1073,10 +1155,17 @@ pub async fn run() {
                             // then the session reruns on the healed bus (the
                             // wake's HR already woke the charger - its caps
                             // arrive into THIS session).
+                            //
+                            // r250: the dance runs HERE (the BUS is held by
+                            // this arm) — the FUSB302-only wedge never trips
+                            // the meter arm's read transition (the TPA keeps
+                            // answering), so on charger-only power the
+                            // unwedge never happened and the bootlooped.
                             retried = true;
                             crate::pd_log(
                                 b"[pd] diag FAIL x3 - retry after unwedge\r\n",
                             );
+                            unsafe { i2c_unwedge() };
                             first = true; // the loop top skips its own wait
                             boot_wake = false; // no second auto-wake
                             Timer::after_millis(1500).await;
@@ -1158,10 +1247,17 @@ pub async fn run() {
                             // then the session reruns on the healed bus (the
                             // wake's HR already woke the charger - its caps
                             // arrive into THIS session).
+                            //
+                            // r250: the dance runs HERE (the BUS is held by
+                            // this arm) — the FUSB302-only wedge never trips
+                            // the meter arm's read transition (the TPA keeps
+                            // answering), so on charger-only power the
+                            // unwedge never happened and the bootlooped.
                             retried = true;
                             crate::pd_log(
                                 b"[pd] diag FAIL x3 - retry after unwedge\r\n",
                             );
+                            unsafe { i2c_unwedge() };
                             first = true; // the loop top skips its own wait
                             boot_wake = false; // no second auto-wake
                             Timer::after_millis(1500).await;
@@ -1630,6 +1726,13 @@ pub async fn run() {
             } else {
                 phy.restart_unheard().await.err()
             };
+            // r250: the post-HR unwedge — the FUSB302's I2C interface
+            // locks up after an unanswered HR transmission (the r239f
+            // finding), and every I2C access after it would fail
+            // (err=768-era). The dance is SDA-gated: harmless when the
+            // bus is healthy, clears the held-SDA lockup before the
+            // transition's reads run.
+            unsafe { i2c_unwedge() };
             if phy.hard_reset_sent() {
                 RESTART.store(false, Ordering::Relaxed); // performed
                 match phy.transition_to_default().await {
