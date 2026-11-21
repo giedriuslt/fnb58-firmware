@@ -778,7 +778,9 @@ async fn main(spawner: Spawner) {
         });
         flags
     };
-    ui.draw_rst(&mut lcd, rst_flags).await;
+    // r249: the boot-time draw_rst overlay ("rst=NN" in the title bar —
+    // a reboot-loop debug aid) removed at the user's request; the same
+    // value goes to the console boot log right below.
     {
         let mut d = [0u8; 64];
         let mut n = 0;

@@ -193,17 +193,23 @@ impl Lcd {
         self.fill_window(x0 + r, y1, x1 - r, y1, color).await;
         self.fill_window(x0, y0 + r, x0, y1 - r, color).await;
         self.fill_window(x1, y0 + r, x1, y1 - r, color).await;
-        // Four corner arcs, one pixel per row/col.
-        for dy in 0..r {
+        // Four corner arcs, continuous: each row spans horizontally from
+        // its own inset back to the previous row's. The chord inset can
+        // jump two-three columns between adjacent rows (r=5: 5,2,1,1,1),
+        // and a one-pixel-per-row arc left HOLES there — the corners
+        // rendered discontinuous (the user's broken-corner report).
+        // The row's own inset stays the span's outer end, so the arc's
+        // outer boundary still matches rounded_fill's corner cut.
+        let mut prev = r;
+        for dy in 1..r {
             let inset = Self::corner_inset(r, dy);
-            let ax = x0 + inset;
-            self.fill_window(ax, y0 + dy, ax, y0 + dy, color).await;
-            let ax = x1 - inset;
-            self.fill_window(ax, y0 + dy, ax, y0 + dy, color).await;
-            let ax = x0 + inset;
-            self.fill_window(ax, y1 - dy, ax, y1 - dy, color).await;
-            let ax = x1 - inset;
-            self.fill_window(ax, y1 - dy, ax, y1 - dy, color).await;
+            let lo = inset.min(prev);
+            let hi = inset.max(prev);
+            self.fill_window(x0 + lo, y0 + dy, x0 + hi, y0 + dy, color).await;
+            self.fill_window(x1 - hi, y0 + dy, x1 - lo, y0 + dy, color).await;
+            self.fill_window(x0 + lo, y1 - dy, x0 + hi, y1 - dy, color).await;
+            self.fill_window(x1 - hi, y1 - dy, x1 - lo, y1 - dy, color).await;
+            prev = inset;
         }
         // The r-inset pixel where each arc meets an edge (dy = r is the
         // edge start, already drawn; the column arcs between the last
