@@ -386,6 +386,20 @@ pub struct Ui {
     /// packed — a change redraws immediately, not on the next capture).
     ripple_at: u32,
     ripple_tag: u16,
+    /// r242: the overview's structural gate — the badge color the card
+    /// chrome was last drawn with (the PROTOCOL card wears it; the other
+    /// cards are static). force_repaint's u16::MAX forces the cards back
+    /// after a screen entry or a shot.
+    power_struct: u16,
+    /// r242: the energy screen's structural gate (the cards + labels are
+    /// static; the totals redraw live in place).
+    energy_struct: u16,
+    /// r242: the LINES screen's structural gate (the D+/D- cards).
+    lines_struct: u16,
+    /// r242: the energy note's last-drawn identity (the memory index +
+    /// the journal's save outcome) — the note redraws only on change
+    /// (its band erase made the every-tick erase+draw cycle flicker).
+    energy_note: (u16, bool),
 }
 
 /// Draw a NUL-terminated copy of `s` (truncated to fit the buffer).
@@ -613,6 +627,10 @@ impl Ui {
             cal_active: false,
             cal_ident: u32::MAX,
             cal_live: (0, 0, false),
+            power_struct: u16::MAX,
+            energy_struct: u16::MAX,
+            lines_struct: u16::MAX,
+            energy_note: (u16::MAX, false),
         }
     }
 
@@ -1009,6 +1027,11 @@ impl Ui {
         self.rec_notice = false;
         self.rec_struct = (0xFF, false, false, false, 0, 0, 0);
         self.rec_live = (u32::MAX, u16::MAX);
+        // r242: the overview's and the energy screen's card chrome too.
+        self.power_struct = u16::MAX;
+        self.energy_struct = u16::MAX;
+        self.lines_struct = u16::MAX;
+        self.energy_note = (u16::MAX, false);
     }
 
     /// r230c: the per-screen header, uniform across all screens —
@@ -1036,17 +1059,14 @@ impl Ui {
             Screen::Cal => (b"CAL", MAGENTA),
         };
         text(lcd, 8, 2, title, 3, accent).await;
-        // The pills sit clear of the longest title ("PD PROFILES" is 11
-        // chars = 198 px); the dots follow them.
-        let (pill_x, dots): (u16, [u16; 3]) = if title.len() >= 10 {
-            (212, [292, 303, 314])
+        // r242: the four group pills are GONE (the user's request — the
+        // screens aren't grouped, they were pure decoration). The three
+        // page dots stay (the first is the screen's accent on its page).
+        let dots: [u16; 3] = if title.len() >= 10 {
+            [292, 303, 314]
         } else {
-            (180, [290, 302, 314])
+            [290, 302, 314]
         };
-        for (i, &c) in [YELLOW, GREEN, ORANGE, MAGENTA].iter().enumerate() {
-            let x = pill_x + i as u16 * 20;
-            lcd.rounded_fill(x, 2, x + 14, 22, 6, c).await;
-        }
         for (i, &d) in dots.iter().enumerate() {
             lcd.dot(d, 12, 5, if i == 0 && screen == Screen::Power { CYAN } else { RULE })
                 .await;
@@ -2345,24 +2365,32 @@ impl Ui {
     /// r226: the energy screen — kws-x1's draw_energy: the CHARGE /
     /// ENERGY / TIME totals in stacked cards. `save_ok` carries the
     /// journal's last checkpoint outcome (the note row below the cards;
-    /// the interval comes from the applied setting).
+    /// the interval comes from the applied setting). r242: two draw
+    /// gates (see draw_power) — the card chrome is structural (the old
+    /// every-tick full redraw strobed all three labels), the totals
+    /// redraw live in place.
     pub async fn draw_energy(
-        &self,
+        &mut self,
         lcd: &mut Lcd,
         totals: settings_core::energy::Totals,
         save_ok: bool,
     ) {
         use core::sync::atomic::Ordering;
-        let cards: [(&[u8], u64, &[u8], u16); 2] = [
-            (b"CHARGE", totals.milliamp_hours(), b"Ah", CYAN),
-            (b"ENERGY", totals.milliwatt_hours(), b"Wh", GREEN),
+        if self.energy_struct != 1 {
+            card(lcd, 4, 34, 315, 90, b"CHARGE", CYAN).await;
+            card(lcd, 4, 96, 315, 152, b"ENERGY", GREEN).await;
+            card(lcd, 4, 158, 315, 214, b"TIME", WHITE).await;
+            self.energy_struct = 1;
+        }
+        // Live, in place: the mAh (mWh) count IS the thousandths of an
+        // Ah (Wh) — three decimals of it read directly in Ah (Wh),
+        // kws-x1's fixed_u64(mAh, 3) trick.
+        let cards: [(u64, &[u8], u16); 2] = [
+            (totals.milliamp_hours(), b"Ah", CYAN),
+            (totals.milliwatt_hours(), b"Wh", GREEN),
         ];
-        for (i, (label, value, unit, color)) in cards.iter().enumerate() {
+        for (i, (value, unit, color)) in cards.iter().enumerate() {
             let y0 = 34 + i as u16 * 62;
-            card(lcd, 4, y0, 315, y0 + 56, label, *color).await;
-            // The mAh (mWh) count IS the thousandths of an Ah (Wh) —
-            // three decimals of it read directly in Ah (Wh), kws-x1's
-            // fixed_u64(mAh, 3) trick.
             let mut l = Line12::new();
             l.num_u32(*value as u32, 3);
             l.push(unit);
@@ -2370,7 +2398,6 @@ impl Ui {
             lcd.draw_text(12, y0 + 10, l.bytes(), 3, *color, BLACK).await;
         }
         // TIME: hours grow past 99 (kws-x1's duration format).
-        card(lcd, 4, 158, 315, 214, b"TIME", WHITE).await;
         let seconds = (totals.elapsed_ms / 1000) as u32;
         let mut l = Line12::new();
         l.num_u32(seconds / 3600, 0);
@@ -2384,30 +2411,40 @@ impl Ui {
         l.pad();
         lcd.draw_text(12, 168, l.bytes(), 3, WHITE, BLACK).await;
         // The note: how the totals are kept (kws-x1's hint note).
-        let idx = crate::settings::ENERGY_IDX.load(Ordering::Relaxed);
-        let memory = settings_core::EnergyMemory::ALL
-            .get(idx)
-            .copied()
-            .unwrap_or(settings_core::EnergyMemory::Off);
-        let mut note = [0u8; 24];
-        match (memory, save_ok) {
-            (settings_core::EnergyMemory::Off, _) => set(&mut note, b"RAM ONLY"),
-            (_, false) => set(&mut note, b"SAVE FAIL"),
-            (_, true) => {
-                let mut line = [0u8; 24];
-                set(&mut line, b"CHECKPOINT ");
-                let mut n = 11;
-                for &b in memory.label().as_bytes() {
-                    if n < 23 {
-                        line[n] = b;
-                        n += 1;
+        // r242: redraws ONLY on change — the r242b band erase turned the
+        // every-tick redraw into an erase+draw cycle that flickered the
+        // note (the user's follow-up); the identity is the memory index
+        // plus the journal's save outcome.
+        let idx = crate::settings::ENERGY_IDX.load(Ordering::Relaxed) as u16;
+        if (idx, save_ok) != self.energy_note {
+            self.energy_note = (idx, save_ok);
+            let memory = settings_core::EnergyMemory::ALL
+                .get(idx as usize)
+                .copied()
+                .unwrap_or(settings_core::EnergyMemory::Off);
+            let mut note = [0u8; 24];
+            match (memory, save_ok) {
+                (settings_core::EnergyMemory::Off, _) => set(&mut note, b"RAM ONLY"),
+                (_, false) => set(&mut note, b"SAVE FAIL"),
+                (_, true) => {
+                    let mut line = [0u8; 24];
+                    set(&mut line, b"CHECKPOINT ");
+                    let mut n = 11;
+                    for &b in memory.label().as_bytes() {
+                        if n < 23 {
+                            line[n] = b;
+                            n += 1;
+                        }
                     }
+                    line[n] = 0;
+                    note = line;
                 }
-                line[n] = 0;
-                note = line;
             }
+            // The note's width varies (RAM ONLY / CHECKPOINT …) — the
+            // band is erased first so a shorter note leaves no tail.
+            lcd.fill_window(8, 202, 170, 212, BLACK).await;
+            lcd.draw_text(12, 220 - 16, &note, 1, GRAY, BLACK).await;
         }
-        lcd.draw_text(12, 220 - 16, &note, 1, GRAY, BLACK).await;
     }
 
     /// r225: the lines screen (kws-x1's Lines tab with only the D+/D−
@@ -2750,13 +2787,20 @@ impl Ui {
     /// cards (this tester's CC lines are not wired to the MCU, the user
     /// board fact). The taps are the QC task's 20 Hz reads, so the
     /// values are live; the 3-decimal V format (r222).
-    pub async fn draw_lines(&self, lcd: &mut Lcd) {
+    pub async fn draw_lines(&mut self, lcd: &mut Lcd) {
         use core::sync::atomic::Ordering;
         let dp = crate::qc_task::DP_MV.load(Ordering::Relaxed);
         let dm = crate::qc_task::DM_MV.load(Ordering::Relaxed);
-        card(lcd, 4, 34, 156, 134, b"D+", YELLOW).await;
+        // r242: the cards + labels STRUCTURAL (see draw_power — the old
+        // every-tick full redraw strobed the D+/D- labels, the user's
+        // follow-up report).
+        if self.lines_struct != 1 {
+            card(lcd, 4, 34, 156, 134, b"D+", YELLOW).await;
+            card(lcd, 164, 34, 315, 134, b"D-", CYAN).await;
+            self.lines_struct = 1;
+        }
+        // Live, in place: the two tap readings (padded opaque cells).
         value_text(lcd, 12, 44, u32::from(dp), 3, b"V", YELLOW, 7).await;
-        card(lcd, 164, 34, 315, 134, b"D-", CYAN).await;
         value_text(lcd, 172, 44, u32::from(dm), 3, b"V", CYAN, 7).await;
     }
 
@@ -2764,21 +2808,34 @@ impl Ui {
     /// 320x240 panel: the VOLTAGE/CURRENT cards on top, the POWER and
     /// MAX (session peaks) cards below, the PROTOCOL strip at the
     /// bottom, all as rounded outlined cards with notched labels. The
-    /// metrics keep the r222 three-decimal V/A/W format. Redraws fully
-    /// at the meter cadence (idempotent overdraw, like the old rows).
-    pub async fn draw_power(&self, lcd: &mut Lcd, mv: u32, ua: i32, mw: i32) {
+    /// metrics keep the r222 three-decimal V/A/W format. r242: two draw
+    /// gates (the r230b class) — the card chrome is STRUCTURAL (once
+    /// per entry, or when the strip's badge color changes; the old full
+    /// redraw at the meter cadence repainted every card's top edge
+    /// colored over the label's glyph row, then the notch black-bit it,
+    /// then the text restored it — the labels strobed and the line
+    /// showed through), the values stay live in place.
+    pub async fn draw_power(&mut self, lcd: &mut Lcd, mv: u32, ua: i32, mw: i32) {
         use core::sync::atomic::Ordering;
-        // Row 1: the value cards (kws-x1's VOLTS_CARD / AMPS_CARD).
-        card(lcd, 4, 34, 156, 82, b"VOLTAGE", YELLOW).await;
+        let (badge, color) = protocol_badge();
+        if self.power_struct != color {
+            // Row 1: the value cards (kws-x1's VOLTS_CARD / AMPS_CARD).
+            card(lcd, 4, 34, 156, 82, b"VOLTAGE", YELLOW).await;
+            card(lcd, 164, 34, 315, 82, b"CURRENT", CYAN).await;
+            // Row 2: the power card and the session peaks.
+            card(lcd, 4, 90, 240, 154, b"POWER", GREEN).await;
+            card(lcd, 248, 90, 315, 154, b"MAX", MAGENTA).await;
+            // The protocol strip's chrome (kws-x1's protocol badge).
+            card(lcd, 4, 162, 315, 188, b"PROTOCOL", color).await;
+            self.power_struct = color;
+        }
+        // Live, in place: the three values (the padded opaque cells
+        // erase their own band).
         value_text(lcd, 12, 46, mv, 3, b"V", YELLOW, 7).await;
-        card(lcd, 164, 34, 315, 82, b"CURRENT", CYAN).await;
         // The meter works in either direction, so the current is shown
         // as a magnitude (kws-x1's note).
         value_text(lcd, 172, 46, ua.unsigned_abs(), 3, b"A", CYAN, 7).await;
-        // Row 2: the power card and the session peaks.
-        card(lcd, 4, 90, 240, 154, b"POWER", GREEN).await;
         value_text(lcd, 12, 104, mw.unsigned_abs(), 4, b"W", GREEN, 9).await;
-        card(lcd, 248, 90, 315, 154, b"MAX", MAGENTA).await;
         let peaks = [
             (crate::qc_task::PEAK_MV.load(Ordering::Relaxed), b"V", YELLOW),
             (crate::qc_task::PEAK_UA.load(Ordering::Relaxed), b"A", CYAN),
@@ -2796,10 +2853,11 @@ impl Ui {
             let w = l.len as u16 * 6;
             lcd.draw_text(310 - w, y, l.bytes(), 1, *color, BLACK).await;
         }
-        // The protocol strip with its heartbeat square (kws-x1's
-        // protocol badge + STRIP_DOT).
-        let (badge, color) = protocol_badge();
-        card(lcd, 4, 162, 315, 188, b"PROTOCOL", color).await;
+        // The badge text + the heartbeat square (kws-x1's STRIP_DOT).
+        // r242: the badge band is erased first — its width varies, and a
+        // shorter badge (USB after a PD contract) left the longer one's
+        // tail.
+        lcd.fill_window(8, 166, 170, 180, BLACK).await;
         text(lcd, 12, 170, &badge, 1, color).await;
         lcd.rounded_fill(300, 170, 308, 178, 2, color).await;
     }
