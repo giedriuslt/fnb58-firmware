@@ -273,6 +273,23 @@ pub enum SetMode {
     Edit,
 }
 
+/// r253: how many rows the SET screen has (DIM IDLE, ENERGY SAVE,
+/// PD PASS, REC INT, BUTTON TONE). Pub: the main loop's row cursor wraps
+/// on it — the literal it used had to be found for every new row.
+pub const SET_ROWS: usize = 5;
+/// The SET rows' geometry: outlined cards of this many rows, starting
+/// here, this many rows apart (the last one ends at 205, above the hint
+/// at 216). The gap is 3, not the 2 the four-row layout had: a card's
+/// label starts 3 rows above its top edge (card()), and with a 2-row gap
+/// that first label row sat on the bottom border of the card above —
+/// its opaque cells cut notches into it.
+const SET_TOP: u16 = 34;
+const SET_CARD_ROWS: u16 = 32;
+const SET_PITCH: u16 = 35;
+/// The value's row inside its card (14 px tall at scale 2; four blank
+/// rows stay under it before the bottom border).
+const SET_VALUE_ROW: u16 = 14;
+
 pub struct Ui {
     pub screen: Screen,
     /// r172: the PPS screen's voltage-selection mode (OK enters, OK
@@ -377,6 +394,9 @@ pub struct Ui {
     /// r239: the REC-interval row's edited value (the REC_INTERVALS
     /// index), re-read from the applied value on entry.
     pub set_rec: usize,
+    /// r253: the BUTTON TONE row's edited value (true = the click is
+    /// off), re-read from the applied value on entry.
+    pub set_tone_muted: bool,
     /// r221: the calibration wizard (created fresh on the OK that
     /// enters it, from the applied calibration; nothing applies until
     /// the last OK). r226: `cal_active` gates the wizard — without it
@@ -642,6 +662,7 @@ impl Ui {
             set_sel: 0,
             set_drawn: -1,
             set_rec: 0,
+            set_tone_muted: false,
             set_mode: SetMode::Idle,
             set_row: 0,
             set_energy: 0,
@@ -1174,6 +1195,7 @@ impl Ui {
                 crate::settings::PASSTHROUGH.load(core::sync::atomic::Ordering::Relaxed);
             self.set_rec =
                 crate::settings::REC_IDX.load(core::sync::atomic::Ordering::Relaxed);
+            self.set_tone_muted = crate::settings::tone_muted();
             self.set_mode = SetMode::Idle;
             self.set_drawn = -1;
         }
@@ -2035,15 +2057,19 @@ impl Ui {
     /// r226: the settings page — two rows (the dim timeout and the
     /// energy checkpoint interval) with kws-x1's cursor model: Idle
     /// shows both flat, Row/Edit highlight the cursor row in yellow.
+    /// r253: a fifth row, BUTTON TONE (ON/OFF) — the click on every
+    /// press; the cards tighten to fit (SET_ROWS and its consts).
     pub async fn draw_settings(&mut self, lcd: &mut Lcd) {
         // r239: the REC row joins the identity (the old i16 packing
-        // had no room for a 4th field; i32 with wide spacing).
+        // had no room for a 4th field; i32 with wide spacing). r253: the
+        // tone flag takes the units place beside passthrough's.
         let ident = self.set_mode as i32 * 1_000_000
             + self.set_row as i32 * 100_000
             + self.set_sel as i32 * 10_000
             + self.set_energy as i32 * 1_000
             + self.set_rec as i32 * 10
-            + i32::from(self.set_passthrough);
+            + i32::from(self.set_passthrough) * 2
+            + i32::from(self.set_tone_muted);
         if ident == self.set_drawn {
             return;
         }
@@ -2065,6 +2091,8 @@ impl Ui {
             .map(|&m| m.label().as_bytes())
             .unwrap_or(b"OFF");
         let pass_value: &[u8] = if self.set_passthrough { b"ON" } else { b"OFF" };
+        // r253: the BUTTON TONE row — ON unless the click is muted.
+        let tone_value: &[u8] = if self.set_tone_muted { b"OFF" } else { b"ON" };
         // r239: the REC interval row — the interval a FRESH recording
         // starts with (a resumed log keeps its own).
         let rec_value: &[u8] = match crate::settings::REC_INTERVALS
@@ -2083,22 +2111,34 @@ impl Ui {
         };
         // r232: the settings as outlined cards (the box style the
         // graphical screens use) — the cursor row's card in yellow, the
-        // other in gray, the value big inside. r239: four rows now
-        // (the REC interval joins).
-        let rows: [(u16, u16, &[u8], &[u8]); 4] = [
-            (34, 76, b"DIM IDLE", dim_value),
-            (78, 120, b"ENERGY SAVE", energy_value),
-            (122, 164, b"PD PASS", pass_value),
-            (166, 208, b"REC INT", rec_value),
+        // others in gray, the value big inside. r239: four rows (the REC
+        // interval joins). r253: five (BUTTON TONE joins), at SET_PITCH.
+        let rows: [(&[u8], &[u8]); SET_ROWS] = [
+            (b"DIM IDLE", dim_value),
+            (b"ENERGY SAVE", energy_value),
+            (b"PD PASS", pass_value),
+            (b"REC INT", rec_value),
+            (b"BUTTON TONE", tone_value),
         ];
-        for (i, (y0, y1, label, value)) in rows.iter().enumerate() {
+        for (i, (label, value)) in rows.iter().enumerate() {
+            let y0 = SET_TOP + i as u16 * SET_PITCH;
             let cursor = self.set_mode != SetMode::Idle && self.set_row == i;
             let color = if cursor { YELLOW } else { GRAY };
-            card(lcd, 4, *y0, 315, *y1, label, color).await;
+            card(
+                lcd,
+                4,
+                y0,
+                315,
+                y0 + SET_CARD_ROWS - 1,
+                label,
+                color,
+            )
+            .await;
             let mut v = Line12::new();
             v.push(value);
             v.pad();
-            lcd.draw_text(20, y0 + 18, v.bytes(), 2, color, BLACK).await;
+            lcd.draw_text(20, y0 + SET_VALUE_ROW, v.bytes(), 2, color, BLACK)
+                .await;
         }
     }
 

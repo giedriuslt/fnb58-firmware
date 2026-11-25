@@ -62,6 +62,12 @@ static SHOT_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// r225: console 'x' armed — advance one screen forward (the remote
 /// navigation the screenshot workflow drives: 'x' then 'shot').
 static NEXT_SCREEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// r253: console 'bt' armed — flip the button click (the SET screen's
+/// BUTTON TONE row) and save it. Armed like 'x' because the save needs
+/// the settings store, which only the main loop holds; it is how the
+/// save → boot-scan path is checked on the device without the buttons.
+static TONE_TOGGLE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 /// r239d: the meter arm's last-read health, for the transition logs.
 static METER_WAS_OK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
@@ -974,6 +980,29 @@ async fn main(spawner: Spawner) {
             sender.push(b"[ui] advanced\r\n");
         }
 
+        // r253: console 'bt' — flip the button click and save it: the
+        // same save the SET screen's OK runs, every stored field passed
+        // through unchanged so only the settings word appends. An open
+        // SET screen picks the new value up.
+        if TONE_TOGGLE_ARMED.swap(false, Ordering::Relaxed) {
+            let muted = !settings::tone_muted();
+            settings::save(
+                &mut flash,
+                &mut store,
+                settings::DIM_MINUTES.load(Ordering::Relaxed),
+                settings::ENERGY_IDX.load(Ordering::Relaxed),
+                settings::PASSTHROUGH.load(Ordering::Relaxed),
+                settings::REC_IDX.load(Ordering::Relaxed),
+                muted,
+                settings::applied(),
+            );
+            settings::log_tone();
+            if ui.screen == Screen::Settings {
+                ui.set_tone_muted = settings::tone_muted();
+                ui.set_drawn = -1;
+            }
+        }
+
         // r223: console 'shot' — force a full repaint of the CURRENT
         // screen with the LCD's capture sink armed: every draw primitive
         // streams to the console (tools/fnb58-shot.py replays them into
@@ -1096,7 +1125,8 @@ async fn main(spawner: Spawner) {
                 // r176: NOT while a PD exchange is in flight — the buzz is
                 // a 30 ms busy-wait that blacks out the PD task's answer
                 // window (the same class as the r160 draw starvation).
-                if !pd_task::BUSY.load(Ordering::Relaxed) {
+                // r253: off when the SET screen's BUTTON TONE row muted it.
+                if !settings::tone_muted() && !pd_task::BUSY.load(Ordering::Relaxed) {
                     buzzer.buzz(500, 30);
                 }
             } else {
@@ -1157,6 +1187,7 @@ async fn main(spawner: Spawner) {
                             ui.set_energy,
                             ui.set_passthrough,
                             ui.set_rec,
+                            ui.set_tone_muted,
                             settings::applied(),
                         );
                         ui.set_mode = SetMode::Row;
@@ -1261,6 +1292,7 @@ async fn main(spawner: Spawner) {
                             settings::ENERGY_IDX.load(Ordering::Relaxed),
                             settings::PASSTHROUGH.load(Ordering::Relaxed),
                             settings::REC_IDX.load(Ordering::Relaxed),
+                            settings::TONE_MUTED.load(Ordering::Relaxed),
                             cal,
                         );
                         ui.enter(&mut lcd, Screen::Settings).await;
@@ -1308,8 +1340,10 @@ async fn main(spawner: Spawner) {
                     ));
                 }
                 Press::SetRow(dir) => {
-                    // r226: the settings page's row cursor.
-                    ui.set_row = ((ui.set_row as i16 + dir).rem_euclid(4)) as usize;
+                    // r226: the settings page's row cursor (r253: the row
+                    // count is the screen's, not a literal here).
+                    ui.set_row =
+                        ((ui.set_row as i16 + dir).rem_euclid(crate::ui::SET_ROWS as i16)) as usize;
                     ui.set_drawn = -1;
                     let mut d = [0u8; 24];
                     let mut n = 0;
@@ -1537,6 +1571,30 @@ async fn main(spawner: Spawner) {
                     // the QC screens cycle their own targets. r226: the
                     // settings page's Edit mode changes the CURSOR row's
                     // value (dim, or the energy checkpoint interval).
+                    if ui.screen == Screen::Settings && ui.set_row == 4 {
+                        // r253: the BUTTON TONE row toggles (ON <-> OFF). It
+                        // is saved by the OK like every row; the click on
+                        // the presses after that follows the saved value.
+                        ui.set_tone_muted = !ui.set_tone_muted;
+                        ui.set_drawn = -1;
+                        let mut d = [0u8; 32];
+                        let mut n = 0;
+                        for &b in b"[set] button tone=" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        let label: &[u8] = if ui.set_tone_muted { b"OFF" } else { b"ON" };
+                        for &b in label {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        for &b in b"\r\n" {
+                            d[n] = b;
+                            n += 1;
+                        }
+                        sender.push(&d[..n]);
+                        continue;
+                    }
                     if ui.screen == Screen::Settings && ui.set_row == 3 {
                         // r239: the REC INT row cycles the interval
                         // index (1-2-3-5-10-20-30-60 s; a fresh
@@ -2357,6 +2415,15 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
             d[n + 1] = b'\n';
             n += 2;
             send_direct(&d[..n]);
+        }
+        // r253: flip the button click and save it (the SET screen's
+        // BUTTON TONE row, from the console). Armed like 'x': the save
+        // needs the settings store, which only the main loop holds.
+        // Must stay ABOVE the bare 'b' arm (the r212 rule: a plain
+        // b'b' match would swallow "bt").
+        b'b' if cmd == b"bt" => {
+            TONE_TOGGLE_ARMED.store(true, Ordering::Relaxed);
+            send_direct(b"[set] button tone toggle armed\r\n");
         }
         // r216: toggle the idle dim immediately (the same 20%/100% the
         // idle logic applies) — hardware verification without waiting

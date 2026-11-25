@@ -112,13 +112,22 @@ impl EnergyMemory {
 /// The settings record word: the dim minutes in the low byte, the
 /// energy-memory index in bits 8..10 (kws-x1 packs its settings word
 /// as bitfields; the r218 word's reserved bits were held for exactly
-/// this) and the PD passthrough flag in bit 11 (r233). Callers validate
-/// `minutes` via [`dim_minutes_to_record`].
-pub fn settings_word(minutes: u32, energy_idx: usize, passthrough: bool, rec_idx: usize) -> u32 {
+/// this), the PD passthrough flag in bit 11 (r233), the recording
+/// interval index in bits 12..14 (r239) and the button-click mute flag
+/// in bit 15 (r253). Callers validate `minutes` via
+/// [`dim_minutes_to_record`].
+pub fn settings_word(
+    minutes: u32,
+    energy_idx: usize,
+    passthrough: bool,
+    rec_idx: usize,
+    tone_muted: bool,
+) -> u32 {
     (minutes & 0xFF)
         | ((energy_idx as u32 & 0x7) << 8)
         | (u32::from(passthrough) << 11)
         | ((rec_idx as u32 & 0x7) << 12)
+        | (u32::from(tone_muted) << 15)
 }
 
 /// Decode a record word's energy-memory index (bits 8..10, valid
@@ -144,6 +153,14 @@ pub fn rec_interval_from_record(word: u32) -> usize {
     (word >> 12 & 0x7) as usize
 }
 
+/// Decode a record word's button-click mute flag (bit 15, r253). The bit
+/// means MUTED on purpose: every record written before the flag existed
+/// has it clear, so those devices keep the click they were shipped with
+/// — an "enabled" bit would have silenced them all on the first boot.
+pub fn tone_muted_from_record(word: u32) -> bool {
+    word >> 15 & 1 == 1
+}
+
 /// The scan fold's carried findings: the newest dim minutes, the newest
 /// energy-memory index and the newest calibration fields.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -152,6 +169,8 @@ pub struct ScanState {
     pub energy: Option<usize>,
     pub passthrough: bool,
     pub rec: Option<usize>,
+    /// r253: false (the click on) until a record says otherwise.
+    pub tone_muted: bool,
     pub cal: Found,
 }
 
@@ -186,6 +205,7 @@ pub fn scan_records(
                 }
                 state.passthrough = passthrough_from_record(word);
                 state.rec = Some(rec_interval_from_record(word));
+                state.tone_muted = tone_muted_from_record(word);
             }
         }
         slot += RECORD;
@@ -235,23 +255,67 @@ mod tests {
     #[test]
     fn settings_word_packs_dim_and_energy() {
         for (minutes, idx) in [(0u32, 0usize), (10, 4), (5, 2)] {
-            let word = settings_word(minutes, idx, false, 0);
+            let word = settings_word(minutes, idx, false, 0, false);
             assert_eq!(dim_minutes_from_record(word), Some(minutes));
             assert_eq!(energy_memory_from_record(word), Some(idx));
         }
         // An invalid energy index decodes as nothing; dim survives.
-        assert_eq!(energy_memory_from_record(settings_word(5, 6, false, 0)), None);
+        assert_eq!(energy_memory_from_record(settings_word(5, 6, false, 0, false)), None);
         // The old single-field words read as energy=Off (index 0).
         assert_eq!(energy_memory_from_record(5), Some(0));
     }
 
     #[test]
     fn rec_interval_roundtrips_and_old_words_default() {
-        assert_eq!(rec_interval_from_record(settings_word(1, 0, false, 7)), 7);
+        assert_eq!(rec_interval_from_record(settings_word(1, 0, false, 7, false)), 7);
         assert_eq!(REC_INTERVALS[7], 60);
         // An old single-field word reads as 1 s (index 0).
         assert_eq!(rec_interval_from_record(5), 0);
         assert_eq!(REC_INTERVALS[rec_interval_from_record(0x0000_2000)], 3);
+    }
+
+    /// r253: the button click's mute flag rides bit 15. The bit means
+    /// MUTED, so every record written before the flag existed — and a
+    /// store with no record at all — reads as the click ON, which is
+    /// what those devices already did.
+    #[test]
+    fn button_tone_mute_flag_roundtrips_and_old_words_keep_the_click() {
+        for (minutes, idx, pass, rec) in [(0u32, 0usize, false, 0usize), (10, 4, true, 7)] {
+            let on = settings_word(minutes, idx, pass, rec, false);
+            let off = settings_word(minutes, idx, pass, rec, true);
+            assert!(!tone_muted_from_record(on));
+            assert!(tone_muted_from_record(off));
+            // The flag is the only difference: the other fields survive it.
+            assert_eq!(off, on | 1 << 15);
+            assert_eq!(dim_minutes_from_record(off), Some(minutes));
+            assert_eq!(energy_memory_from_record(off), Some(idx));
+            assert_eq!(passthrough_from_record(off), pass);
+            assert_eq!(rec_interval_from_record(off), rec);
+            // Still one valid record: the complement check holds.
+            assert!(valid(off, !off));
+            // And not a calibration record (those are tagged in the top byte).
+            let mut found = Found::default();
+            assert!(!found.read(off));
+        }
+        // Words from every earlier build (the flag's bit clear) keep the click.
+        assert!(!tone_muted_from_record(5));
+        assert!(!tone_muted_from_record(1 | 1 << 11 | 7 << 12));
+        // An empty scan (no record at all) starts with the click on.
+        assert!(!ScanState::default().tone_muted);
+        // A scan reads the flag, and the newest record wins for it too.
+        let word = settings_word(5, 0, false, 0, false);
+        let (state, _) =
+            scan_records([(word, !word)].into_iter(), ScanState::default(), FIRST + RECORD);
+        assert!(!state.tone_muted);
+        let muted = settings_word(5, 0, false, 0, true);
+        let records = [(muted, !muted), (word, !word)];
+        let (state, _) =
+            scan_records(records.into_iter(), ScanState::default(), FIRST + 2 * RECORD);
+        assert!(!state.tone_muted);
+        let records = [(word, !word), (muted, !muted)];
+        let (state, _) =
+            scan_records(records.into_iter(), ScanState::default(), FIRST + 2 * RECORD);
+        assert!(state.tone_muted);
     }
 
     #[test]
@@ -294,13 +358,14 @@ mod tests {
         // stale record from the same sector.
         let (state, _) = scan_records([(dim, !dim)].into_iter(), ScanState { dim: Some(10), ..ScanState::default() }, 32);
         assert_eq!(state.dim, Some(2));
-        // A packed dim+energy word updates both fields.
-        let word = settings_word(5, 3, true, 0);
+        // A packed word updates every field.
+        let word = settings_word(5, 3, true, 0, true);
         let (state, _) =
             scan_records([(word, !word)].into_iter(), ScanState::default(), FIRST + RECORD);
         assert_eq!(state.dim, Some(5));
         assert_eq!(state.energy, Some(3));
         assert!(state.passthrough);
+        assert!(state.tone_muted);
     }
 
     /// r221: calibration records ride the same scan — a calibration word

@@ -96,6 +96,19 @@ pub fn passthrough() -> bool {
     PASSTHROUGH.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// r253: the applied button click — true when MUTED. The click on every
+/// press (the main loop) reads this at the press, so a saved change
+/// applies at once. Off by default: nothing stored means the click stays
+/// on, and so does every record written before the flag existed (the
+/// word's bit means muted — settings-core's tone_muted_from_record).
+pub static TONE_MUTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// r253: whether the button click is muted.
+pub fn tone_muted() -> bool {
+    TONE_MUTED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// r226: the applied interval in seconds, `None` = Off (the main
 /// loop's checkpoint cadence reads this).
 pub fn energy_interval() -> Option<u64> {
@@ -257,6 +270,7 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
         energy,
         passthrough,
         rec,
+        tone_muted,
         cal,
     } = state;
     match dim {
@@ -267,6 +281,7 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
             }
             PASSTHROUGH.store(passthrough, core::sync::atomic::Ordering::Relaxed);
             REC_IDX.store(rec.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
+            TONE_MUTED.store(tone_muted, core::sync::atomic::Ordering::Relaxed);
             store_cal(cal.calibration());
             let mut d = [0u8; 40];
             let mut n = 0;
@@ -283,6 +298,7 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
             log_energy();
             log_passthrough();
             log_rec();
+            log_tone();
             log_cal(b"[set] stored cal", cal.calibration());
             (
                 Store {
@@ -293,6 +309,7 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
                             energy.unwrap_or(0),
                             passthrough,
                             rec.unwrap_or(0),
+                            tone_muted,
                         ),
                         cal.calibration(),
                     ),
@@ -310,10 +327,12 @@ pub fn open(flash: &mut Flash) -> (Store, Option<u32>) {
                 ENERGY_IDX.store(idx, core::sync::atomic::Ordering::Relaxed);
                 log_energy();
             }
-            log_passthrough();
-            log_rec();
             PASSTHROUGH.store(passthrough, core::sync::atomic::Ordering::Relaxed);
             REC_IDX.store(rec.unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
+            TONE_MUTED.store(tone_muted, core::sync::atomic::Ordering::Relaxed);
+            log_passthrough();
+            log_rec();
+            log_tone();
             if cal.any() {
                 store_cal(cal.calibration());
                 log_cal(b"[set] stored cal", cal.calibration());
@@ -346,6 +365,29 @@ fn log_passthrough() {
     }
     for &b in b"
 " {
+        d[n] = b;
+        n += 1;
+    }
+    log(&d[..n]);
+}
+
+/// r253: log the applied button click (the boot evidence — the row's
+/// saved value is otherwise invisible in the log). Pub(crate): the
+/// main loop's console 'bt' arm reports its save through it.
+pub(crate) fn log_tone() {
+    let muted = TONE_MUTED.load(core::sync::atomic::Ordering::Relaxed);
+    let mut d = [0u8; 32];
+    let mut n = 0;
+    for &b in b"[set] button tone=" {
+        d[n] = b;
+        n += 1;
+    }
+    let label: &[u8] = if muted { b"OFF" } else { b"ON" };
+    for &b in label {
+        d[n] = b;
+        n += 1;
+    }
+    for &b in b"\r\n" {
         d[n] = b;
         n += 1;
     }
@@ -428,24 +470,25 @@ fn log_cal(prefix: &[u8], cal: Calibration) {
     log(&d[..n]);
 }
 
-/// The store's full record set: the settings word (dim + energy), then
-/// the calibration's one record per field (kws-x1's records[..] shape —
-/// a newly claimed sector starts with all of them, so it never depends
-/// on older ones).
+/// The store's full record set: the settings word (every flag and
+/// field, r253 included), then the calibration's one record per field
+/// (kws-x1's records[..] shape — a newly claimed sector starts with all
+/// of them, so it never depends on older ones).
 fn record_set(
     minutes: u32,
     energy_idx: usize,
     passthrough: bool,
     rec_idx: usize,
+    tone_muted: bool,
     cal: Calibration,
 ) -> [u32; 1 + FIELDS] {
     let mut records = [0u32; 1 + FIELDS];
-    records[0] = settings_word(minutes, energy_idx, passthrough, rec_idx);
+    records[0] = settings_word(minutes, energy_idx, passthrough, rec_idx, tone_muted);
     records[1..].copy_from_slice(&cal.records());
     records
 }
 
-/// Save the settings word (dim + energy index) and the calibration
+/// Save the settings word (every flag and field) and the calibration
 /// (append only the changed records unless the store is full — then a
 /// new sector is claimed with the FULL record set, kws-x1's save).
 /// Every outcome logs — no silent failure branches. The values are
@@ -458,13 +501,14 @@ pub fn save(
     energy_idx: usize,
     passthrough: bool,
     rec_idx: usize,
+    tone_muted: bool,
     cal: Calibration,
 ) {
     let Some(word) = dim_minutes_to_record(minutes) else {
         log(b"[set] save refused (bad value)\r\n");
         return;
     };
-    let word = settings_word(minutes, energy_idx, passthrough, rec_idx);
+    let word = settings_word(minutes, energy_idx, passthrough, rec_idx, tone_muted);
     if word == store.saved.0 && cal == store.saved.1 {
         return;
     }
@@ -472,7 +516,7 @@ pub fn save(
     // dim word if it changed, all FIELDS calibration records if the
     // calibration as a whole changed) — compared against the OLD saved
     // set, which updates only after the fold.
-    let records = record_set(minutes, energy_idx, passthrough, rec_idx, cal);
+    let records = record_set(minutes, energy_idx, passthrough, rec_idx, tone_muted, cal);
     let mut changed = [0u32; 1 + FIELDS];
     let mut count = 0;
     for (record, keep) in records.iter().zip(
@@ -490,6 +534,7 @@ pub fn save(
     ENERGY_IDX.store(energy_idx, core::sync::atomic::Ordering::Relaxed);
     PASSTHROUGH.store(passthrough, core::sync::atomic::Ordering::Relaxed);
     REC_IDX.store(rec_idx, core::sync::atomic::Ordering::Relaxed);
+    TONE_MUTED.store(tone_muted, core::sync::atomic::Ordering::Relaxed);
     store_cal(cal);
     store.saved = (word, cal);
     let result = match store.next {

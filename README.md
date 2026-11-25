@@ -166,6 +166,9 @@ ADC1+DMA1+analysis chain) followed by one on the PA6 pickup; `r2` =
 the 32-bit-wide variant; `m` = a DMA memory-to-memory copy (engine
 test); `af`/`ad`/`ap` = the AFC handshake-path commit, direct-entry
 commit, and ping-width sweep (see the AFC section). `b` = toggle the idle dim (r216).
+`bt` = flip the button click and save it — the SET screen's BUTTON TONE
+row from the host (r253; the main loop runs the save and logs
+`[set] button tone=ON|OFF`).
 `c` = the applied calibration fields + the meter's raw registers
 (r221: `[cal] z=… c=… v=… raw=<bus>/<cur> f=<fresh>`). `x` = advance
 one screen forward (r225 — the remote navigation the screenshot
@@ -438,6 +441,19 @@ W25Q128 carries the stock firmware's littlefs, so claiming ERASES the
 sector first — once per ~10,240 records, never during saves. The
 region boundary protects everything beyond sector 20.
 
+**The settings word** (the record's data word): the idle-dim minutes in
+bits 7..0 (0/1/2/5/10), the energy-memory index in bits 10..8, the PD
+passthrough flag in bit 11, the REC-interval index in bits 14..12 and
+the button-click mute flag in bit 15 (r253); bits 31..16 are free, and
+the calibration fields ride beside it as separate tagged records. The
+mute flag means *muted* on purpose: every record an earlier build wrote
+has that bit clear, so a device updated from r252 or before keeps its
+click instead of going silent on the first boot. The codecs live in
+`settings-core` (`cargo test -p settings-core`, host), and
+`fnb58-research/ui-hostcheck` runs the real `open()`/`save()` against a
+RAM model of the chip (mute, reboot, an older record, a sector
+rollover).
+
 ## Offline recorder (r239)
 
 The REC screen records calibrated voltage/current samples into the
@@ -460,15 +476,40 @@ columns t_s,v_v,a_a,w_w.
 always navigate (the r218 always-adjusting screen blocked reaching the
 later screens; r222 gated the adjust, r226 grew the rows); **OK enters
 Row mode** (hint `OK:SET` → `LR:ROW OK:EDIT BK:X`), LEFT/RIGHT move the
-cursor over the two rows (DIM IDLE, ENERGY SAVE), **OK opens the row's
-editor** (`LR:ADJ OK:SAVE BK:X`), LEFT/RIGHT change that row's value,
-OK saves it (`[set] dim=N min EN=<interval> saved s=<sect>` on the
-console) and returns to Row mode, BACK steps back a level. The dim
-timeout applies immediately; the energy interval arms the journal's
-checkpoint cadence (previewing never checkpoints per arrow tap). Boot
-evidence: `[set] stored dim=N min` + `[set] energy <interval>` or
-`[set] no stored settings (default dim=1)`; a JEDEC mismatch logs
-`[set] flash JEDEC FAIL` and leaves defaults.
+cursor over the rows (DIM IDLE, ENERGY SAVE, PD PASS, REC INT and, as
+of r253, BUTTON TONE — five outlined cards), **OK opens the row's
+editor** (`LR:ADJ OK:SAVE BK:X`), LEFT/RIGHT change that row's value
+(the two flags toggle), OK saves it (`[set] dim=N min EN=<interval>
+saved s=<sect>` on the console) and returns to Row mode, BACK steps
+back a level. The dim timeout applies immediately; the energy interval
+arms the journal's checkpoint cadence (previewing never checkpoints per
+arrow tap). **BUTTON TONE** (r253) turns the click on every press off
+or on; it applies from the next press after the save, and the two boot
+beeps are not part of it. Fitting the fifth row tightened the cards
+from a 44 to a 35 px pitch with a 3-row gap: at the old 2-row gap each
+card's label sat on the bottom border of the card above and cut
+notches into it. Boot evidence: `[set] stored dim=N min`, `[set] energy
+<interval>`, `[set] pd pass=…`, `[set] rec int=…s` and `[set] button
+tone=ON|OFF`, or `[set] no stored settings (default dim=1)`; a JEDEC
+mismatch logs `[set] flash JEDEC FAIL` and leaves defaults. Console
+`bt` flips the click and saves it from the host (the same save as the
+row's OK).
+
+**Status of the r253 image (2026-11-25) — do not flash it to the bench
+board as it is.** The feature works there (the SET screen renders, and
+`bt` → reboot read the stored mute back), but the image boots badly:
+4 boots of 4 failed their first I²C transactions — the meter
+identification read (`[meter] rust i2c read FAIL`), the accelerometer
+init (`[accel] kxtj3 FAIL`) and the PD diagnostic (`[pd] snapshot
+FAIL`, `err=257`, PD parked) — until the meter loop's unwedge healed
+the bus a second later, too late for them. r252, flashed back the same
+way, booted clean 4 of 4 (meter OK, accelerometer OK, the PD diagnostic
+runs to its no-source end). Nothing in this change touches I²C, so this
+is the image-dependent start-up behaviour the board has shown before,
+not a fault in these paths. A boot-time retry of the first read after
+the unwedge (r253b, not kept) did not cure it: the retry failed too,
+and PD failed with `err=523` (a bus error at register 0x0B). The device
+stays on r252.
 
 ## Calibration (r221/r221b/r226)
 
