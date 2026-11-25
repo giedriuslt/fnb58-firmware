@@ -1,0 +1,13 @@
+[package]
+name = "single-wire-protocols"
+version = "0.1.0"
+edition = "2024"
+description = "Allocation-free SCP, FCP and AFC detection and output control with caller-owned physical transport."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# Upstream r cdd1101 inherits these from its own workspace root
+# (crc = "3.4.0", thiserror = "2.0.21"); this copy is not that workspace.
+crc = { version = "3.4.0", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }

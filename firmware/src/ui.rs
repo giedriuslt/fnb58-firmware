@@ -299,16 +299,20 @@ pub struct Ui {
     qc_tgt: u16,
     /// r195: the dynamic rows' last in-place update (ms, wrapping u32).
     qc_dyn_at: u32,
-    /// r196: the QC3 screen's dynamic rows' last update (separate cadence
-    /// from the QC2 screen's — each screen redraws independently).
-    qc3_dyn_at: u32,
-    /// r196: the QC3 screen's static-layer cache (state + target).
-    qc3_state: u8,
-    qc3_tgt: u16,
-    /// r198: the AFC screen's caches (same pattern as the QC screens).
+    /// r252: the QC3 screen's two draw gates (the r239c class): the
+    /// structural identity (state, failure, badge) redraws the card chrome
+    /// once per change; the live values (selected target, bus, D±) overdraw
+    /// in place. `None` bus = no fresh meter reading.
+    qc3_struct: (u8, u8, u8),
+    qc3_live: (u16, Option<u32>, u16, u16),
+    /// r198/r252: the AFC screen's identity at the last redraw (the QC2
+    /// pattern): state, outcome, failure, the pending request and the
+    /// output a session is holding.
     afc_state: u8,
+    afc_outcome: u8,
+    afc_failure: u8,
     afc_tgt: u16,
-    afc_dyn_at: u32,
+    afc_held: u16,
     /// r229: the profiles selector's state (kws-x1's editing flag and
     /// the previewed row) plus the body's identity cache.
     pub profiles_edit: bool,
@@ -473,11 +477,26 @@ fn fixed(buf: &mut [u8], mut n: usize, v: u32, dec: usize) -> usize {
 fn protocol_badge() -> ([u8; 24], u16) {
     use core::sync::atomic::Ordering;
     let state = crate::qc_task::STATE.load(Ordering::Relaxed);
-    if state == 3 || state == 5 {
+    // r252: 7 is the AFC session's state. The gate used to take only the
+    // QC session states (3/5), so the AFC arm below was unreachable and a
+    // live AFC session never badged the overview.
+    if state == 3 || state == 5 || state == 7 {
         let mode = crate::qc_task::MODE.load(Ordering::Relaxed);
         let (name, mv): (&[u8], u16) = match mode {
             1 => (b"QC3 ", u32::from(crate::qc_task::M3_TARGET.load(Ordering::Relaxed)) as u16),
-            2 => (b"AFC ", crate::qc_task::AFC_TARGET.load(Ordering::Relaxed)),
+            2 => {
+                // The request a session is holding; the pending one when
+                // none is.
+                let held = crate::qc_task::AFC_SET_MV.load(Ordering::Relaxed);
+                (
+                    b"AFC ",
+                    if held != 0 {
+                        held
+                    } else {
+                        crate::qc_task::AFC_TARGET.load(Ordering::Relaxed)
+                    },
+                )
+            }
             _ => (
                 b"QC2 ",
                 crate::qc_task::TARGETS_MV
@@ -584,12 +603,13 @@ impl Ui {
             qc_failure: 0xFF,
             qc_tgt: 0xFFFF,
             qc_dyn_at: 0,
-            qc3_dyn_at: 0,
-            qc3_state: 0xFF,
-            qc3_tgt: 0xFFFF,
+            qc3_struct: (0xFF, 0xFF, 0xFF),
+            qc3_live: (u16::MAX, None, u16::MAX, u16::MAX),
             afc_state: 0xFF,
+            afc_outcome: 0xFF,
+            afc_failure: 0xFF,
             afc_tgt: 0xFFFF,
-            afc_dyn_at: 0,
+            afc_held: 0xFFFF,
             profiles_edit: false,
             profiles_sel: 0,
             profiles_drawn: (true, usize::MAX, 0, 0),
@@ -1014,12 +1034,13 @@ impl Ui {
         self.qc_failure = 0xFF;
         self.qc_tgt = 0xFFFF;
         self.qc_dyn_at = 0;
-        self.qc3_dyn_at = 0;
-        self.qc3_state = 0xFF;
-        self.qc3_tgt = 0xFFFF;
+        self.qc3_struct = (0xFF, 0xFF, 0xFF);
+        self.qc3_live = (u16::MAX, None, u16::MAX, u16::MAX);
         self.afc_state = 0xFF;
+        self.afc_outcome = 0xFF;
+        self.afc_failure = 0xFF;
         self.afc_tgt = 0xFFFF;
-        self.afc_dyn_at = 0;
+        self.afc_held = 0xFFFF;
         self.ripple_at = 0;
         self.ripple_tag = 0xFFFF;
         self.set_drawn = -1;
@@ -1315,9 +1336,11 @@ impl Ui {
             b"OFF", b"RELEASE", b"ENTRY", b"ACTIVE", b"FAIL", b"STEP",
         ];
         let name = STATES.get(state as usize).copied().unwrap_or(b"?");
+        // r252: the reason alone — it follows the state's own "FAIL", and
+        // the old "FAIL NODCP" read "QC FAIL FAIL NODCP" on this row.
         let detail: &[u8] = match (state, failure, outcome) {
-            (4, 1, _) => b"FAIL NODCP",
-            (4, 2, _) => b"FAIL NOENTRY",
+            (4, 1, _) => b"NODCP",
+            (4, 2, _) => b"NOENTRY",
             (3, _, 1) => b"OUTPUT WAIT",
             (3, _, 2) => b"OUTPUT FOLLOWED",
             (3, _, 3) => b"OUTPUT IGNORED",
@@ -1329,6 +1352,9 @@ impl Ui {
         // + the outcome 2 = "QC ACTIVE OUTPUT FOLLOWED" = 25 > 24 — the
         // device froze mid-draw). 25 chars x 12 px (scale 2) = 300 px
         // from x=8: fits the 320-px screen.
+        // r252: drawn with draw_text, NOT text() — the helper copies into
+        // a 24-byte buffer, so the line above still lost its tail and
+        // read "QC ACTIVE OUTPUT FOLLO".
         let mut line = [0u8; 32];
         let mut n = 0;
         for &b in b"QC " {
@@ -1344,226 +1370,269 @@ impl Ui {
             n += detail.len();
         }
         line[n] = 0;
-        text(
-            lcd,
+        lcd.draw_text(
             8,
             184,
             &line,
             2,
             if state == 4 { ORANGE } else { CYAN },
+            BLACK,
         )
         .await;
     }
 
-    /// r196: the QC3 screen — target (mV), state, the crate's tracked
-    /// continuous set point, and the taps/output. Same split as draw_qc:
-    /// the static rows (fill + TGT + state) redraw only on state/target
-    /// changes; the fast numbers update in place at 200 ms.
-    /// r230: the QC3 screen — kws-x1's card layout: the STEPS card (the
-    /// continuous range), the SET VOLTAGE and VBUS cards side by side
-    /// (the tracked set point and the live calibrated bus, big in the
-    /// trace's colour), and the LINES card with the D± taps and the
-    /// ACTIVE badge (or the failure, in orange). Redraws on state or
-    /// set-point change; the VBUS card rides the meter's 200 ms values.
+    /// r196: the QC3 screen. r230: kws-x1's card layout — the STEPS card
+    /// (the continuous range), the SET VOLTAGE and VBUS cards side by
+    /// side, the LINES card with the D± taps and the state pill.
+    /// r252: the r247 two-gate split RESTORED (the r248 cleanup wiped it
+    /// and it was never re-applied — it was in no commit): the card chrome
+    /// redraws only when the identity changes (state, failure, pill); the
+    /// values overdraw in place. A walk no longer repaints four card
+    /// outlines per pulse (the strobe), and a LEFT/RIGHT change reaches
+    /// the screen (the old gate keyed on the ramp position, never on the
+    /// target, so the selection looked frozen).
+    /// The SET VOLTAGE card shows the SELECTED target (M3_TARGET — what
+    /// the next OK walks to) in CYAN, set apart from VBUS: both had been
+    /// yellow, so nothing marked the selection. The pill follows kws-x1's
+    /// row state: STEPPING until the ramp reaches the target, ACTIVE then.
+    /// Value bands are padded to 7 cells (r227's value_text rule): the old
+    /// 12-cell pad at scale 3 is 216 px and ran through the card borders
+    /// (the SET value reached x=227, past its border at 156 and across the
+    /// VBUS card). The pill is the QC2 rows' one: the old badge was
+    /// right-aligned with a scale-1 formula but drawn at scale 2, so
+    /// ACTIVE ran to x=348 on a 320-px screen.
     pub async fn draw_qc3(&mut self, lcd: &mut Lcd) {
         use core::sync::atomic::Ordering;
         let state = crate::qc_task::STATE.load(Ordering::Relaxed);
         let failure = crate::qc_task::FAILURE.load(Ordering::Relaxed);
         let set = crate::qc_task::SET_MV.load(Ordering::Relaxed);
-        let statics_changed = state != self.qc3_state
-            || set != self.qc3_tgt
-            || self.qc3_dyn_at != 1;
-        self.qc3_state = state;
-        self.qc3_tgt = set;
-        self.qc3_dyn_at = 1;
-        if !statics_changed {
-            return;
-        }
-        lcd.fill_window(0, 32, 319, 210, BLACK).await;
-        // The STEPS card: the continuous range (qc3's own constants).
-        card(lcd, 4, 34, 315, 66, b"STEPS", ORANGE).await;
-        let mut steps = [0u8; 24];
-        let mut n = 0;
-        // "3.6-12V BY 0.2V" from the crate's milli-volt constants.
-        n = fixed(&mut steps, n, u32::from(crate::qc_task::M3_MIN_MV), 3);
-        steps[n] = b'-';
-        n += 1;
-        n = fixed(&mut steps, n, u32::from(crate::qc_task::M3_MAX_MV), 3);
-        for &b in b"V BY " {
-            steps[n] = b;
-            n += 1;
-        }
-        n = fixed(&mut steps, n, u32::from(qc_protocol::qc3::STEP_MV), 3);
-        for &b in b"V" {
-            steps[n] = b;
-            n += 1;
-        }
-        steps[n] = 0;
-        text(lcd, 12, 42, &steps, 2, WHITE).await;
-
-        // The SET VOLTAGE and VBUS cards side by side.
-        card(lcd, 4, 72, 156, 146, b"SET VOLTAGE", YELLOW).await;
-        card(lcd, 164, 72, 315, 146, b"VBUS", YELLOW).await;
-        let mut l = Line12::new();
-        if set > 0 {
-            l.num_u32(u32::from(set), 3);
-        } else {
-            l.num_u32(u32::from(crate::qc_task::M3_TARGET.load(Ordering::Relaxed)), 3);
-        }
-        l.push(b"V");
-        l.pad();
-        lcd.draw_text(12, 86, l.bytes(), 3, YELLOW, BLACK).await;
-        let cal = crate::settings::applied();
-        let bus_raw = crate::qc_task::METER_BUS_RAW.load(Ordering::Relaxed);
-        let bus_fresh = crate::qc_task::METER_FRESH.load(Ordering::Relaxed);
-        let mut v = Line12::new();
-        if bus_fresh {
-            v.num_u32(cal.millivolts(bus_raw), 3);
-        } else {
-            v.push(b"--.---");
-        }
-        v.push(b"V");
-        v.pad();
-        lcd.draw_text(172, 86, v.bytes(), 3, YELLOW, BLACK).await;
-
-        // The LINES card: the D± taps left, ACTIVE or the failure right.
-        card(lcd, 4, 152, 315, 190, b"LINES", GREEN).await;
-        // Two fixed cells — the joined line is 19 chars and Line12 caps
-        // at 12 (the D- value clipped, caught by the screenshot).
+        let target = crate::qc_task::M3_TARGET.load(Ordering::Relaxed);
+        let pill: u8 = match (state, failure) {
+            (4, 1) => 1,
+            (4, 2) => 2,
+            (5, _) if set == target => 3,
+            (5, _) => 4,
+            (3, _) => 3,
+            _ => 0,
+        };
         let dp = crate::qc_task::DP_MV.load(Ordering::Relaxed);
         let dm = crate::qc_task::DM_MV.load(Ordering::Relaxed);
-        let mut ldp = Line12::new();
-        ldp.push(b"D+ ");
-        ldp.num_u32(u32::from(dp), 3);
-        ldp.push(b"V");
-        ldp.pad();
-        lcd.draw_text(12, 162, ldp.bytes(), 2, WHITE, BLACK).await;
-        let mut ldm = Line12::new();
-        ldm.push(b"D- ");
-        ldm.num_u32(u32::from(dm), 3);
-        ldm.push(b"V");
-        ldm.pad();
-        lcd.draw_text(150, 162, ldm.bytes(), 2, WHITE, BLACK).await;
-        let (badge, color): (&[u8], u16) = match (state as u32, failure as u32) {
-            (4, 1) => (b"FAIL NODCP", ORANGE),
-            (4, 2) => (b"FAIL NOENTRY", ORANGE),
-            (3, _) | (5, _) => (b"ACTIVE", GREEN),
-            _ => (b"", GRAY),
-        };
-        if !badge.is_empty() {
-            text(lcd, 313 - badge.len() as u16 * 6, 164, badge, 2, color).await;
+        // None until the meter has a reading ("--.---V").
+        let bus = crate::qc_task::METER_FRESH
+            .load(Ordering::Relaxed)
+            .then(|| {
+                crate::settings::applied()
+                    .millivolts(crate::qc_task::METER_BUS_RAW.load(Ordering::Relaxed))
+            });
+        let struct_ident = (state, failure, pill);
+        let live = (target, bus, dp, dm);
+        if struct_ident == self.qc3_struct && live == self.qc3_live {
+            return;
+        }
+        if struct_ident != self.qc3_struct {
+            self.qc3_struct = struct_ident;
+            // The fill erased the values too: force the live pass.
+            self.qc3_live = (u16::MAX, None, u16::MAX, u16::MAX);
+            lcd.fill_window(0, 32, 319, 210, BLACK).await;
+            // The STEPS card: the continuous range (qc3's own constants).
+            card(lcd, 4, 34, 315, 66, b"STEPS", ORANGE).await;
+            let mut steps = [0u8; 24];
+            let mut n = 0;
+            // "3.6-12V BY 0.2V" from the crate's milli-volt constants.
+            n = fixed(&mut steps, n, u32::from(crate::qc_task::M3_MIN_MV), 3);
+            steps[n] = b'-';
+            n += 1;
+            n = fixed(&mut steps, n, u32::from(crate::qc_task::M3_MAX_MV), 3);
+            for &b in b"V BY " {
+                steps[n] = b;
+                n += 1;
+            }
+            n = fixed(&mut steps, n, u32::from(qc_protocol::qc3::STEP_MV), 3);
+            for &b in b"V" {
+                steps[n] = b;
+                n += 1;
+            }
+            steps[n] = 0;
+            text(lcd, 12, 42, &steps, 2, WHITE).await;
+
+            // The SET VOLTAGE card (the selected target, the highlight)
+            // and the VBUS card side by side.
+            card(lcd, 4, 72, 156, 146, b"SET VOLTAGE", CYAN).await;
+            card(lcd, 164, 72, 315, 146, b"VBUS", YELLOW).await;
+
+            // The LINES card: the D± taps left, the state pill right (the
+            // QC2 rows' pill: outlined, the label at scale 1 inside).
+            card(lcd, 4, 152, 315, 190, b"LINES", GREEN).await;
+            // Index by `pill`: none, NO DCP, NO QC, ACTIVE, STEPPING.
+            const PILLS: [(&[u8], u16); 5] = [
+                (b"", GRAY),
+                (b"NO DCP", ORANGE),
+                (b"NO QC", ORANGE),
+                (b"ACTIVE", GREEN),
+                (b"STEPPING", ORANGE),
+            ];
+            let (label, color) = PILLS[pill as usize];
+            if !label.is_empty() {
+                lcd.rounded_outline(258, 160, 312, 178, 5, color).await;
+                // Centred in the pill (55 px wide, 6 px per glyph).
+                text(
+                    lcd,
+                    258 + (55 - label.len() as u16 * 6) / 2,
+                    164,
+                    label,
+                    1,
+                    color,
+                )
+                .await;
+            }
+        }
+        if live != self.qc3_live {
+            self.qc3_live = live;
+            // In place, fixed-width pads as the erasers. 7 cells = 126 px
+            // at scale 3: each band ends inside its own card.
+            value_text(lcd, 12, 86, u32::from(target), 3, b"V", CYAN, 7).await;
+            match bus {
+                Some(mv) => value_text(lcd, 172, 86, mv, 3, b"V", YELLOW, 7).await,
+                None => {
+                    let mut v = Line12::new();
+                    v.push(b"--.---V");
+                    while v.len < 7 {
+                        v.push(b" ");
+                    }
+                    lcd.draw_text(172, 86, v.bytes(), 3, YELLOW, BLACK).await;
+                }
+            }
+            // 10 cells each: D+ ends at x=131, D- starts at x=132 and
+            // ends before the pill at 258.
+            let mut ldp = Line12::new();
+            ldp.push(b"D+ ");
+            ldp.num_u32(u32::from(dp), 3);
+            ldp.push(b"V");
+            while ldp.len < 10 {
+                ldp.push(b" ");
+            }
+            lcd.draw_text(12, 162, ldp.bytes(), 2, WHITE, BLACK).await;
+            let mut ldm = Line12::new();
+            ldm.push(b"D- ");
+            ldm.num_u32(u32::from(dm), 3);
+            ldm.push(b"V");
+            while ldm.len < 10 {
+                ldm.push(b" ");
+            }
+            lcd.draw_text(132, 162, ldm.bytes(), 2, WHITE, BLACK).await;
         }
     }
 
-
+    /// r198: the AFC screen. r252: laid out as the QC2 screen (draw_qc) —
+    /// one row per request (5 V = the stop/restore, 9 V, and the 12 V
+    /// extension), the pending request framed in the screen's accent,
+    /// ACTIVE badging the row the charger is HOLDING, and the failure or
+    /// follow verdict on the status row. The D±/VBUS numbers left for the
+    /// LINES screen, as QC2's did (r230). The badge keys on the session's
+    /// own target (qc_task::AFC_SET_MV), not on the frame: LEFT/RIGHT may
+    /// move the pending request while a session holds another.
     pub async fn draw_afc(&mut self, lcd: &mut Lcd) {
         use core::sync::atomic::Ordering;
         let state = crate::qc_task::STATE.load(Ordering::Relaxed);
+        let outcome = crate::qc_task::OUTCOME.load(Ordering::Relaxed);
         let failure = crate::qc_task::FAILURE.load(Ordering::Relaxed);
         let tgt = crate::qc_task::AFC_TARGET.load(Ordering::Relaxed);
-        let dp = crate::qc_task::DP_MV.load(Ordering::Relaxed);
-        let dm = crate::qc_task::DM_MV.load(Ordering::Relaxed);
-        let vb = crate::qc_task::VBUS_MV.load(Ordering::Relaxed);
-        let statics_changed = state != self.afc_state || tgt != self.afc_tgt;
-        let now = embassy_time::Instant::now().as_millis() as u32;
-        let dyn_due = now.wrapping_sub(self.afc_dyn_at) >= 200;
-        if !statics_changed && !dyn_due {
+        let held = crate::qc_task::AFC_SET_MV.load(Ordering::Relaxed);
+        if state == self.afc_state
+            && outcome == self.afc_outcome
+            && failure == self.afc_failure
+            && tgt == self.afc_tgt
+            && held == self.afc_held
+        {
             return;
         }
-        if statics_changed {
-            self.afc_state = state;
-            self.afc_tgt = tgt;
-            lcd.fill_window(0, 32, 319, 210, BLACK).await;
-
-            // The next OK requests exactly this target.
-            let mut line = [0u8; 24];
-            let mut n = 0;
-            for &b in b"TGT " {
-                line[n] = b;
-                n += 1;
+        self.afc_state = state;
+        self.afc_outcome = outcome;
+        self.afc_failure = failure;
+        self.afc_tgt = tgt;
+        self.afc_held = held;
+        lcd.fill_window(0, 32, 319, 210, BLACK).await;
+        for (i, &mv) in crate::qc_task::AFC_TARGETS_MV.iter().enumerate() {
+            let y = 40 + i as u16 * 34;
+            if mv == tgt {
+                // The pending request framed in the screen's accent (the
+                // QC2 choice frame).
+                lcd.rounded_outline(4, y - 6, 315, y + 22, 5, CYAN).await;
             }
-            n = crate::push_dec(&mut line, n, u32::from(tgt / 1000));
-            line[n] = b'V';
-            n += 1;
-            line[n] = 0;
-            text(lcd, 8, 48, &line, 2, YELLOW).await;
-
-            // State row: the shared STATE machine, AFC-labeled
-            // (6 = the wire detection exchange, 7 = the AFC session).
-            const STATES: [&[u8]; 8] = [
-                b"OFF", b"RELEASE", b"ENTRY", b"ACTIVE", b"FAIL", b"STEP", b"DETECT", b"AFC",
-            ];
-            let name = STATES.get(state as usize).copied().unwrap_or(b"?");
-            let mut line = [0u8; 24];
-            let mut n = 0;
-            for &b in b"AFC " {
-                line[n] = b;
-                n += 1;
-            }
-            line[n..n + name.len()].copy_from_slice(name);
-            n += name.len();
-            line[n] = 0;
-            text(lcd, 8, 88, &line, 3, WHITE).await;
-
-            // Failure reasons: the QC names plus the AFC-specific codes
-            // (3 = SILENT, 4 = wire/promote damage).
-            let detail: &[u8] = match (state, failure) {
-                (4, 1) => b"FAIL NODCP",
-                (4, 2) => b"FAIL NOENTRY",
-                (4, 3) => b"FAIL SILENT",
-                (4, 4) => b"FAIL WIRE",
-                _ => b"",
-            };
-            if !detail.is_empty() {
-                let mut line = [0u8; 24];
-                line[..detail.len()].copy_from_slice(detail);
-                line[detail.len()] = 0;
-                text(lcd, 8, 132, &line, 2, CYAN).await;
+            let mut l = Line12::new();
+            // kws-x1's row label: whole volts ("5V", "12V").
+            l.num_u32(u32::from(mv) / 1000, 0);
+            l.push(b"V");
+            l.pad();
+            lcd.draw_text(12, y, l.bytes(), 2, level_color(mv), BLACK).await;
+            // 7 = qc_task's STATE_AFC: an AFC session is live and holds
+            // this request.
+            if state == 7 && mv == held {
+                // ACTIVE: the charger is holding this request.
+                lcd.rounded_outline(258, y - 2, 312, y + 16, 5, GREEN).await;
+                text(lcd, 265, y + 2, b"ACTIVE", 1, GREEN).await;
             }
         }
-        self.afc_dyn_at = now;
-
-        // The dynamic rows, in place (fixed-width, space-padded).
+        // The status row (the QC2 one's shape): the state and the failure
+        // reason or the follow verdict. Another trigger's session (the
+        // shared STATE machine) is named as its own, not as an AFC one.
+        const NAMES: [&[u8]; 8] = [
+            b"OFF", b"RELEASE", b"ENTRY", b"ACTIVE", b"FAIL", b"STEP", b"DETECT", b"ACTIVE",
+        ];
+        let name = NAMES.get(state as usize).copied().unwrap_or(b"?");
+        // The parts are joined with single spaces below, so no prefix
+        // carries one.
+        let (prefix, name, detail): (&[u8], &[u8], &[u8]) = match state {
+            7 => (
+                b"AFC",
+                name,
+                match outcome {
+                    1 => b"OUTPUT WAIT",
+                    2 => b"OUTPUT FOLLOWED",
+                    3 => b"OUTPUT IGNORED",
+                    _ => b"",
+                },
+            ),
+            4 => (
+                b"AFC",
+                name,
+                match failure {
+                    1 => b"NODCP",
+                    2 => b"NOENTRY",
+                    3 => b"SILENT",
+                    4 => b"WIRE",
+                    _ => b"",
+                },
+            ),
+            3 => (b"QC2", name, b""),
+            5 => (b"QC3", name, b""),
+            _ => (b"AFC", name, b""),
+        };
+        // 32 bytes: the worst case ("AFC ACTIVE OUTPUT FOLLOWED") is 26
+        // bytes (the r247 class — QC2's 24-byte buffer panicked on its 25).
+        // 26 chars x 12 px (scale 2) = 312 px from x=8: the 320-px screen
+        // exactly. Drawn with draw_text, NOT text(): the helper copies
+        // into a 24-byte buffer and cut this line at 23 characters.
         let mut line = [0u8; 32];
         let mut n = 0;
-        for &b in b"DP " {
-            line[n] = b;
-            n += 1;
-        }
-        n = crate::push_dec(&mut line, n, u32::from(dp));
-        while n < 12 {
-            line[n] = b' ';
-            n += 1;
-        }
-        for &b in b"DM " {
-            line[n] = b;
-            n += 1;
-        }
-        n = crate::push_dec(&mut line, n, u32::from(dm));
-        while n < 20 {
-            line[n] = b' ';
-            n += 1;
+        for part in [prefix, name, detail] {
+            if n > 0 && !part.is_empty() {
+                line[n] = b' ';
+                n += 1;
+            }
+            line[n..n + part.len()].copy_from_slice(part);
+            n += part.len();
         }
         line[n] = 0;
-        lcd.draw_text(8, 168, &line, 2, GREEN, BLACK).await;
-
-        let mut line = [0u8; 24];
-        let mut n = 0;
-        for &b in b"VB " {
-            line[n] = b;
-            n += 1;
-        }
-        n = crate::push_dec(&mut line, n, u32::from(vb));
-        while n < 8 {
-            line[n] = b' ';
-            n += 1;
-        }
-        for &b in b"mV" {
-            line[n] = b;
-            n += 1;
-        }
-        line[n] = 0;
-        lcd.draw_text(8, 196, &line, 2, WHITE, BLACK).await;
+        lcd.draw_text(
+            8,
+            184,
+            &line,
+            2,
+            if state == 4 { ORANGE } else { CYAN },
+            BLACK,
+        )
+        .await;
     }
 
     /// r199: the ripple screen — the kws-x1 draw_ripple port

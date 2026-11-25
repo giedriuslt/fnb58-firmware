@@ -224,12 +224,14 @@ mailbox — the vendor `custom_hid` class as a template), `fnb58_usb.c`
 picks the class at boot (`fnb58_usb_init_hid`), and the Rust
 main loop samples the meter and builds the reports.
 
-## QC2.0/QC3.0/AFC trigger (r189–r215)
+## QC2.0/QC3.0/AFC trigger (r189–r215, screens r230/r252)
 
 The QC screen (3rd in the LEFT/RIGHT cycle) triggers QC2 voltages
 5/9/12/20 V; the QC3 screen (4th) triggers continuous-mode targets in
 native 200 mV steps (3.6–20 V) — the charger steps one pulse at a time
-toward the target (`SET` on screen tracks it). Both work through the
+toward the target (its SET VOLTAGE card shows the selected target; the
+LINES pill reads STEPPING until the ramp reaches it, ACTIVE then — r252).
+Both work through the
 traced data-line front end: **PA5 (DAC2_OUT) drives D+ via 100 Ω, PA4
 (DAC1_OUT) drives D− via 100 Ω; PA3/PA2 read D+/D− via 1 kΩ each on
 ADC3** (r201: the taps moved from ADC1 to ADC3 — PA2/PA3 are
@@ -259,12 +261,17 @@ logic, host-tested); the board layer is `dac.rs`
   reads it as a fixed request and exits) before the next request.
 - **AFC** (r198–r215, the 5th screen): Samsung Adaptive Fast Charging
   over the same front end — after the DCP handshake, D+ stays at 0.6 V
-  and a single-wire exchange runs on D− (the vendored
-  `single-wire-protocols` crate; 160 µs UI, DWT-cycle-counter timing —
+  and a single-wire exchange runs on D− (the
+  `single-wire-protocols` crate — a git dependency until r252, now the
+  copy under `vendor/` that adds the 12 V request; 160 µs UI,
+  DWT-cycle-counter timing —
   start-relative since r210 — cached DAC codes, a 1.8 V ping level
   since r214 matching the reference phone's GPIO, and a fast
-  single-conversion tap read for the wire budget). **Screen flow**:
-  LEFT/RIGHT in selection cycles the target (`TGT 5V/9V`,
+  single-conversion tap read for the wire budget). **Screen flow**
+  (r252: laid out as the QC2 screen — one row per request, the pending
+  one framed in the screen's accent, ACTIVE on the row the charger is
+  holding, the state and verdict on a status row): LEFT/RIGHT in
+  selection steps the pending request through the rows (`5V/9V/12V`,
   `[afc] tgt=` on the console); OK commits — the task releases the
   lines, runs the DCP entry, then the exchange. **Task states** (the
   shared `STATE` atomic + the AFC screen's names): OFF → RELEASING →
@@ -272,8 +279,12 @@ logic, host-tested); the board layer is `dac.rs`
   → AFC (session active, requests followed on VBUS) with FAIL + a
   reason (`SILENT` = the adapter never answered the wire, `WIRE` = a
   damaged exchange, `NODCP`/`NOENTRY` = entry failed). A commit while
-  active retargets (9 V) or stops (5 V + the crate's 100-UI reset
-  pulse); a commit from another screen stops AFC first. A `SILENT`
+  active retargets (9 V ↔ 12 V) or stops (5 V + the crate's 100-UI reset
+  pulse); a second OK on the request already held does nothing (r252 —
+  it used to stop the live session); a commit from another screen stops
+  AFC first. A retarget that lands before the session's first request
+  has been sent is refused with a log line (`[afc] retarget refused`,
+  OK again) instead of being dropped. A `SILENT`
   result auto-retries once through the direct entry (no QC handshake,
   r211). **Status on this charger** (r212–r215, partner-side verdict):
   the adapter answers no D− single-wire ping at any width (1–60 ms),
@@ -282,6 +293,47 @@ logic, host-tested); the board layer is `dac.rs`
   **Console probes**: `af` = full AFC commit (handshake path), `ad` =
   direct entry (no handshake), `ap` = ping-width sweep — each logs the
   wire envelope `[afc] wire ping= rx_lo= rx_hi= n=` (raw counts).
+- **The 12 V request (r252) is an fnb58 extension, not a reference
+  value.** The reference driver, kws-x1 and the `single-wire-protocols`
+  revision kws-x1 pins (`cdd1101`) carry only 5 V (`0x08`) and 9 V
+  (`0x46`). Both decode under HiSilicon's AFC `V_I_Byte` layout — "16
+  voltages (5-20V) and 16 current levels (0.75-3A) can be specified
+  using one Fast Charge V_I_Byte" (NXP FTF 2016, *Smart USB: Fast
+  Charging Products*, slide 23): the high nibble is the voltage code
+  (5 V + code), the low nibble the current code (0.75 A + 0.15 A ×
+  code). `0x08` is 5 V at code 8 (1.95 A, the 2 A request) and `0x46`
+  is 9 V at code 6 (1.65 A, the 1.67 A request), so 12 V is voltage
+  code 7. No reference gives the current code of a 12 V request: it is
+  a choice, `5` = 1.5 A, so the byte is `0x75`
+  (`V12_CURRENT_CODE` in `vendor/single-wire-protocols/src/afc.rs`).
+  **No adapter has been verified to honour it** — the charger below
+  answers no AFC ping at all, so on it the 12 V row ends in `FAIL
+  SILENT` like 5 V and 9 V do; a 9 V-only adapter is expected to leave
+  the output where it was (`OUTPUT IGNORED`). The crate is vendored for
+  it (`vendor/single-wire-protocols` + a `[patch]` entry in the
+  workspace manifest): the same bytes as `cdd1101` except `src/afc.rs`,
+  one doc line in `src/lib.rs`, `tests/afc.rs` (whose golden-edge tests
+  pin `0x75` on the wire; `cargo test -p single-wire-protocols`, host)
+  and the manifest's two `workspace = true` dependencies, pinned here to
+  the versions that workspace declares.
+- **The three trigger screens (r252)** draw their chrome once per
+  identity change and overdraw live values in place. QC2 and AFC: the
+  pending request framed in the screen's accent, ACTIVE on the row
+  being held (the session's own target, `qc_task::AFC_SET_MV` — the
+  frame may have moved on), the state and verdict on a status row. QC3:
+  the STEPS card; SET VOLTAGE (the selected target, cyan) beside VBUS
+  (yellow); the LINES card with the state pill. Fixed here: the status
+  rows went through the `text()` helper, which truncates at 23
+  characters ("…OUTPUT FOLLO"), and QC2's failure line said "QC FAIL
+  FAIL NODCP"; the QC3 value pads (12 cells at scale 3) ran through
+  the card borders and its badge off the panel; the overview's badge
+  gate never admitted the AFC session's state; and the r247 QC3
+  two-gate split, lost in the r248 cleanup and in no commit, is
+  restored (the old gate keyed on the ramp position, so LEFT/RIGHT
+  never reached the screen and every ramp pulse repainted the body).
+  `fnb58-research/ui-hostcheck` compiles the real `ui.rs` on the host
+  against a recording fake of `Lcd` and checks these screens pixel by
+  pixel (`cargo run -- <out-dir>`).
 - **Verification is closed-loop**: the request levels are read back on
   the taps (screen + diag `dp=`/`dm=`) and the output is followed on
   the published TPA626 bus voltage (`vb=`) — `FOLLOWED`/`IGNORED`

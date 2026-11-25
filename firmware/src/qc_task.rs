@@ -40,8 +40,14 @@ pub static TARGET: AtomicU8 = AtomicU8::new(1);
 /// Selected QC3 target in mV (the QC3 screen cycles it in 200 mV steps,
 /// clamped to qc3::MIN_MV..=20000).
 pub static M3_TARGET: AtomicU16 = AtomicU16::new(9000);
-/// r198: the AFC screen's target (5000 or 9000 — the two AFC requests).
+/// r198: the AFC screen's PENDING request in mV — one of AFC_TARGETS_MV
+/// (r252: 5000, 9000 or 12000; 5 V is the stop/restore).
 pub static AFC_TARGET: AtomicU16 = AtomicU16::new(9000);
+/// r252: the output a live AFC session is HOLDING (mV; 0 = none) — the
+/// session's own target. Published apart from the pending request because
+/// LEFT/RIGHT may move the pending one while the session holds its own;
+/// the AFC screen's ACTIVE badge and the overview's badge read this.
+pub static AFC_SET_MV: AtomicU16 = AtomicU16::new(0);
 pub static COMMIT: AtomicBool = AtomicBool::new(false);
 /// TPA626 bus voltage in mV, published by the main loop's meter read.
 pub static VBUS_MV: AtomicU16 = AtomicU16::new(0);
@@ -79,6 +85,14 @@ const STATE_AFC: u8 = 7;
 
 /// The selectable QC2 targets in cycle order (5 V = the stop/restore).
 pub const TARGETS_MV: [u16; 4] = [5000, 9000, 12000, 20000];
+/// The selectable AFC requests in cycle order (5 V = the stop/restore).
+/// r252: 12 V is an fnb58 EXTENSION — the reference driver, kws-x1 and the
+/// pinned crate revision carry only 5 V and 9 V. Its byte is derived from
+/// the AFC V_I_Byte layout (vendor/single-wire-protocols src/afc.rs, the
+/// module docs); the current code of the request is a choice, and no
+/// adapter has been verified to honour it. A 9 V-only adapter is expected
+/// to leave the output where it was (OUTPUT IGNORED on the status row).
+pub const AFC_TARGETS_MV: [u16; 3] = [5000, 9000, 12000];
 /// The QC3 target range (the crate floors stepping at qc3::MIN_MV).
 pub const M3_MIN_MV: u16 = 3600;
 pub const M3_MAX_MV: u16 = 20_000;
@@ -115,13 +129,19 @@ pub fn commit_continuous() {
     COMMIT.store(true, Ordering::Relaxed);
 }
 
-/// r198: the AFC screen's target cycle (5000 ↔ 9000, the two AFC
-/// requests). Returns the new target in mV for the console line.
+/// r198: the AFC screen's target cycle. r252: one step in `dir` through
+/// AFC_TARGETS_MV with wraparound (QC2's cycle_target — the two-request
+/// toggle ignored the direction). Returns the new target in mV for the
+/// console line.
 pub fn cycle_afc_target(dir: i16) -> u16 {
     let current = AFC_TARGET.load(Ordering::Relaxed);
-    let next = if current >= 9000 { 5000 } else { 9000 };
+    let index = AFC_TARGETS_MV
+        .iter()
+        .position(|&mv| mv == current)
+        .unwrap_or(1);
+    let next = (index as i16 + dir).rem_euclid(AFC_TARGETS_MV.len() as i16) as usize;
+    let next = AFC_TARGETS_MV[next];
     AFC_TARGET.store(next, Ordering::Relaxed);
-    let _ = dir;
     next
 }
 
@@ -239,7 +259,7 @@ pub fn reset_peaks() {
 enum Request {
     Fixed(Voltage),
     Continuous(u16),
-    /// r198: an AFC single-wire request (5000 or 9000 mV).
+    /// r198: an AFC single-wire request (one of AFC_TARGETS_MV).
     Afc(u16),
 }
 
@@ -691,6 +711,7 @@ fn update(
                     log(b"[afc] adapter answered\r\n");
                     let session = afc::Session::start(afc::Adapter, afc_voltage(target));
                     STATE.store(STATE_AFC, Ordering::Relaxed);
+                    AFC_SET_MV.store(target, Ordering::Relaxed);
                     State::AfcActive {
                         session,
                         target,
@@ -752,28 +773,51 @@ fn update(
         } => {
             if commit {
                 match request {
+                    Request::Afc(5000) => {
+                        // Stop (also the way down from 9 V / 12 V): queue
+                        // + send the 5 V request, then the crate's 100-UI
+                        // reset pulse, then release.
+                        session.stop();
+                        let mut phy = DmWire::new();
+                        let _ = session.poll(&mut phy);
+                        let _ = afc::reset(&mut phy);
+                        release_lines();
+                        log(b"[afc] stop: 5v + reset\r\n");
+                        AFC_SET_MV.store(0, Ordering::Relaxed);
+                        STATE.store(STATE_OFF, Ordering::Relaxed);
+                        return State::Stopping(now);
+                    }
                     Request::Afc(t) if t != target => {
-                        if t < 9000 {
-                            // Stop: queue + send the 5 V request, then the
-                            // crate's 100-UI reset pulse, then release.
-                            session.stop();
-                            let mut phy = DmWire::new();
-                            let _ = session.poll(&mut phy);
-                            let _ = afc::reset(&mut phy);
-                            release_lines();
-                            log(b"[afc] stop: 5v + reset\r\n");
-                            STATE.store(STATE_OFF, Ordering::Relaxed);
-                            return State::Stopping(now);
+                        // A retarget (9 V <-> 12 V): queue it behind the
+                        // request already sent. r252: a retarget landing
+                        // in the first tick after the detection finds that
+                        // first request still queued, and Session::set
+                        // refuses (Busy). The refusal is LOGGED, not
+                        // swallowed — the old `let _ =` went on to log
+                        // "req <new>v sent" while sending the OLD request.
+                        match session.set(afc_voltage(t)) {
+                            Ok(()) => {
+                                log_dec(b"[afc] req ", &[u32::from(t / 1000)], &[b"v\r\n"]);
+                                AFC_SET_MV.store(t, Ordering::Relaxed);
+                                STATE.store(STATE_AFC, Ordering::Relaxed);
+                                return State::AfcActive {
+                                    session,
+                                    target: t,
+                                    follow: None,
+                                    decided: false,
+                                };
+                            }
+                            Err(_) => {
+                                log(b"[afc] retarget refused: request queued - ok again\r\n");
+                            }
                         }
-                        let _ = session.set(AfcVoltage::V9);
-                        log(b"[afc] req 9v\r\n");
-                        STATE.store(STATE_AFC, Ordering::Relaxed);
-                        return State::AfcActive {
-                            session,
-                            target: t,
-                            follow: None,
-                            decided: false,
-                        };
+                    }
+                    Request::Afc(_) => {
+                        // The request already in force (a second OK): a
+                        // no-op, as QC2's same-request commit is. r252:
+                        // this used to fall into the arm below, which
+                        // STOPPED the live session with a reset pulse.
+                        log(b"[afc] same target: held\r\n");
                     }
                     _ => {
                         // A commit from another screen: stop AFC first
@@ -783,6 +827,7 @@ fn update(
                         let _ = afc::reset(&mut phy);
                         release_lines();
                         log(b"[afc] switch: stopped (re-commit to enter QC)\r\n");
+                        AFC_SET_MV.store(0, Ordering::Relaxed);
                         STATE.store(STATE_OFF, Ordering::Relaxed);
                         return State::Off;
                     }
@@ -812,6 +857,7 @@ fn update(
                         log(b"[afc] fail WIRE\r\n");
                         FAILURE.store(4, Ordering::Relaxed);
                         STATE.store(STATE_FAILED, Ordering::Relaxed);
+                        AFC_SET_MV.store(0, Ordering::Relaxed);
                         release_lines();
                         return State::Off;
                     }
@@ -846,12 +892,13 @@ fn update(
     }
 }
 
-/// The AFC voltage for a mV target (the two AFC requests).
+/// The AFC voltage for a mV target (AFC_TARGETS_MV). 12 V is the fnb58
+/// extension — AFC_TARGETS_MV's doc.
 fn afc_voltage(target_mv: u16) -> AfcVoltage {
-    if target_mv >= 9000 {
-        AfcVoltage::V9
-    } else {
-        AfcVoltage::V5
+    match target_mv {
+        9000 => AfcVoltage::V9,
+        12000 => AfcVoltage::V12,
+        _ => AfcVoltage::V5,
     }
 }
 

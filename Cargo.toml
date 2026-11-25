@@ -29,8 +29,12 @@ usbpd = { git = "https://github.com/kralonur/usbpd", rev = "16b13a23dafad6c5dd0c
 usbpd-traits = { git = "https://github.com/kralonur/usbpd", rev = "16b13a23dafad6c5dd0c18801ee978b785730f83" }
 
 # r158 debug: vendored pd-protocol with dtrace instrumentation (host tests)
+# r252: vendored single-wire-protocols — the pinned revision (cdd1101, kept
+# byte-for-byte apart from src/afc.rs, src/lib.rs and tests/afc.rs) only
+# defines the 5 V and 9 V AFC requests; the copy adds Voltage::V12.
 [patch."https://github.com/kralonur/embedded-charging-protocols-rs"]
 pd-protocol = { path = "pd-protocol-debug/pd-protocol" }
+single-wire-protocols = { path = "vendor/single-wire-protocols" }
 
 # r174: vendored usbpd-traits — the SenderResponseTimer widened 30 -> 100 ms
 # (the r173 log: this charger Accepts a re-Request slower than the spec's
