@@ -559,6 +559,11 @@ pub(crate) async fn restore_baseline(bus: &mut embassy_at32::i2c::I2c) -> Result
 pub(crate) unsafe fn i2c_unwedge() {
     use embassy_at32::gpio::{Drive, OutputPin, Port};
     const HALF: u32 = 48; // ~5 us at 192 MHz
+    // r254: a trace row either side of the dance — the lines as found
+    // and as left (read before the pins become GPIOs; IDT shows the line
+    // in either mode). Trace builds only.
+    #[cfg(feature = "i2c-trace")]
+    let found = embassy_at32::i2c::trace::pins();
     let mut scl =
         unsafe { OutputPin::new_open_drain(Port::B, 6, true, Drive::Moderate) }
             .expect("i2c scl gpio");
@@ -582,6 +587,8 @@ pub(crate) unsafe fn i2c_unwedge() {
     cortex_m::asm::delay(HALF);
     sda.set_high();
     cortex_m::asm::delay(HALF);
+    #[cfg(feature = "i2c-trace")]
+    embassy_at32::i2c::trace::mark(1, found, embassy_at32::i2c::trace::pins());
 }
 
 pub(crate) fn i2c_src_code(e: embassy_at32::i2c::Error) -> u32 {

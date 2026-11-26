@@ -168,7 +168,10 @@ test); `af`/`ad`/`ap` = the AFC handshake-path commit, direct-entry
 commit, and ping-width sweep (see the AFC section). `b` = toggle the idle dim (r216).
 `bt` = flip the button click and save it — the SET screen's BUTTON TONE
 row from the host (r253; the main loop runs the save and logs
-`[set] button tone=ON|OFF`).
+`[set] button tone=ON|OFF`). In trace builds only (`--features
+i2c-trace`): `z` / `z2` = the I²C driver's transfer table since boot,
+`y` / `y<n>` = read / set its start-delay knob (cycles; applies at the
+next boot) — see *I²C: the dropped START*.
 `c` = the applied calibration fields + the meter's raw registers
 (r221: `[cal] z=… c=… v=… raw=<bus>/<cur> f=<fresh>`). `x` = advance
 one screen forward (r225 — the remote navigation the screenshot
@@ -425,6 +428,62 @@ a button press** the backlight dims to **20%**; any press restores 100%
 dim immediately (hardware check without waiting the minute). PC-link
 mode keeps full brightness.
 
+## I²C: the dropped START (r254)
+
+Why some firmware images fail their first bus transfers on boot and
+others do not: the cause of r253's boot failure and of r252's
+occasional one, and very likely of the earlier image-dependent
+start-up failures as well (same signature — deterministic per image,
+the first bus transfers — but those images were never traced).
+
+**The cause, in the driver** (`at32f403a-embassy-rs`, `i2c.rs`). A
+transfer returns as soon as it has *requested* its STOP; the controller
+completes the STOP on the bus a few microseconds later, and the next
+transfer usually begins inside that window. A START requested before
+the STOP completes is held and generated right after it. A START
+requested *at the instant the STOP completes* is dropped: nothing
+happens, the STARTF wait runs to its 50 ms deadline, and the STOP the
+error path then adds leaves the controller with both requests pending.
+One such loss is survivable; from the second on the controller issues
+no START at all, both lines idle, until a reset. Nothing is wrong with
+the bus or the chips at any point. Which pairs of transfers land on
+that instant is a sub-microsecond property of the code's layout — hence
+deterministic per image, and different for every image.
+
+**How it was shown (2026-11-26).** The driver's `trace` feature records
+every transfer since boot — the time, the address, the operations, the
+error, the SCL/SDA lines at entry and return, the status registers —
+read with console `z` and `z2` and decoded by
+`fnb58-research/i2ctrace.py`. Console `y<n>` stores a start delay in the
+battery domain, so one image can be re-booted with different timings
+(`fnb58-research/i2csweep.py`; `fnb58-research/bootcheck.py` classifies a
+boot). On one image a delay of 256 CPU cycles (1.3 µs) lost the bus on
+4 boots of 6, and no other delay did: the same meter read succeeded
+with its START requested roughly 4 µs after the previous return, and
+timed out at roughly 5 µs with the data line still low on entry — the
+tail of the previous STOP.
+
+**The fix.** `I2c::wait_bus_free`: before a transfer's first START the
+driver waits for the controller's BUSY flag to clear, which happens
+exactly when it sees its own STOP, so every START is requested after
+the completion instead of onto it. A bus that never frees fails there
+without a request pending. With it: 31 boots across the delays on the
+traced image (17 of them at the failing delay), and 15 boots of 15 of
+the r253 source, every transfer clean.
+
+Reported, not changed: the driver's status poll takes about 35 µs per
+iteration, not the ~10 µs its comment says — `cortex_m::asm::delay`
+counts loop iterations of roughly three CPU cycles each, not cycles.
+
+**Builds.** `cargo build --features i2c-trace` adds the trace and the
+knob (about 7 KiB, a few instructions per transfer); the default build,
+and every image tagged without `-t`, leaves them out.
+
+**Still to verify on hardware:** the PD contract on a charger with the
+fix in — none was attached. That is also the test of whether the
+"USB-attached contract limitation" and the r242-era first-diagnostic
+failings shared this cause.
+
 ## Settings store (r218)
 
 The first 20 sectors of the external W25Q128 (0x000000..0x014000) are
@@ -495,21 +554,14 @@ mismatch logs `[set] flash JEDEC FAIL` and leaves defaults. Console
 `bt` flips the click and saves it from the host (the same save as the
 row's OK).
 
-**Status of the r253 image (2026-11-25) — do not flash it to the bench
-board as it is.** The feature works there (the SET screen renders, and
-`bt` → reboot read the stored mute back), but the image boots badly:
-4 boots of 4 failed their first I²C transactions — the meter
-identification read (`[meter] rust i2c read FAIL`), the accelerometer
-init (`[accel] kxtj3 FAIL`) and the PD diagnostic (`[pd] snapshot
-FAIL`, `err=257`, PD parked) — until the meter loop's unwedge healed
-the bus a second later, too late for them. r252, flashed back the same
-way, booted clean 4 of 4 (meter OK, accelerometer OK, the PD diagnostic
-runs to its no-source end). Nothing in this change touches I²C, so this
-is the image-dependent start-up behaviour the board has shown before,
-not a fault in these paths. A boot-time retry of the first read after
-the unwedge (r253b, not kept) did not cure it: the retry failed too,
-and PD failed with `err=523` (a bus error at register 0x0B). The device
-stays on r252.
+**The r253 image on the bench board (2026-11-25/26).** As first
+committed, this change's image booted badly on the bench board — 4
+boots of 4 failed their first I²C transactions (the PD diagnostic's
+snapshot read, then the meter identification read and the accelerometer
+init; PD parked with `err=257`) where r252 booted clean. The cause was
+not in this change but in the I²C driver's START timing, which the
+section *I²C: the dropped START* covers. With the driver fixed, this
+same source boots clean (r255, 15 boots of 15).
 
 ## Calibration (r221/r221b/r226)
 

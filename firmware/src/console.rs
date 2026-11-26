@@ -529,6 +529,28 @@ pub(crate) fn dbg_dt(n: usize) -> u16 {
     }
 }
 
+/// r254: the I2C trace's timing knob, in DT9 — the delay in CPU cycles
+/// that the I2C driver inserts before every transfer's START. It
+/// survives soft resets, so ONE image can be re-booted with different
+/// timings (console `y<n>`); a power cycle clears it (0 = no delay).
+/// Trace builds only.
+#[cfg(feature = "i2c-trace")]
+pub(crate) fn dbg_set_i2c_delay(cycles: u16) {
+    bpr_access();
+    unsafe {
+        use embassy_at32::pac::at32f403a::BPR;
+        BPR::steal()
+            .dt(9)
+            .write(|w| w.dt().bits(cycles));
+    }
+}
+
+/// DT9 as it stands (the boot applies it to the driver).
+#[cfg(feature = "i2c-trace")]
+pub(crate) fn dbg_i2c_delay() -> u16 {
+    dbg_dt(9)
+}
+
 /// r184: battery-domain bootloader-request cookie (BPR DT2). The app
 /// writes 0xB007 and soft-resets; the bootloader
 /// (bootloader/src/main.rs `consume_bootloader_request`) reads it, clears

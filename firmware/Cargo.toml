@@ -19,6 +19,12 @@ path = "src/bin/pdmin.rs"
 test = false
 bench = false
 
+[features]
+# r254: the I2C driver's bus trace and its timing knob (console `z`, `z2`,
+# `y`) — the diagnostic behind fnb58-research/i2ctrace.py. A diagnostic:
+# shipping builds leave it out.
+i2c-trace = ["embassy-at32/trace"]
+
 [dependencies]
 cortex-m = { workspace = true, features = ["critical-section-single-core"] }
 cortex-m-rt.workspace = true

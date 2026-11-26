@@ -178,6 +178,26 @@ async fn main(spawner: Spawner) {
             let _scl = unsafe { AlternatePin::new_open_drain(Port::B, 6, Drive::Moderate) };
             let _sda = unsafe { AlternatePin::new_open_drain(Port::B, 7, Drive::Moderate) };
             let i2c = unsafe { I2c::new_i2c1(clocks.pclk1_hz, Speed::Standard) };
+            // r254: the I2C driver's trace — time it from the bus's
+            // creation (the AFC PHY starts the same counter when its task
+            // runs; twice is harmless) and apply the timing knob (console
+            // 'y', kept in the battery domain). Trace builds only.
+            #[cfg(feature = "i2c-trace")]
+            {
+                embassy_at32::i2c::trace::enable_cycle_counter();
+                let delay = console::dbg_i2c_delay();
+                embassy_at32::i2c::trace::set_start_delay(u32::from(delay));
+                let mut d = [0u8; 40];
+                let mut n = 0;
+                for &b in b"[i2c] start delay=" {
+                    d[n] = b;
+                    n += 1;
+                }
+                n = push_dec(&mut d, n, u32::from(delay));
+                d[n] = b'\r';
+                d[n + 1] = b'\n';
+                console::boot_log().push(&d[..n + 2]);
+            }
             let mut guard = pd_task::BUS.lock().await;
             *guard = pd_task::BusCell(i2c.ok());
         }
@@ -411,6 +431,26 @@ async fn main(spawner: Spawner) {
         // The speed was never the issue: the real r115-era root cause was
         // the never-armed selection (r149).
         let i2c = unsafe { I2c::new_i2c1(clocks.pclk1_hz, Speed::Standard) };
+        // r254: the I2C driver's trace — time it from the bus's
+        // creation (the AFC PHY starts the same counter when its task
+        // runs; twice is harmless) and apply the timing knob (console
+        // 'y', kept in the battery domain). Trace builds only.
+        #[cfg(feature = "i2c-trace")]
+        {
+            embassy_at32::i2c::trace::enable_cycle_counter();
+            let delay = console::dbg_i2c_delay();
+            embassy_at32::i2c::trace::set_start_delay(u32::from(delay));
+            let mut d = [0u8; 40];
+            let mut n = 0;
+            for &b in b"[i2c] start delay=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, u32::from(delay));
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            console::boot_log().push(&d[..n + 2]);
+        }
         {
             let mut guard = pd_task::BUS.lock().await;
             *guard = pd_task::BusCell(i2c.ok());
@@ -2464,6 +2504,144 @@ fn run_flash_command(flash: &mut flash::Flash, cmd: &[u8], sender: &mut Sender) 
                 Err(_) => sender.push(b"[flash] jedec FAIL
 "),
             }
+        }
+        // r254: 'y' prints the I2C start-delay knob; 'y<n>' sets it (CPU
+        // cycles) in the battery domain first. It takes effect at the next
+        // boot and survives soft resets, not a power cycle.
+        #[cfg(feature = "i2c-trace")]
+        b'y' => {
+            let mut cycles: u32 = 0;
+            let mut any = false;
+            for &b in &cmd[1..] {
+                if b.is_ascii_digit() {
+                    cycles = cycles * 10 + u32::from(b - b'0');
+                    any = true;
+                } else {
+                    break;
+                }
+            }
+            if any {
+                console::dbg_set_i2c_delay((cycles & 0xFFFF) as u16);
+            }
+            let mut d = [0u8; 64];
+            let mut n = 0;
+            for &b in b"[i2c] start delay=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, u32::from(console::dbg_i2c_delay()));
+            for &b in b" cycles\r\n" {
+                d[n] = b;
+                n += 1;
+            }
+            send_direct(&d[..n]);
+        }
+        // r254: the trace's second half — where each transfer's longest
+        // poll gap began (the cycle counter) and the flag the driver was
+        // waiting for. Must stay above the bare 'z' arm (the r212 rule).
+        #[cfg(feature = "i2c-trace")]
+        b'z' if cmd == b"z2" => {
+            let mut index = 0usize;
+            embassy_at32::i2c::trace::with_entries(|entries| {
+                for entry in entries {
+                    let mut d = [0u8; 32];
+                    let mut n = 0;
+                    for &b in b"[z2] " {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = push_hex8(&mut d, n, index as u32);
+                    d[n] = b' ';
+                    n += 1;
+                    n = push_hex16(&mut d, n, entry.gap_start >> 16);
+                    n = push_hex16(&mut d, n, entry.gap_start & 0xFFFF);
+                    d[n] = b' ';
+                    d[n + 1] = b'0' + entry.gap_step;
+                    d[n + 2] = b'\r';
+                    d[n + 3] = b'\n';
+                    send_direct(&d[..n + 4]);
+                    index += 1;
+                }
+            });
+        }
+        // r254: the I2C trace (embassy-at32 i2c::trace) — one line per
+        // transfer since boot, oldest first: the index, the cycle counter
+        // at the call and the return, the address (ff = a marker), the
+        // operations, their lengths, the result (0 ok, else the driver's
+        // error code), the SCL/SDA lines at the call and the return, the
+        // longest poll gap inside the transfer, STS1, STS2.
+        // fnb58-research/i2ctrace.py sends this and decodes it.
+        #[cfg(feature = "i2c-trace")]
+        b'z' => {
+            fn push_hex32(buf: &mut [u8], pos: usize, v: u32) -> usize {
+                let n = push_hex16(buf, pos, v >> 16);
+                push_hex16(buf, n, v & 0xFFFF)
+            }
+            let mut index = 0usize;
+            let ((), dropped) = embassy_at32::i2c::trace::with_entries(|entries| {
+                for entry in entries {
+                    let mut d = [0u8; 64];
+                    let mut n = 0;
+                    for &b in b"[zt] " {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = push_hex8(&mut d, n, index as u32);
+                    for &b in b" " {
+                        d[n] = b;
+                        n += 1;
+                    }
+                    n = push_hex32(&mut d, n, entry.start);
+                    d[n] = b' ';
+                    n += 1;
+                    n = push_hex32(&mut d, n, entry.end);
+                    d[n] = b' ';
+                    n += 1;
+                    n = push_hex8(&mut d, n, u32::from(entry.address));
+                    d[n] = b' ';
+                    n += 1;
+                    n = push_hex8(&mut d, n, u32::from(entry.ops));
+                    d[n] = b' ';
+                    n += 1;
+                    n = push_hex8(&mut d, n, u32::from(entry.lens));
+                    d[n] = b' ';
+                    n += 1;
+                    d[n] = b'0' + entry.result;
+                    d[n + 1] = b' ';
+                    d[n + 2] = b'0' + entry.pins_in;
+                    d[n + 3] = b' ';
+                    d[n + 4] = b'0' + entry.pins_out;
+                    d[n + 5] = b' ';
+                    n += 6;
+                    n = push_hex32(&mut d, n, entry.longest_poll_gap);
+                    d[n] = b' ';
+                    n += 1;
+                    n = push_hex16(&mut d, n, u32::from(entry.sts1));
+                    d[n] = b' ';
+                    n += 1;
+                    n = push_hex16(&mut d, n, u32::from(entry.sts2));
+                    d[n] = b'\r';
+                    d[n + 1] = b'\n';
+                    n += 2;
+                    send_direct(&d[..n]);
+                    index += 1;
+                }
+            });
+            let mut d = [0u8; 64];
+            let mut n = 0;
+            for &b in b"[zt] n=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, index as u32);
+            for &b in b" dropped=" {
+                d[n] = b;
+                n += 1;
+            }
+            n = push_dec(&mut d, n, dropped);
+            d[n] = b'\r';
+            d[n + 1] = b'\n';
+            send_direct(&d[..n + 2]);
         }
         b'f' => {
             let mut sector: u32 = 0;
